@@ -1,0 +1,10 @@
+{
+  "eip155:112172": {
+    "chainId": 112172,
+    "mainnet": false,
+    "domain": {
+      "name": "DFMI Dollar",
+      "version": "1"
+    }
+  }
+}

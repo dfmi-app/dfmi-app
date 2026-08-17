@@ -1,0 +1,8 @@
+{
+  "name": "dfmi-buyer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "x402 buyer client for the dfmi market",
+  "dependencies": { "ethers": "^6.13.0" }
+}
