@@ -64,6 +64,6 @@ You can also use any x402-compatible client.
 
 ## Notes
 
-- Reports include both languages: `.summary` (English) and `.summaryZh` (中文).
+- Reports include both languages: `.summary` (English) and `.summaryZh` (Chinese).
 - Keep `chains.json` next to `buy.mjs` — it defines the dfmi chain (eip155:112172, dUSD).
 - `.env` stays on your machine. Never commit or share your private key.

@@ -1,0 +1,22 @@
+# secrets and deployment records — never commit
+.env
+.env.*
+!.env.example
+*.deployed.json
+intent-wallet.deployed.json
+
+# local chain / facilitator config (operating layer, not protocol)
+dfmi.json
+
+# build artifacts
+agent-registry.json
+service-registry.json
+intent-wallet.json
+node_modules/
+buyers/node_modules/
+buyers/purchases.json
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/

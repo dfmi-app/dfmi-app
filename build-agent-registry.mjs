@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * build-agent-registry.mjs — 编译 contracts/AgentRegistry.sol → agent-registry.json {abi, bytecode}
- * 用法: node build-agent-registry.mjs
+ * build-agent-registry.mjs — compiles contracts/AgentRegistry.sol → agent-registry.json {abi, bytecode}
+ * Usage: node build-agent-registry.mjs
  */
 import solc from 'solc';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -12,7 +12,7 @@ const input = {
   sources: { 'AgentRegistry.sol': { content: source } },
   settings: {
     optimizer: { enabled: true, runs: 200 },
-    evmVersion: 'byzantium', // 老 AuRa 链:避开 PUSH0/CHAINID 等新操作码
+    evmVersion: 'byzantium', // legacy AuRa chain: avoid newer opcodes such as PUSH0 / CHAINID
     outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object'] } },
   },
 };
