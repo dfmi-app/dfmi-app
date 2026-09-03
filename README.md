@@ -34,13 +34,15 @@ Stated limits, on purpose: `ServiceRegistry` registration is first-come and self
 
 ## What is in this repository, and what is not
 
-This repository contains the **protocol layer**: the four contracts above, the build and deploy scripts for the registry, and a reference buyer client.
+This repository contains the **protocol layer**: the four contracts above, the build and deploy scripts for the identity and intent layers, and a reference buyer client.
 
 | Path | What it is |
 |---|---|
 | `contracts/` | The three layers, as Solidity ^0.8.20 (`evmVersion: byzantium` for the AuRa chain) |
 | `build-agent-registry.mjs` | Compiles `AgentRegistry.sol` to `agent-registry.json` (`abi`, `bytecode`) |
 | `deploy-agent-registry.mjs` | Deploys the global `AgentRegistry` and wires its address into the facilitator config |
+| `build-intent.mjs` | Compiles `ServiceRegistry.sol` and `IntentSessionWallet.sol` |
+| `deploy-intent-demo.mjs` | One-shot intent-layer demo: deploys the registry and wallet, registers a category, funds the wallet, and grants a session scoped to `market-data` only |
 | `buyers/` | `buy.mjs`: an x402 buyer / verification client (exact scheme, EVM) that runs the full loop — 402 → offline signature → paid retry → settlement receipt |
 
 Not in this repository, by design: the facilitator (payment verification and settlement service), the chain node configuration, the dUSD contract, and the market front end. These are the **operating layer**; they run the live network at dfmi.app and are kept separate from the protocol contracts so the contracts can be read, reused, and audited on their own.
@@ -69,14 +71,15 @@ See [`buyers/README.md`](buyers/README.md) for the full claim → buy → read f
 
 | When | What |
 |---|---|
-| [Month YYYY] | Design started: revocation in the credential, not the balance |
-| [Month YYYY] | dfmi chain (`eip155:112172`) and dUSD live; x402 facilitator running |
-| [Month YYYY] | `SessionKeyWallet` (v1: cap, expiry, revoke) deployed and exercised by live purchases |
-| [Month YYYY] | `AgentRegistry` (identity) and `IntentSessionWallet` + `ServiceRegistry` (intent) deployed |
-| August 2026 | dfmi.app and dfmi.me public; Terms, Privacy, and Legal Notice effective 2 August 2026 |
+| May 2026 | Design started: revocation belongs in the credential, not the balance |
+| May 2026 | dfmi chain (`eip155:112172`), dUSD, and the x402 facilitator brought up |
+| May 2026 | `SessionKeyWallet` (v1: cap, expiry, revoke) deployed and exercised by live purchases |
+| 2 August 2026 | dfmi.app and dfmi.me public; Terms, Privacy, and Legal Notice effective |
 | 17 August 2026 | Protocol contracts and reference client published in this repository |
+| 19 August 2026 | `AgentRegistry` (identity layer) deployed |
+| 20 August 2026 | `IntentSessionWallet` + `ServiceRegistry` (intent layer) deployed |
 
-The contracts were designed and run against real transactions before this repository was made public; the public commit history begins at publication, not at the start of the work.
+The credential layer ran against real transactions for three months before this repository was made public; the public commit history begins at publication, not at the start of the work.
 
 ## Design principles
 
