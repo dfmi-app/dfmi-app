@@ -70,7 +70,9 @@ export class PayKit {
       const from = inv.created_block ?? 0;
       const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, from - 5), head);
       const want = BigInt(inv.amount_units);
-      const hit = transfers.find(t => t.value === want && (!inv.payer_hint || t.from.toLowerCase() === inv.payer_hint.toLowerCase()));
+      // The exact amount is the matching key; payer_hint only breaks ties (it is a hint, not a filter).
+      const exact = transfers.filter(t => t.value === want);
+      const hit = (inv.payer_hint && exact.find(t => t.from.toLowerCase() === inv.payer_hint.toLowerCase())) || exact[0];
       if (hit) {
         const conf = head - hit.block + 1;
         if (conf >= this.cfg.confirmations) return this.#present(this.#settle(inv, hit, conf));
