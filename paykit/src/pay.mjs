@@ -14,12 +14,16 @@
  *   SessionKeyWallet (bounded credential: the key can only spend within the cap the owner set)
  *     SESSION_KEY=0x…  node src/pay.mjs --session <wallet_address> <pay_to> <exact_amount>
  *
+ * Idempotent: if this payer already sent this exact amount to this payee recently, it reports that tx and does not pay again
+ * (PAY_FORCE=1 overrides). A facilitator 5xx is treated as "unclear" and the chain is checked before reporting failure.
+ *
  * Prints JSON with the tx hash. Then on the seller side:  node src/cli.mjs check <invoice_id> --tx <hash>
  */
 import { randomBytes } from 'node:crypto';
 import { Contract, JsonRpcProvider, Network, Wallet, parseUnits, formatUnits } from 'ethers';
 import { loadConfig } from './config.mjs';
 import { InvoiceStore } from './store.mjs';
+import { ChainReader } from './chain.mjs';
 
 const cfg = loadConfig(process.env.PAYKIT_CONFIG);
 if (!cfg.facilitator) { console.error('paykit.config.json needs "facilitator" (e.g. https://facilitator.dfmi.app)'); process.exit(2); }
@@ -47,6 +51,22 @@ const signer = new Wallet(key, provider);
 const units = parseUnits(String(amount), cfg.decimals);
 const now = Math.floor(Date.now() / 1000);
 const erc20 = new Contract(cfg.token, ['function balanceOf(address) view returns (uint256)'], provider);
+const reader = new ChainReader(cfg, provider);
+const payerAddr = session ? wallet : signer.address;
+
+// ---- idempotency: a 5xx from the facilitator is not proof the payment failed. Before paying, look for an
+//      exact-amount transfer from this payer to this payee in the recent past; if it exists, report it and stop.
+const LOOKBACK = Number(process.env.PAY_LOOKBACK_BLOCKS ?? 20000);
+async function alreadyPaid() {
+  const head = await reader.blockNumber();
+  const xfers = await reader.transfersTo(payTo, Math.max(0, head - LOOKBACK), head);
+  return xfers.find(t => t.value === units && t.from.toLowerCase() === payerAddr.toLowerCase()) ?? null;
+}
+const done = (t, note) => { console.error(note); console.log(JSON.stringify({ tx_hash: t.txHash, block: t.block, payer: t.from, to: payTo, amount, symbol: cfg.symbol, already_paid: true }, null, 2)); process.exit(0); };
+if (!process.env.PAY_FORCE) {
+  const prior = await alreadyPaid().catch(() => null);
+  if (prior) done(prior, `already paid: ${amount} ${cfg.symbol} from ${payerAddr} → ${payTo} in tx ${prior.txHash} (block ${prior.block}). Not paying twice; set PAY_FORCE=1 to override.`);
+}
 
 // ---- what the facilitator checks the payment against (same object shape as an x402 402 quote)
 const requirements = {
@@ -96,11 +116,27 @@ if (!session) {
 
 // ---- hand the signed authorization to the facilitator; it verifies, broadcasts, and pays the gas
 console.error(`settling ${amount} ${cfg.symbol} → ${payTo} via ${cfg.facilitator} (${requirements.scheme})`);
-const r = await fetch(`${cfg.facilitator}/settle`, {
-  method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ paymentPayload, paymentRequirements: requirements }),
-  signal: AbortSignal.timeout(90_000),
-});
-const out = await r.json().catch(() => ({ success: false, error: `facilitator HTTP ${r.status}` }));
-if (!out.success) { console.error(`settle failed: ${out.error ?? JSON.stringify(out)}`); process.exit(1); }
+let r = null, out;
+try {
+  r = await fetch(`${cfg.facilitator}/settle`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ paymentPayload, paymentRequirements: requirements }),
+    signal: AbortSignal.timeout(90_000),
+  });
+  out = await r.json().catch(() => ({ success: false, error: `facilitator HTTP ${r.status}`, unclear: true }));
+} catch (e) {
+  out = { success: false, error: `facilitator unreachable: ${e.message}`, unclear: true };   // timeout / network: also unclear
+}
+if (!out.success) {
+  if (out.unclear || (r && r.status >= 500)) {
+    // The facilitator may have broadcast the transfer and failed only to reply. Ask the chain, not the facilitator.
+    console.error(`facilitator reply unclear (${out.error}); checking the chain before giving up…`);
+    for (let i = 0; i < 6; i++) {
+      await new Promise(res => setTimeout(res, 5000));
+      const t = await alreadyPaid().catch(() => null);
+      if (t) done(t, `payment found on-chain despite the facilitator error: tx ${t.txHash}`);
+    }
+  }
+  console.error(`settle failed: ${out.error ?? JSON.stringify(out)}`); process.exit(1);
+}
 console.log(JSON.stringify({ tx_hash: out.transaction, block: out.blockNumber, payer: out.payer, to: payTo, amount, symbol: cfg.symbol, scheme: requirements.scheme }, null, 2));

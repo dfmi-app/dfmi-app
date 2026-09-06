@@ -80,8 +80,8 @@ const goods = createSdkMcpServer({
   version: '0.1.0',
   tools: [
     tool('deliver_goods', 'Release the goods for a settled invoice. Verifies on-chain settlement before releasing; refuses otherwise.',
-      { invoice_id: z.string(), product: z.enum(Object.keys(CATALOG)).default('market-report') },
-      async ({ invoice_id, product }) => {
+      { invoice_id: z.string(), product: z.enum(Object.keys(CATALOG)).optional().describe('defaults to market-report') },
+      async ({ invoice_id, product = 'market-report' }) => {
         // The gate: re-check the chain right now. The model's belief about payment is irrelevant.
         const st = await kit.checkPayment({ invoice_id });
         if (st.status !== 'paid') return fail(`Refused: invoice ${invoice_id} is "${st.status}", not "paid". Nothing delivered.`);

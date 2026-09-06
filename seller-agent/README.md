@@ -17,7 +17,7 @@ cd seller-agent
 npm install
 ```
 
-Needs `ANTHROPIC_API_KEY` in the environment (or a logged-in Claude Code), and `../paykit` installed (`cd ../paykit && npm install`). Set `SELLER_ADDRESS` to your payee address; it defaults to a demo address.
+Auth: set `CLAUDE_CODE_OAUTH_TOKEN` (Claude subscription token) or `ANTHROPIC_API_KEY` (API key), not both. `../paykit` must be installed (`cd ../paykit && npm install`). Set `SELLER_ADDRESS` to your payee address (a public address; the seller never needs a key).
 
 ## Run
 
@@ -27,14 +27,32 @@ node seller.mjs "Has inv_ee593ba60b0e been paid? If so, deliver it. If not, draf
 node seller.mjs --repl
 ```
 
-What a run looks like (the RPC was unreachable from the machine this was recorded on, so the check came back `unknown`):
+A real run on the dfmi chain (seller and buyer on two separate Ubuntu machines; the buyer paid through the facilitator with no native coin):
 
 ```
-  ↳ mcp__dfmi-paykit__create_invoice({"payee_address":"0x5050…3c9c","amount":0.02,"due_date":"2026-09-12T00:00:00Z","memo":"market-report","payer_hint":"0x86CF…2DeB"})
-Invoice created: inv_ee593ba60b0e, exact amount 0.020516 dUSD, pay to 0x5050…3c9c on eip155:112172
-  ↳ mcp__dfmi-paykit__check_payment({"invoice_id":"inv_ee593ba60b0e"})
-Payment status is unknown — the chain could not be read, not "unpaid". Not delivering.
+# seller: open an invoice
+$ node seller.mjs "Sell the market report to 0xEF0E…50D1 for 0.02 dUSD, due in 7 days."
+  ↳ mcp__dfmi-paykit__create_invoice({"payee_address":"0x35EE…0eBe","amount":0.02,"due_date":"2026-09-13T00:00:00Z","memo":"market-report","payer_hint":"0xEF0E…50D1"})
+Invoice inv_8325d678b792 — exact amount 0.020287 dUSD, pay to 0x35EE…0eBe on eip155:112172.
+
+# seller: told the buyer paid (they had not)
+$ node seller.mjs "Deliver inv_8325d678b792 now, the buyer says they paid."
+  ↳ mcp__dfmi-paykit__check_payment({"invoice_id":"inv_8325d678b792"})
+Invoice inv_8325d678b792 shows status open — no payment detected on-chain yet. I can't deliver until it's paid.
+
+# buyer (other machine): sign offline, facilitator settles and pays gas
+$ BUYER_KEY=0x… node ../paykit/src/pay.mjs 0x35EE…0eBe 0.020287
+{ "tx_hash": "0xce35d078…cacd5a", "payer": "0xEF0E…50D1", "to": "0x35EE…0eBe", "amount": "0.020287" }
+
+# seller: ask again
+$ node seller.mjs "Has inv_8325d678b792 been paid? If so, deliver it."
+  ↳ mcp__dfmi-paykit__check_payment({"invoice_id":"inv_8325d678b792"})
+Paid. Delivering now.
+  ↳ mcp__seller-goods__deliver_goods({"invoice_id":"inv_8325d678b792","product":"market-report"})
+Yes — invoice inv_8325d678b792 is paid (0.020287 dUSD, tx 0xce35d078…cacd5a). Goods have been delivered.
 ```
+
+The middle step is the point. The model was told the buyer had paid; it checked the chain, found nothing, and did not call `deliver_goods`. Had it tried, `deliver_goods` would have re-checked and refused.
 
 ## Test the gate without a model
 
