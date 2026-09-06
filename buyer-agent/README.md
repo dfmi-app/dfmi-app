@@ -38,6 +38,31 @@ node buyer.mjs "Pay invoice inv_x: 0.90 dUSD to 0x35EE… on eip155:112172."    
 
 `BUYER_DEBUG=1` prints every tool result.
 
+## The first one, 2026-09-06
+
+Owner (once): `grant.mjs fund` 1 dUSD into SessionKeyWallet `0x4Be5…B6d6`, `grant.mjs grant` a fresh session key with cap 0.50 dUSD for 7 days (tx `0x1d5c8053…f9b3`).
+
+```
+# seller machine
+$ node seller.mjs "Sell the market report to 0x4Be5…B6d6 for 0.02 dUSD, due in 7 days."
+Invoice inv_4c445f21ea4e — exact amount 0.020457 dUSD, pay to 0x35EE…0eBe, chain eip155:112172.
+
+# buyer machine
+$ node buyer.mjs "Pay invoice inv_4c445f21ea4e: 0.020457 dUSD to 0x35EE…0eBe on eip155:112172."
+  ↳ mcp__dfmi-buykit__check_budget({})
+0.020457 dUSD fits within budget and the 0.05 cap. Proceeding with payment.
+  ↳ mcp__dfmi-buykit__pay_invoice({"invoice_id":"inv_4c445f21ea4e","pay_to":"0x35EE…0eBe","exact_amount":0.020457,"max_amount":0.05,"chain":"eip155:112172"})
+Paid successfully. Tx hash: 0x80f5cf6e…9b0cbe
+
+# seller machine
+$ node seller.mjs "Has inv_4c445f21ea4e been paid? If so, deliver it."
+  ↳ mcp__dfmi-paykit__check_payment({"invoice_id":"inv_4c445f21ea4e"})
+  ↳ mcp__seller-goods__deliver_goods({"invoice_id":"inv_4c445f21ea4e"})
+Yes — inv_4c445f21ea4e is paid. Payer: 0x4Be5…B6d6. Goods delivered.
+```
+
+On the first attempt the buyer's pre-payment scan hit the node's `eth_getLogs` range limit. The agent did not pay, did not retry, and asked its owner to check the chain: nothing moved. The scan is chunked now, and buykit refuses outright when it cannot verify prior payments, because paying blind is how duplicates happen.
+
 ## A full agent-to-agent purchase
 
 1. Seller agent (`../seller-agent`) creates an invoice: id, exact amount, pay_to, chain.
