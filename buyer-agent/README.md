@@ -38,6 +38,21 @@ node buyer.mjs "Buy the market report from the seller at http://<seller-host>:44
 #   ↳ get_offer → check_budget → request_invoice → pay_invoice → collect_goods
 ```
 
+Run on 2026-09-06 between two machines on a LAN (seller 192.168.2.71):
+
+```
+$ node buyer.mjs "Buy the market report from the seller at http://192.168.2.71:4444."
+  ↳ get_offer({"seller_url":"http://192.168.2.71:4444"})
+  ↳ check_budget({})
+Price 0.02 dUSD fits within budget (remaining 0.479543, under 0.05 per-purchase cap). Proceeding.
+  ↳ request_invoice({"seller_url":"http://192.168.2.71:4444","product":"market-report"})
+pay_to matches seller address from get_offer. Proceeding to pay.
+  ↳ pay_invoice({"invoice_id":"inv_28578e9521bf","exact_amount":0.020197,"pay_to":"0x35EE…0eBe","chain":"eip155:112172","max_amount":0.05})
+Payment confirmed. Collecting goods now.
+  ↳ collect_goods({"seller_url":"http://192.168.2.71:4444","invoice_id":"inv_28578e9521bf"})
+Purchase complete. Tx 0xbd00f780…5552ef (block 675065). Invoice inv_28578e9521bf — paid, delivered.
+```
+
 The agent never sees a human between the offer and the goods. The seller's replies are data; the amounts it quotes still have to pass buykit's cap, the owner's `BUYER_MAX`, and the wallet contract.
 
 Manual pieces, if you want them:
@@ -74,6 +89,49 @@ Yes — inv_4c445f21ea4e is paid. Payer: 0x4Be5…B6d6. Goods delivered.
 ```
 
 On the first attempt the buyer's pre-payment scan hit the node's `eth_getLogs` range limit. The agent did not pay, did not retry, and asked its owner to check the chain: nothing moved. The scan is chunked now, and buykit refuses outright when it cannot verify prior payments, because paying blind is how duplicates happen.
+
+## The boundary, demonstrated (2026-09-06)
+
+Three runs, same buyer machine, same seller service. The owner acts twice, from a different machine, and never touches the agent.
+
+**1. Over the limit.** The owner's per-purchase limit is 0.05 dUSD.
+
+```
+$ node buyer.mjs "Pay invoice inv_demo: 0.30 dUSD to 0x35EE…0eBe on eip155:112172."
+1. Over the limit: 0.30 dUSD is above the 0.05 dUSD max_amount cap I'm allowed to pay per purchase.
+2. No valid invoice exists: I can't pay an arbitrary invoice_id/amount/address supplied directly.
+I'm stopping here and not calling pay_invoice.
+```
+
+The model refused before reaching the tool. Calling buykit directly, past the model:
+
+```
+$ node ../buykit/src/cli.mjs pay 0x35EE…0eBe 0.30 --max 0.05
+{ "paid": false, "refused": true, "reason": "amount 0.3 exceeds the caller's limit 0.05" }
+$ node ../buykit/src/cli.mjs pay 0x35EE…0eBe 0.60
+{ "paid": false, "refused": true, "reason": "over session cap: remaining 0.479727 dUSD" }
+```
+
+Nothing was signed. Had that not held either, the wallet contract's `require(s.spent + amount <= s.cap)` reverts. Three layers, each one there when the layer above it fails.
+
+**2. Revoked.** The owner, on another machine: `grant.mjs revoke <wallet> <session>` (tx `0xea9951ac…c367`). The session key stays on the buyer machine, untouched.
+
+```
+$ node buyer.mjs "Buy the market report from the seller at http://192.168.2.71:4444."
+  ↳ get_offer(…)  ↳ check_budget({})
+check_budget shows the session key is currently inactive/revoked — active: false, remaining: 0.0, can_pay: false
+… despite wallet balance of 4.959346 dUSD and cap of 0.5. I can't pay for anything.
+```
+
+**3. Granted again.** The owner: `grant.mjs grant <wallet> <session> 0.50 --days 7` (tx `0x341d70d4…af8e`).
+
+```
+$ node buyer.mjs "Buy the market report from the seller at http://192.168.2.71:4444."
+  ↳ get_offer → check_budget → request_invoice → pay_invoice → collect_goods
+Purchase complete. Paid 0.020273 dUSD, tx 0xaeea45f7…2575 (block 675295), invoice inv_9f308d442800. Market report delivered.
+```
+
+A human was present at revoke and at grant. Nowhere else.
 
 ## A full agent-to-agent purchase
 

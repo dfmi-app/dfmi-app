@@ -82,7 +82,7 @@ See [`buyers/README.md`](buyers/README.md) for the full claim → buy → read f
 | 17 August 2026 | Protocol contracts and reference client published in this repository |
 | 19 August 2026 | `AgentRegistry` (identity layer) deployed |
 | 20 August 2026 | `IntentSessionWallet` + `ServiceRegistry` (intent layer) deployed |
-| 6 September 2026 | First agent-to-agent purchase settled on dfmi: seller agent invoiced with `paykit`, buyer paid through the facilitator, seller verified on-chain and delivered — reproduced on Claude, glm-5.3 and gpt-6-astra. `buykit` and the buyer agent published |
+| 6 September 2026 | First agent-to-agent purchase settled on dfmi: seller agent invoiced with `paykit`, buyer agent paid from a `SessionKeyWallet` session through `buykit` and the facilitator, seller verified on-chain and delivered. Reproduced on Claude, glm-5.3 and gpt-6-astra; then end to end with no human between offer and goods (`seller-serve.mjs` + `buyer.mjs`) |
 
 The credential layer ran against real transactions for three months before this repository was made public; the public commit history begins at publication, not at the start of the work.
 
