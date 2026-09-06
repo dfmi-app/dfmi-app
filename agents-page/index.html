@@ -45,7 +45,9 @@ h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;li
 .bar i{display:block;height:100%;background:var(--ink);transition:width .6s}
 .sess.revoked .bar i{background:var(--acc)}
 .kv{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:12.5px;color:var(--ink2);font-variant-numeric:tabular-nums}
-.timeline{border-top:1px solid var(--line)}
+.timeline{border-top:1px solid var(--line);border-bottom:1px solid var(--line);max-height:560px;overflow-y:auto;padding:0 12px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.timeline::-webkit-scrollbar{width:8px}.timeline::-webkit-scrollbar-thumb{background:var(--line)}
+.tl-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px}.tl-head .cnt{font-family:var(--mono);font-size:12px;color:var(--dim)}
 .ev{display:grid;grid-template-columns:150px 1fr;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);align-items:start}
 .ev time{font-family:var(--mono);font-size:12px;color:var(--dim);padding-top:4px;font-variant-numeric:tabular-nums}
 .ev .who{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-right:8px;padding:2px 7px;background:var(--offsoft);color:var(--ink2)}
@@ -54,6 +56,7 @@ h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;li
 .ev .meta{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:4px;word-break:break-all;line-height:1.6}
 .ev .meta a{color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--line)}.ev .meta a:hover{color:var(--acc)}
 .ev.human{background:linear-gradient(90deg,var(--accsoft),transparent 60%);margin:0 -12px;padding-left:12px;padding-right:12px}
+.ev:last-child{border-bottom:none}
 .empty{color:var(--dim);padding:24px 0;font-style:italic;font-family:var(--serif);font-size:18px}
 .how{margin-top:48px;border-top:1px solid var(--line);padding-top:24px}
 .how p{color:var(--ink2);font-size:15.5px;line-height:1.6;max-width:66ch;margin:0 0 12px}
@@ -90,7 +93,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
   <h2 data-i18n="t8">Session keys the buyer holds</h2>
   <div class="sessions" id="sessions"></div>
 
-  <h2 data-i18n="t9">Timeline</h2>
+  <div class="tl-head"><h2 data-i18n="t9">Timeline</h2><span class="cnt" id="tlcount"></span></div>
   <div class="timeline" id="timeline"></div>
 
   <div class="how">
@@ -121,12 +124,12 @@ var S = {
       bought:function(d,a){return "bought "+d+" for <b>"+a+" dUSD</b>";},granted:function(k,c,e){return "granted session "+k+": cap <b>"+c+" dUSD</b>"+(e?", until "+e:"");},
       revoked:function(k){return "revoked session "+k;},revNote:"the key still exists on the buyer's machine; it can no longer spend",
       session:"session",wallet:"wallet",seller:"seller",tx:"tx",spent:"spent",cap:"cap",remaining:"remaining",expires:"expires",noExp:"no expiry",owner:"owner",
-      active:"active",revokedP:"revoked",expired:"expired",block:"block",updated:"updated",justNow:"just now",minAgo:function(n){return n+" min ago";},hAgo:function(n){return n+" h ago";},dAgo:function(n){return n+" d ago";},goods:"goods"},
+      active:"active",revokedP:"revoked",expired:"expired",block:"block",updated:"updated",count:function(n){return n+" events, newest first · scroll for more";},justNow:"just now",minAgo:function(n){return n+" min ago";},hAgo:function(n){return n+" h ago";},dAgo:function(n){return n+" d ago";},goods:"goods"},
   zh:{live:"实时 · 每 15 秒刷新",stale:"数据源不可用",noSess:"暂无 session",noEv:"暂无记录",agent:"agent",human:"人",
       bought:function(d,a){return "购买 "+d+"，<b>"+a+" dUSD</b>";},granted:function(k,c,e){return "授权 session "+k+"：额度 <b>"+c+" dUSD</b>"+(e?"，有效至 "+e:"");},
       revoked:function(k){return "撤销 session "+k;},revNote:"钥匙仍在买家机器上，但已无法再花一分钱",
       session:"session",wallet:"钱包",seller:"卖家",tx:"tx",spent:"已花",cap:"额度",remaining:"剩余",expires:"到期",noExp:"不过期",owner:"主人",
-      active:"有效",revokedP:"已撤销",expired:"已过期",block:"区块",updated:"更新于",justNow:"刚刚",minAgo:function(n){return n+" 分钟前";},hAgo:function(n){return n+" 小时前";},dAgo:function(n){return n+" 天前";},goods:"商品"}
+      active:"有效",revokedP:"已撤销",expired:"已过期",block:"区块",updated:"更新于",count:function(n){return n+" 条，最新在上 · 向下滚动查看更多";},justNow:"刚刚",minAgo:function(n){return n+" 分钟前";},hAgo:function(n){return n+" 小时前";},dAgo:function(n){return n+" 天前";},goods:"商品"}
 };
 var T = function(){ return S[lang]; };
 var lastFeed = null, liveOk = false;
@@ -167,7 +170,10 @@ function render(f){
       '<div class="meta">'+t.wallet+' '+esc(short(e.wallet))+' · '+t.tx+' '+txl(e.tx)+' · '+t.revNote+'</div></div></div>';
     return "";
   });
-  $("timeline").innerHTML = rows.length ? rows.join("") : '<div class="empty">'+t.noEv+'</div>';
+  var tl = $("timeline"); var keep = tl.scrollTop;
+  tl.innerHTML = rows.length ? rows.join("") : '<div class="empty">'+t.noEv+'</div>';
+  tl.scrollTop = keep;
+  $("tlcount").textContent = rows.length ? t.count(rows.length) : "";
   setLive(true);
 }
 
