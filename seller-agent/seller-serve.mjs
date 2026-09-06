@@ -11,9 +11,11 @@
  * The seller *agent* (seller.mjs and friends) is still there for the human-facing parts: reminders, questions, exceptions.
  *
  *   SELLER_ADDRESS=0x… node seller-serve.mjs [--port 4444]
+ *   Optional: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID → posts a line on each order and delivery (notify.mjs).
  */
 import { createServer } from 'node:http';
 import { cfg, kit, SELLER, CATALOG, deliverGoods } from './seller-core.mjs';
+import { notify, enabled as tgEnabled } from './notify.mjs';
 
 const PORT = Number(process.argv[process.argv.indexOf('--port') + 1] || process.env.SELLER_PORT || 4444);
 const PRICES = { 'market-report': process.env.PRICE_MARKET_REPORT ?? '0.02' };
@@ -37,6 +39,7 @@ createServer(async (req, res) => {
       const inv = await kit.createInvoice({ payee_address: SELLER, amount: PRICES[product], memo: product, payer_hint: buyer,
         due_date: new Date(Date.now() + DUE_DAYS * 86400e3).toISOString() });
       log(`order ${inv.invoice_id} ${product} ${inv.exact_amount} ${cfg.symbol} for ${buyer ?? '?'}`);
+      notify(`🧾 seller: invoice ${inv.invoice_id} for ${product}, ${inv.exact_amount} ${cfg.symbol}, buyer ${buyer ?? '?'}`);
       return json(res, 201, { invoice_id: inv.invoice_id, product, exact_amount: inv.exact_amount, pay_to: inv.pay_to, chain: inv.chain, symbol: inv.symbol, due_date: inv.due_date });
     }
     if (req.method === 'GET' && u.pathname.startsWith('/invoice/')) {
@@ -46,9 +49,10 @@ createServer(async (req, res) => {
     if (req.method === 'POST' && u.pathname === '/deliver') {
       const { invoice_id, product } = await body(req);
       if (!invoice_id) return json(res, 400, { error: 'invoice_id required' });
-      try { const g = await deliverGoods({ invoice_id, product }); log(`delivered ${invoice_id} (tx ${g.tx_hash})`); return json(res, 200, g); }
-      catch (e) { log(`refused ${invoice_id}: ${e.message}`); return json(res, 402, { delivered: false, error: e.message }); }
+      try { const g = await deliverGoods({ invoice_id, product }); log(`delivered ${invoice_id} (tx ${g.tx_hash})`);
+        notify(`📦 seller: delivered ${invoice_id} to ${g.payer}. Settled on-chain, tx ${g.tx_hash}`); return json(res, 200, g); }
+      catch (e) { log(`refused ${invoice_id}: ${e.message}`); notify(`⛔ seller: refused delivery of ${invoice_id}: ${e.message}`); return json(res, 402, { delivered: false, error: e.message }); }
     }
     return json(res, 404, { error: 'not found', routes: ['GET /offer', 'POST /order', 'GET /invoice/:id', 'POST /deliver'] });
   } catch (e) { log('error', e.message); return json(res, 500, { error: e.message }); }
-}).listen(PORT, () => log(`selling ${Object.keys(CATALOG).join(', ')} as ${SELLER} on ${cfg.chain} | http://0.0.0.0:${PORT}/offer`));
+}).listen(PORT, () => log(`selling ${Object.keys(CATALOG).join(', ')} as ${SELLER} on ${cfg.chain} | http://0.0.0.0:${PORT}/offer | telegram ${tgEnabled ? 'on' : 'off'}`));

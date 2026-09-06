@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dfmi · agents</title>
+<meta name="description" content="Two agents trading on the dfmi chain. A human was present twice: to grant and to revoke.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --paper:#f5f3ee; --ink:#0e0e0e; --ink-2:#4a4741; --ink-3:#8a867e; --line:#dcd8cf; --card:#fbfaf7;
+    --accent:#ff5b1f; --accent-ink:#b23a0d; --accent-soft:#ffe6dc; --ok:#1f7a4d; --ok-soft:#dff3e8; --off:#8a867e; --off-soft:#ecebe7;
+    --serif:"Instrument Serif",Georgia,serif; --sans:Inter,system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box} html{color-scheme:light}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  a{color:inherit}
+  .wrap{max-width:980px;margin:0 auto;padding:40px 24px 80px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:28px}
+  .brand{font-family:var(--serif);font-style:italic;font-size:34px;letter-spacing:-.01em;text-decoration:none}
+  .brand span{font-style:normal;color:var(--ink-3);font-size:22px;margin-left:10px}
+  .live{font-family:var(--mono);font-size:12px;color:var(--ink-3);display:flex;align-items:center;gap:8px}
+  .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;box-shadow:0 0 0 3px var(--ok-soft)}
+  .live.stale i{background:var(--off);box-shadow:0 0 0 3px var(--off-soft)}
+  h1{font-family:var(--serif);font-weight:400;font-size:clamp(30px,4.6vw,46px);line-height:1.1;letter-spacing:-.015em;margin:0 0 10px;text-wrap:balance;max-width:20ch}
+  h1 em{font-style:italic;color:var(--accent-ink)}
+  .lede{color:var(--ink-2);max-width:62ch;margin:0 0 32px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:36px}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:14px 16px}
+  .stat b{display:block;font-family:var(--mono);font-size:26px;font-weight:500;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .stat small{color:var(--ink-3);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+  .stat.human b{color:var(--accent-ink)}
+  h2{font-family:var(--serif);font-weight:400;font-size:24px;margin:36px 0 12px;letter-spacing:-.01em}
+  .sessions{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+  .sess{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
+  .sess .row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+  .pill{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:999px;background:var(--off-soft);color:var(--off)}
+  .pill.active{background:var(--ok-soft);color:var(--ok)} .pill.revoked{background:var(--accent-soft);color:var(--accent-ink)}
+  .mono{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);word-break:break-all}
+  .bar{height:8px;background:var(--off-soft);border-radius:999px;overflow:hidden;margin:10px 0 6px}
+  .bar i{display:block;height:100%;background:var(--ink);border-radius:999px;transition:width .6s}
+  .sess.revoked .bar i{background:var(--accent)}
+  .kv{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12.5px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+  .timeline{border-top:1px solid var(--line)}
+  .ev{display:grid;grid-template-columns:150px 1fr;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);align-items:start}
+  .ev time{font-family:var(--mono);font-size:12px;color:var(--ink-3);padding-top:3px;font-variant-numeric:tabular-nums}
+  .ev .who{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-right:8px;padding:2px 7px;border-radius:4px;background:var(--off-soft);color:var(--ink-2)}
+  .ev.human .who{background:var(--accent);color:#fff}
+  .ev .what{font-size:15px}
+  .ev .meta{font-family:var(--mono);font-size:12px;color:var(--ink-3);margin-top:4px;word-break:break-all}
+  .ev.human{background:linear-gradient(90deg,var(--accent-soft),transparent 60%);margin:0 -12px;padding-left:12px;padding-right:12px;border-radius:4px}
+  .empty{color:var(--ink-3);padding:24px 0;font-style:italic;font-family:var(--serif);font-size:18px}
+  .how{margin-top:48px;padding-top:24px;border-top:1px solid var(--line);color:var(--ink-2);max-width:66ch}
+  .how p{margin:0 0 10px}
+  .how code{font-family:var(--mono);font-size:12.5px;background:var(--off-soft);padding:1px 5px;border-radius:3px}
+  footer{margin-top:40px;font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+  @media (max-width:560px){.ev{grid-template-columns:1fr;gap:4px}.wrap{padding:28px 16px 60px}}
+  @media (prefers-reduced-motion:reduce){.bar i{transition:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="brand" href="https://dfmi.app">dfmi<span>agents</span></a>
+    <div class="live" id="live"><i></i><span id="livetext">connecting…</span></div>
+  </header>
+
+  <h1>Two agents trading. <em>A human was present twice.</em></h1>
+  <p class="lede">A selling agent invoices and verifies settlement on the dfmi chain. A buying agent pays from a session key its owner granted, inside a cap the wallet contract enforces. Everything below is read from the ledger and the chain. The orange rows are the only moments a person acted.</p>
+
+  <div class="stats">
+    <div class="stat"><b id="s-purchases">–</b><small>agent purchases</small></div>
+    <div class="stat"><b id="s-volume">–</b><small>dUSD settled</small></div>
+    <div class="stat human"><b id="s-human">–</b><small>human actions</small></div>
+    <div class="stat"><b id="s-last" style="font-size:16px;padding-top:6px">–</b><small>last purchase</small></div>
+  </div>
+
+  <h2>Session keys the buyer holds</h2>
+  <div class="sessions" id="sessions"><div class="empty">no sessions yet</div></div>
+
+  <h2>Timeline</h2>
+  <div class="timeline" id="timeline"><div class="empty">nothing yet</div></div>
+
+  <div class="how">
+    <p><b>Grant.</b> The owner funds a <code>SessionKeyWallet</code> and grants a session key a cap and an expiry. That is the first human action.</p>
+    <p><b>Trade.</b> The buyer agent asks the seller for an offer, checks its budget on-chain, requests an invoice, pays through the facilitator with no gas, and collects the goods. The seller agent releases goods only after it sees the exact amount settled on-chain. No prompt decides any of that; code and the contract do.</p>
+    <p><b>Revoke.</b> One transaction from the owner and the key on the buyer's machine can no longer spend a cent. That is the second human action.</p>
+    <p>Code: <a href="https://github.com/dfmi-app/dfmi-app">github.com/dfmi-app/dfmi-app</a> (<code>paykit</code>, <code>buykit</code>, <code>seller-agent</code>, <code>buyer-agent</code>, MIT).</p>
+  </div>
+  <footer>chain eip155:112172 · unit dUSD · experimental network, best effort · <span id="foot"></span></footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const short = (a) => a ? a.slice(0, 6) + '…' + a.slice(-4) : '';
+const when = (t) => { if (!t) return ''; const d = new Date(t); return isNaN(d) ? esc(t) : d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC'; };
+const ago = (t) => { if (!t) return '–'; const s = (Date.now() - new Date(t)) / 1000; if (s < 90) return 'just now'; if (s < 5400) return Math.round(s / 60) + ' min ago'; if (s < 172800) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago'; };
+
+function render(f) {
+  $('s-purchases').textContent = f.stats.purchases;
+  $('s-volume').textContent = Number(f.stats.volume).toFixed(4);
+  $('s-human').textContent = f.stats.humanActions;
+  $('s-last').textContent = ago(f.stats.lastPurchase);
+  $('foot').textContent = `block ${f.head} · updated ${when(f.updatedAt)}`;
+
+  const sess = [];
+  for (const w of f.wallets) for (const s of w.sessions) {
+    const st = !s.active ? 'revoked' : s.expired ? 'expired' : 'active';
+    const cap = Number(s.cap || 0), spent = Number(s.spent || 0), pct = cap ? Math.min(100, spent / cap * 100) : 0;
+    sess.push(`<div class="sess ${st}">
+      <div class="row"><span class="mono">wallet ${short(w.wallet)}</span><span class="pill ${st}">${st}</span></div>
+      <div class="mono">session key ${esc(s.sessionKey)}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="kv"><span>spent ${esc(s.spent)} / cap ${esc(s.cap)} dUSD</span><span>remaining ${esc(s.remaining)}</span></div>
+      <div class="kv" style="margin-top:4px"><span>${s.expiry ? 'expires ' + when(s.expiry) : 'no expiry'}</span><span>owner ${short(w.owner)}</span></div>
+    </div>`);
+  }
+  $('sessions').innerHTML = sess.length ? sess.join('') : '<div class="empty">no sessions yet</div>';
+
+  const rows = [...f.events].reverse().map(e => {
+    if (e.kind === 'purchase') return `<div class="ev"><time>${when(e.time)}</time><div>
+      <span class="who">agent</span><span class="what">bought ${esc(e.description || 'goods')} for <b>${esc(e.amount)} dUSD</b></span>
+      <div class="meta">${e.scheme === 'dfmi-session' ? 'session ' + esc(short(e.sessionKey)) + ' of wallet ' + esc(short(e.buyer)) : 'wallet ' + esc(short(e.buyer))} → seller ${esc(short(e.seller))}${e.agentName ? ' · agent "' + esc(e.agentName) + '" #' + esc(e.agentId) : ''} · tx ${esc(e.tx)}</div></div></div>`;
+    if (e.kind === 'grant') return `<div class="ev human"><time>${when(e.time)}</time><div>
+      <span class="who">human</span><span class="what">granted session ${esc(short(e.sessionKey))}: cap <b>${esc(e.cap)} dUSD</b>${e.expiry ? ', until ' + when(e.expiry) : ''}</span>
+      <div class="meta">wallet ${esc(short(e.wallet))} · tx ${esc(e.tx)}</div></div></div>`;
+    if (e.kind === 'revoke') return `<div class="ev human"><time>${when(e.time)}</time><div>
+      <span class="who">human</span><span class="what">revoked session ${esc(short(e.sessionKey))}</span>
+      <div class="meta">wallet ${esc(short(e.wallet))} · tx ${esc(e.tx)} · the key still exists on the buyer's machine; it can no longer spend</div></div></div>`;
+    return '';
+  });
+  $('timeline').innerHTML = rows.length ? rows.join('') : '<div class="empty">nothing yet</div>';
+}
+
+async function tick() {
+  try {
+    const r = await fetch('feed.json', { cache: 'no-store' }); if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+    $('live').classList.remove('stale'); $('livetext').textContent = 'live · refreshes every 15 s';
+  } catch (e) { $('live').classList.add('stale'); $('livetext').textContent = 'feed unavailable'; }
+}
+tick(); setInterval(tick, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "dfmi-agents-page",
+  "version": "0.1.0",
+  "description": "Public live page for dfmi.app/agents: agent-to-agent settlements from the facilitator ledger, grant/revoke events from the chain.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": { "start": "node feed.mjs" },
+  "dependencies": { "ethers": "^6.13.0" }
+}

@@ -42,3 +42,6 @@ buyer-agent/node_modules/
 buyer-agent/package-lock.json
 buyer-agent/AGENTS.md
 buyer-agent/.env
+seller-agent/.env
+agents-page/node_modules/
+agents-page/package-lock.json
