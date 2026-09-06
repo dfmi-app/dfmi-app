@@ -28,7 +28,7 @@ main{padding:54px 0 40px}
 .eyebrow.stale i{background:var(--dim);box-shadow:0 0 0 3px var(--offsoft)}
 h1{font-family:var(--serif);font-weight:400;font-size:clamp(34px,5vw,54px);line-height:1.05;margin:14px 0 12px;letter-spacing:-.01em;text-wrap:balance}
 h1 em{font-style:italic;color:var(--acc2)}
-.lead{font-size:15.5px;color:var(--ink2);line-height:1.6;max-width:66ch;margin:0 0 34px}
+.lead{font-size:15.5px;color:var(--ink2);line-height:1.6;max-width:none;margin:0 0 34px}
 h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;line-height:1.2}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .stat{background:var(--card);border:1px solid var(--line);padding:14px 16px}
@@ -59,7 +59,7 @@ h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;li
 .ev:last-child{border-bottom:none}
 .empty{color:var(--dim);padding:24px 0;font-style:italic;font-family:var(--serif);font-size:18px}
 .how{margin-top:48px;border-top:1px solid var(--line);padding-top:24px}
-.how p{color:var(--ink2);font-size:15.5px;line-height:1.6;max-width:66ch;margin:0 0 12px}
+.how p{color:var(--ink2);font-size:15.5px;line-height:1.6;max-width:none;margin:0 0 12px}
 .how strong{color:var(--ink);font-weight:600}
 .how code{font-family:var(--mono);font-size:12.5px;background:var(--offsoft);padding:1px 5px}
 .upd{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-top:24px}
@@ -101,6 +101,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
     <p data-i18n="t11"><strong>Trade.</strong> The buyer agent asks the seller for an offer, checks its budget on-chain, requests an invoice, pays through the facilitator with no gas, and collects the goods. The seller agent releases goods only after it sees the exact amount settled on-chain. No prompt decides any of that; code and the contract do.</p>
     <p data-i18n="t12"><strong>Revoke.</strong> One transaction from the owner and the key on the buyer's machine can no longer spend a cent. That is the second human action.</p>
     <p data-i18n="t15">Both actions are buttons in the <a href="https://dfmi.app/wallet.html">owner console</a>: unlock the owner wallet, open the session wallet, grant or revoke a key.</p>
+    <p data-i18n="t16">This buyer pays by <b>invoice</b>; the market's other door is pay-per-call <b>x402</b>. <a href="/pay.html">Two ways to ask, one way to settle</a></p>
   </div>
   <div class="upd" id="foot"></div>
   <p class="fine" data-i18n="t14">dfmi is an experimental, non-custodial market for the x402 protocol. dUSD is a test token, not legal tender, and not an investment.</p>
@@ -112,7 +113,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
 </div></div></footer>
 
 <script>
-var ZH = {"h0":"agents","t0":"首页","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
+var ZH = {"h0":"agents","t0":"首页","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t16":"这个买家用<b>发票</b>付款;市场的另一扇门是按次付的 <b>x402</b>。<a href=\"/pay.html\">两种开口,一种结算</a>","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
 var EN = {};
 document.querySelectorAll("[data-i18n]").forEach(function(el){ EN[el.getAttribute("data-i18n")] = el.innerHTML; });
 var lang = "en";
