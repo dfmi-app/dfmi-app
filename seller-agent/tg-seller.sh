@@ -7,4 +7,5 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -f "$HERE/.env" ] && set -a && . "$HERE/.env" && set +a     # SELLER_ADDRESS, CLAUDE_CODE_OAUTH_TOKEN or LLM_API_KEY
 : "${SELLER_ADDRESS:?seller-agent/.env must set SELLER_ADDRESS}"
 RUNNER="${SELLER_RUNNER:-seller.mjs}"                             # seller.mjs (Claude) or seller-ollama.mjs
-cd "$HERE" && exec node "$RUNNER" "$*" 2>&1
+cd "$HERE"
+if [ "${SELLER_TRACE:-0}" = "1" ]; then exec node "$RUNNER" "$*" 2>&1; else exec node "$RUNNER" "$*" 2>/dev/null; fi

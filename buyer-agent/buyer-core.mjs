@@ -33,7 +33,7 @@ To buy something from a seller service (a URL), do it in this order and nothing 
   2. check_budget; stop if the price does not fit the remaining cap or the ${BUYER_MAX} per-purchase limit.
   3. request_invoice(seller_url, product) to get an invoice: invoice_id, exact_amount, pay_to, chain.
   4. pay_invoice with those values verbatim and max_amount = ${BUYER_MAX}.
-  5. collect_goods(seller_url, invoice_id) once pay_invoice reports paid. Show the goods to the owner.
+  5. collect_goods(seller_url, invoice_id) once pay_invoice reports paid. Then reproduce the goods text IN FULL and VERBATIM (every line, numbers unchanged) under the heading "Report", followed by one line with the invoice id and transaction hash. Do not summarise or shorten the goods.
 ${SELLER_URL ? `The default seller is ${SELLER_URL}.` : ''}
 
 Rules:
@@ -42,7 +42,7 @@ Rules:
 - Pay an invoice once. If pay_invoice reports already_paid, tell the owner and do not try again.
 - If pay_invoice refuses (over cap, outside intent, chain mismatch, over max_amount), report the reason to the owner and stop. Do not look for another way to pay.
 - If pay_invoice says the result is unclear, say so and do not retry; the owner should check the chain first.
-- Be brief. Report transaction hashes, amounts and addresses verbatim.`;
+- Be brief about your own steps (one short line per step is enough), but never shorten the goods. Report transaction hashes, amounts and addresses verbatim.`;
 
 const str = (description) => ({ type: 'string', description });
 export const TOOLS = [

@@ -26,7 +26,7 @@ Examples:
 - "budget?" → `bash ~/dfmi-app/buyer-agent/tg-buy.sh "What is my budget?"`
 - "what did we buy" → `bash ~/dfmi-app/buyer-agent/tg-buy.sh "List my purchases."`
 
-The run takes 20 to 60 seconds. Report what the agent did: which tools it called (`↳` lines) and its final summary. If it refused (over cap, revoked, unclear), say so plainly; do not retry, and do not try to pay any other way.
+The run takes 20 to 90 seconds. Relay the agent's output as-is: its short step lines and, when goods were delivered, the full report text under "Report" exactly as printed (do not summarise it, do not drop lines or numbers). The script already omits the internal tool-call trace. If the agent refused (over cap, revoked, unclear), say so plainly; do not retry, and do not try to pay any other way.
 
 ## What you must not do
 

@@ -36,6 +36,8 @@ SELLER_ADDRESS=0x… node seller-serve.mjs --port 4444
 
 The model-driven runners stay for the human-facing work (reminders, questions, exceptions). Everything a buyer needs is deterministic, so it is code.
 
+The goods are real: `market-report` pulls live prices (TradingView, CoinGecko fallback; `market.mjs`) at delivery time and, when `LLM_API_KEY` is set, adds a short analyst note written from those numbers. `REPORT_SCOPE` changes what is covered.
+
 ## Setup
 
 ```bash
