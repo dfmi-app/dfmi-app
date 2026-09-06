@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * deploy-intent-demo.mjs — one-shot deployment of the intent layer:
+ * deploy-intent.mjs — one-shot deployment of the intent layer:
  *   1. deploy ServiceRegistry (reused if dfmi.json already has serviceRegistry)
  *   2. register a category: splitter (the producer's payout address) → category 1 "market-data"
  *   3. deploy IntentSessionWallet (owner = DEPLOYER, dUSD, registry)
  *   4. fund it → generate a session key → grantSession(cap, 7 days, intentMask = category 1 only)
  *   5. write intent-wallet.deployed.json (contains the session private key — keep it in .gitignore, never push it)
  *
- * Usage: node deploy-intent-demo.mjs   (requires DEPLOYER_PRIVATE_KEY in .env; .env may live in this directory or its parent)
+ * Usage: node deploy-intent.mjs   (requires DEPLOYER_PRIVATE_KEY in .env; .env may live in this directory or its parent)
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits } from 'ethers';

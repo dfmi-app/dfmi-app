@@ -42,7 +42,7 @@ This repository contains the **protocol layer**: the four contracts above, the b
 | `build-agent-registry.mjs` | Compiles `AgentRegistry.sol` to `agent-registry.json` (`abi`, `bytecode`) |
 | `deploy-agent-registry.mjs` | Deploys the global `AgentRegistry` and wires its address into the facilitator config |
 | `build-intent.mjs` | Compiles `ServiceRegistry.sol` and `IntentSessionWallet.sol` |
-| `deploy-intent-demo.mjs` | One-shot intent-layer demo: deploys the registry and wallet, registers a category, funds the wallet, and grants a session scoped to `market-data` only |
+| `deploy-intent.mjs` | One-shot intent-layer deployment: deploys the registry and wallet, registers a category, funds the wallet, and grants a session scoped to `market-data` only |
 | `buyers/` | `buy.mjs`: an x402 buyer / verification client (exact scheme, EVM) that runs the full loop — 402 → offline signature → paid retry → settlement receipt |
 | `paykit/` | **Seller-side toolbox** as an MCP server: `create_invoice` (unique exact amount), `check_payment` (reads the chain; `unknown` is never "unpaid"), `send_reminder` (drafts only), `list_invoices`. Read-only, holds no keys. Plus `pay.mjs`, a buyer-side helper that signs offline and settles through the facilitator with no gas |
 | `buykit/` | **Buyer-side toolbox** as an MCP server: `check_budget`, `pay_invoice` (within a `SessionKeyWallet` session, via the facilitator, idempotent), `list_purchases`. Holds a bounded session key, never the owner's key. `grant.mjs` is the owner's issue/revoke tool |

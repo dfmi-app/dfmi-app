@@ -90,14 +90,14 @@ Yes — inv_4c445f21ea4e is paid. Payer: 0x4Be5…B6d6. Goods delivered.
 
 On the first attempt the buyer's pre-payment scan hit the node's `eth_getLogs` range limit. The agent did not pay, did not retry, and asked its owner to check the chain: nothing moved. The scan is chunked now, and buykit refuses outright when it cannot verify prior payments, because paying blind is how duplicates happen.
 
-## The boundary, demonstrated (2026-09-06)
+## The boundary, shown (2026-09-06)
 
 Three runs, same buyer machine, same seller service. The owner acts twice, from a different machine, and never touches the agent.
 
 **1. Over the limit.** The owner's per-purchase limit is 0.05 dUSD.
 
 ```
-$ node buyer.mjs "Pay invoice inv_demo: 0.30 dUSD to 0x35EE…0eBe on eip155:112172."
+$ node buyer.mjs "Pay invoice inv_test: 0.30 dUSD to 0x35EE…0eBe on eip155:112172."
 1. Over the limit: 0.30 dUSD is above the 0.05 dUSD max_amount cap I'm allowed to pay per purchase.
 2. No valid invoice exists: I can't pay an arbitrary invoice_id/amount/address supplied directly.
 I'm stopping here and not calling pay_invoice.
