@@ -5,6 +5,7 @@
  * Tools are served in-process from buyer-core (buykit wrapped as MCP tools). The owner's per-purchase limit
  * (BUYER_MAX) is passed into buykit as max_amount, so the model cannot forget it.
  *
+ *   node buyer.mjs "Buy the market report from the seller at http://192.168.1.71:4444."     # fully automatic: offer → budget → invoice → pay → goods
  *   node buyer.mjs "Pay invoice inv_8325d678b792: 0.020287 dUSD to 0x35EE…0eBe on eip155:112172."
  *   node buyer.mjs "What is my budget?"
  *   node buyer.mjs --repl
@@ -29,15 +30,19 @@ const buykit = createSdkMcpServer({
       { pay_to: z.string(), exact_amount: z.union([z.string(), z.number()]), chain: z.string().optional(), invoice_id: z.string().optional(), memo: z.string().optional(), max_amount: z.union([z.string(), z.number()]).optional() },
       wrap('pay_invoice')),
     tool('list_purchases', 'List payments made by this buyer.', { status: z.enum(['paid', 'already_paid', 'failed']).optional(), pay_to: z.string().optional() }, wrap('list_purchases')),
+    tool('get_offer', 'Ask a seller service what it sells: products, prices, payee address, chain.', { seller_url: z.string() }, wrap('get_offer')),
+    tool('request_invoice', 'Ask the seller service for an invoice for one product. Returns invoice_id, exact_amount, pay_to, chain.', { seller_url: z.string(), product: z.string() }, wrap('request_invoice')),
+    tool('collect_goods', 'After paying, ask the seller service to deliver. It verifies settlement on-chain itself.', { seller_url: z.string(), invoice_id: z.string() }, wrap('collect_goods')),
   ],
 });
 
 async function run(prompt) {
   const q = query({ prompt, options: {
     systemPrompt: SYSTEM, mcpServers: { 'dfmi-buykit': buykit },
-    allowedTools: ['mcp__dfmi-buykit__check_budget', 'mcp__dfmi-buykit__pay_invoice', 'mcp__dfmi-buykit__list_purchases'],
+    allowedTools: ['mcp__dfmi-buykit__check_budget', 'mcp__dfmi-buykit__pay_invoice', 'mcp__dfmi-buykit__list_purchases',
+                   'mcp__dfmi-buykit__get_offer', 'mcp__dfmi-buykit__request_invoice', 'mcp__dfmi-buykit__collect_goods'],
     disallowedTools: ['Bash', 'Write', 'Edit', 'Read', 'WebFetch', 'WebSearch'],
-    permissionMode: 'dontAsk', maxTurns: 10,
+    permissionMode: 'dontAsk', maxTurns: 14,
     stderr: (d) => { if (process.env.BUYER_DEBUG) process.stderr.write('[cli] ' + d); },
   } });
   for await (const m of q) {

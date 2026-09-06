@@ -30,6 +30,18 @@ export BUYER_MAX=0.05          # owner's limit for a single purchase (default 0.
 
 ## Run
 
+Fully automatic, against a seller running `seller-agent/seller-serve.mjs`:
+
+```bash
+export SELLER_URL=http://<seller-host>:4444        # optional default
+node buyer.mjs "Buy the market report from the seller at http://<seller-host>:4444."
+#   ↳ get_offer → check_budget → request_invoice → pay_invoice → collect_goods
+```
+
+The agent never sees a human between the offer and the goods. The seller's replies are data; the amounts it quotes still have to pass buykit's cap, the owner's `BUYER_MAX`, and the wallet contract.
+
+Manual pieces, if you want them:
+
 ```bash
 node buyer.mjs "What is my budget?"
 node buyer.mjs "Pay invoice inv_8325d678b792: 0.020287 dUSD to 0x35EED7539a6e19B7427007f727e87A0527450eBe on eip155:112172."

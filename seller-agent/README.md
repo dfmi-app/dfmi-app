@@ -22,6 +22,20 @@ The rules, the tool definitions and the delivery gate live in `seller-core.mjs`.
 
 `seller-ollama.mjs` is a plain tool-calling loop over `/v1/chat/completions`; it defaults to `https://ollama.com/v1/chat/completions` with `glm-5.3:cloud`. `goods-server.mjs` exposes `deliver_goods` as a stdio MCP server so Codex (or Claude Desktop, Cursor, any MCP client) can mount it next to `paykit/src/server.mjs`; `codex-setup.sh` writes both into `~/.codex/config.toml` and generates `AGENTS.md` from the shared rules.
 
+## Selling to another agent, no human in between
+
+`seller-serve.mjs` is the seller as a service: four HTTP routes, no model. Another agent (see `../buyer-agent`) asks for the offer, orders an invoice, pays on-chain, and collects the goods; the gate is the same `deliverGoods` as everywhere else.
+
+```bash
+SELLER_ADDRESS=0x… node seller-serve.mjs --port 4444
+#   GET  /offer               what is for sale, price, payee, chain
+#   POST /order  {product, buyer}   → invoice (paykit)
+#   GET  /invoice/:id         status from the chain
+#   POST /deliver {invoice_id}      → goods if paid on-chain, 402 otherwise
+```
+
+The model-driven runners stay for the human-facing work (reminders, questions, exceptions). Everything a buyer needs is deterministic, so it is code.
+
 ## Setup
 
 ```bash
