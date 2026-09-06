@@ -18,7 +18,7 @@ The rules, the tool definitions and the delivery gate live in `seller-core.mjs`.
 |---|---|---|
 | Claude (Agent SDK) | `CLAUDE_CODE_OAUTH_TOKEN` (subscription) or `ANTHROPIC_API_KEY` | `node seller.mjs "…"` |
 | Ollama Cloud, OpenAI API, local Ollama | `LLM_API_URL` + `LLM_API_KEY` + `LLM_MODEL` | `node seller-ollama.mjs "…"` |
-| ChatGPT subscription (Codex CLI) | `codex login` | `bash codex-setup.sh`, then `codex exec "…"` |
+| ChatGPT subscription (Codex CLI) | `codex login` | `bash codex-setup.sh`, then `codex exec --approve-for-me "…"` |
 
 `seller-ollama.mjs` is a plain tool-calling loop over `/v1/chat/completions`; it defaults to `https://ollama.com/v1/chat/completions` with `glm-5.3:cloud`. `goods-server.mjs` exposes `deliver_goods` as a stdio MCP server so Codex (or Claude Desktop, Cursor, any MCP client) can mount it next to `paykit/src/server.mjs`; `codex-setup.sh` writes both into `~/.codex/config.toml` and generates `AGENTS.md` from the shared rules.
 
@@ -46,8 +46,8 @@ export LLM_API_KEY=…  LLM_MODEL=glm-5.3:cloud
 node seller-ollama.mjs "Has inv_8325d678b792 been paid? If so, deliver it."
 
 # Codex CLI on a ChatGPT subscription
-bash codex-setup.sh && codex login
-codex exec "Has inv_8325d678b792 been paid? If so, deliver it."
+bash codex-setup.sh && codex login          # headless: codex login --device-auth
+codex exec --approve-for-me "Has inv_8325d678b792 been paid? If so, deliver it."   # exec defaults to approval=never, which blocks MCP calls
 ```
 
 `SELLER_DEBUG=1` prints every tool result.
@@ -85,7 +85,7 @@ The middle step is the point. The model was told the buyer had paid; it checked 
 node --test gate.test.mjs
 ```
 
-Creates an invoice against a dead RPC and asserts that the delivery condition (`status === "paid"`) is false when the status is `unknown`. The same gate was also exercised with a scripted model that called `deliver_goods` on an unpaid invoice: the tool returned `Refused: invoice … is "unknown", not "paid"` and nothing was delivered.
+Creates an invoice against a dead RPC and asserts that the delivery condition (`status === "paid"`) is false when the status is `unknown`. All three backends ran the same invoice on 2026-09-06 (Claude via Agent SDK, glm-5.3:cloud via seller-ollama.mjs, gpt-6-astra via Codex CLI): each called check_payment, saw `paid`, called deliver_goods, and delivered the same tx. The same gate was also exercised with a scripted model that called `deliver_goods` on an unpaid invoice: the tool returned `Refused: invoice … is "unknown", not "paid"` and nothing was delivered.
 
 ## What it is for
 

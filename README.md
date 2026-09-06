@@ -44,6 +44,10 @@ This repository contains the **protocol layer**: the four contracts above, the b
 | `build-intent.mjs` | Compiles `ServiceRegistry.sol` and `IntentSessionWallet.sol` |
 | `deploy-intent-demo.mjs` | One-shot intent-layer demo: deploys the registry and wallet, registers a category, funds the wallet, and grants a session scoped to `market-data` only |
 | `buyers/` | `buy.mjs`: an x402 buyer / verification client (exact scheme, EVM) that runs the full loop — 402 → offline signature → paid retry → settlement receipt |
+| `paykit/` | **Seller-side toolbox** as an MCP server: `create_invoice` (unique exact amount), `check_payment` (reads the chain; `unknown` is never "unpaid"), `send_reminder` (drafts only), `list_invoices`. Read-only, holds no keys. Plus `pay.mjs`, a buyer-side helper that signs offline and settles through the facilitator with no gas |
+| `buykit/` | **Buyer-side toolbox** as an MCP server: `check_budget`, `pay_invoice` (within a `SessionKeyWallet` session, via the facilitator, idempotent), `list_purchases`. Holds a bounded session key, never the owner's key. `grant.mjs` is the owner's issue/revoke tool |
+| `seller-agent/` | Reference selling agent: same rules and code-enforced delivery gate on three backends (Claude Agent SDK, any OpenAI-compatible endpoint such as Ollama Cloud, Codex CLI via MCP). Delivery happens only after paykit sees settlement on-chain |
+| `buyer-agent/` | Reference buying agent on the same three backends; the owner's per-purchase limit is passed into buykit as `max_amount`, so the bound is code, not memory |
 
 Not in this repository, by design: the facilitator (payment verification and settlement service), the chain node configuration, the dUSD contract, and the market front end. These are the **operating layer**; they run the live network at dfmi.app and are kept separate from the protocol contracts so the contracts can be read, reused, and audited on their own.
 
@@ -78,6 +82,7 @@ See [`buyers/README.md`](buyers/README.md) for the full claim → buy → read f
 | 17 August 2026 | Protocol contracts and reference client published in this repository |
 | 19 August 2026 | `AgentRegistry` (identity layer) deployed |
 | 20 August 2026 | `IntentSessionWallet` + `ServiceRegistry` (intent layer) deployed |
+| 6 September 2026 | First agent-to-agent purchase settled on dfmi: seller agent invoiced with `paykit`, buyer paid through the facilitator, seller verified on-chain and delivered — reproduced on Claude, glm-5.3 and gpt-6-astra. `buykit` and the buyer agent published |
 
 The credential layer ran against real transactions for three months before this repository was made public; the public commit history begins at publication, not at the start of the work.
 

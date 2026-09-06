@@ -1,0 +1,17 @@
+{
+  "name": "dfmi-buykit",
+  "version": "0.1.0",
+  "description": "Buyer-side payment toolbox for agents on the dfmi chain: check the budget on a bounded session key, pay an invoice within it (facilitator settles, no gas), list purchases. Holds a session key, never the owner's key.",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "dfmi-buykit": "src/server.mjs" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ethers": "^6.13.0",
+    "zod": "^3.23.0"
+  }
+}

@@ -32,3 +32,13 @@ seller-agent/node_modules/
 seller-agent/package-lock.json
 seller-agent/AGENTS.md
 seller-agent/.env
+
+# buykit / buyer-agent local state (purchases.json is the buyer's log; AGENTS.md is generated)
+buykit/purchases.json
+buykit/purchases.json.tmp
+buykit/node_modules/
+buykit/package-lock.json
+buyer-agent/node_modules/
+buyer-agent/package-lock.json
+buyer-agent/AGENTS.md
+buyer-agent/.env

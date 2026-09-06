@@ -7,7 +7,10 @@
 #   export SELLER_ADDRESS=0x...
 #   bash codex-setup.sh
 #   codex login                       # once, with the ChatGPT account
-#   codex exec "Sell the market report to 0x<buyer> for 0.02 dUSD, due in 7 days."
+#   codex exec --approve-for-me "Sell the market report to 0x<buyer> for 0.02 dUSD, due in 7 days."
+#
+# --approve-for-me is needed: `codex exec` defaults to approval=never, and MCP tool calls require approval,
+# so without it every paykit call fails with "MCP tool call requires approval". Headless login: `codex login --device-auth`.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CFG="$HOME/.codex/config.toml"
@@ -34,5 +37,5 @@ fi
 node -e "import('$HERE/seller-core.mjs').then(m => process.stdout.write('# Seller agent rules\n\n' + m.SYSTEM + '\n\nTools: create_invoice, check_payment, send_reminder, list_invoices (MCP server dfmi-paykit) and deliver_goods (MCP server seller-goods).\n'))" > "$HERE/AGENTS.md"
 echo "wrote $HERE/AGENTS.md (payee $SELLER_ADDRESS)"
 echo
-echo "next:  codex login   then, from $HERE:"
-echo '       codex exec "Sell the market report to 0x<buyer> for 0.02 dUSD, due in 7 days."'
+echo "next:  codex login   (headless: codex login --device-auth)   then, from $HERE:"
+echo '       codex exec --approve-for-me "Sell the market report to 0x<buyer> for 0.02 dUSD, due in 7 days."'

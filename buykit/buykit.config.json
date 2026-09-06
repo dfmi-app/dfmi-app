@@ -1,0 +1,12 @@
+{
+  "chain": "eip155:112172",
+  "chainId": 112172,
+  "rpc": "https://ethereum.dfmi.app:8541",
+  "token": "0x03E25a5DC7aC15f32462652a4bF4986F378d5fcf",
+  "symbol": "dUSD",
+  "decimals": 6,
+  "facilitator": "https://facilitator.dfmi.app",
+  "confirmations": 1,
+  "lookbackBlocks": 20000,
+  "store": "./purchases.json"
+}

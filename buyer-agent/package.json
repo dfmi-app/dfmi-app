@@ -1,0 +1,12 @@
+{
+  "name": "dfmi-buyer-agent",
+  "version": "0.1.0",
+  "description": "A buying agent on the dfmi chain. Spends from a bounded session key through dfmi-buykit. Same rules on three backends: Claude Agent SDK, any OpenAI-compatible endpoint (Ollama Cloud), and Codex CLI via MCP.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": { "start": "node buyer.mjs", "ollama": "node buyer-ollama.mjs" },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.0",
+    "zod": "^4.0.0"
+  }
+}
