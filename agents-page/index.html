@@ -1,147 +1,181 @@
-<!doctype html>
-<html lang="en">
-<head>
+<!DOCTYPE html><html lang="en" translate="no"><head>
 <meta charset="utf-8">
+<meta name="google" content="notranslate">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dfmi · agents</title>
-<meta name="description" content="Two agents trading on the dfmi chain. A human was present twice: to grant and to revoke.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap">
+<title>Agents — dfmi</title>
+<meta name="description" content="Two agents trading on the dfmi chain, live. A selling agent invoices and verifies settlement; a buying agent pays within a session cap its owner granted. A human was present twice.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%230e0e0e%27%2F%3E%3Ctext%20x%3D%2720%27%20y%3D%2745%27%20font-family%3D%27Georgia%2Cserif%27%20font-style%3D%27italic%27%20font-size%3D%2742%27%20fill%3D%27%23f5f3ee%27%3Ed%3C%2Ftext%3E%3C%2Fsvg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
 <style>
-  :root{
-    --paper:#f5f3ee; --ink:#0e0e0e; --ink-2:#4a4741; --ink-3:#8a867e; --line:#dcd8cf; --card:#fbfaf7;
-    --accent:#ff5b1f; --accent-ink:#b23a0d; --accent-soft:#ffe6dc; --ok:#1f7a4d; --ok-soft:#dff3e8; --off:#8a867e; --off-soft:#ecebe7;
-    --serif:"Instrument Serif",Georgia,serif; --sans:Inter,system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
-  }
-  *{box-sizing:border-box} html{color-scheme:light}
-  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
-  a{color:inherit}
-  .wrap{max-width:980px;margin:0 auto;padding:40px 24px 80px}
-  header{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:28px}
-  .brand{font-family:var(--serif);font-style:italic;font-size:34px;letter-spacing:-.01em;text-decoration:none}
-  .brand span{font-style:normal;color:var(--ink-3);font-size:22px;margin-left:10px}
-  .live{font-family:var(--mono);font-size:12px;color:var(--ink-3);display:flex;align-items:center;gap:8px}
-  .live i{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;box-shadow:0 0 0 3px var(--ok-soft)}
-  .live.stale i{background:var(--off);box-shadow:0 0 0 3px var(--off-soft)}
-  h1{font-family:var(--serif);font-weight:400;font-size:clamp(30px,4.6vw,46px);line-height:1.1;letter-spacing:-.015em;margin:0 0 10px;text-wrap:balance;max-width:20ch}
-  h1 em{font-style:italic;color:var(--accent-ink)}
-  .lede{color:var(--ink-2);max-width:62ch;margin:0 0 32px}
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:36px}
-  .stat{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:14px 16px}
-  .stat b{display:block;font-family:var(--mono);font-size:26px;font-weight:500;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-  .stat small{color:var(--ink-3);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
-  .stat.human b{color:var(--accent-ink)}
-  h2{font-family:var(--serif);font-weight:400;font-size:24px;margin:36px 0 12px;letter-spacing:-.01em}
-  .sessions{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
-  .sess{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:16px 18px}
-  .sess .row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
-  .pill{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:999px;background:var(--off-soft);color:var(--off)}
-  .pill.active{background:var(--ok-soft);color:var(--ok)} .pill.revoked{background:var(--accent-soft);color:var(--accent-ink)}
-  .mono{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);word-break:break-all}
-  .bar{height:8px;background:var(--off-soft);border-radius:999px;overflow:hidden;margin:10px 0 6px}
-  .bar i{display:block;height:100%;background:var(--ink);border-radius:999px;transition:width .6s}
-  .sess.revoked .bar i{background:var(--accent)}
-  .kv{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12.5px;color:var(--ink-2);font-variant-numeric:tabular-nums}
-  .timeline{border-top:1px solid var(--line)}
-  .ev{display:grid;grid-template-columns:150px 1fr;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);align-items:start}
-  .ev time{font-family:var(--mono);font-size:12px;color:var(--ink-3);padding-top:3px;font-variant-numeric:tabular-nums}
-  .ev .who{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-right:8px;padding:2px 7px;border-radius:4px;background:var(--off-soft);color:var(--ink-2)}
-  .ev.human .who{background:var(--accent);color:#fff}
-  .ev .what{font-size:15px}
-  .ev .meta{font-family:var(--mono);font-size:12px;color:var(--ink-3);margin-top:4px;word-break:break-all}
-  .ev.human{background:linear-gradient(90deg,var(--accent-soft),transparent 60%);margin:0 -12px;padding-left:12px;padding-right:12px;border-radius:4px}
-  .empty{color:var(--ink-3);padding:24px 0;font-style:italic;font-family:var(--serif);font-size:18px}
-  .how{margin-top:48px;padding-top:24px;border-top:1px solid var(--line);color:var(--ink-2);max-width:66ch}
-  .how p{margin:0 0 10px}
-  .how code{font-family:var(--mono);font-size:12.5px;background:var(--off-soft);padding:1px 5px;border-radius:3px}
-  footer{margin-top:40px;font-family:var(--mono);font-size:12px;color:var(--ink-3)}
-  @media (max-width:560px){.ev{grid-template-columns:1fr;gap:4px}.wrap{padding:28px 16px 60px}}
-  @media (prefers-reduced-motion:reduce){.bar i{transition:none}}
+:root{--bg:#f5f3ee;--ink:#0e0e0e;--ink2:#2a2a2a;--dim:#6b6760;--line:#d9d5cc;--acc:#ff5b1f;--acc2:#b23a0d;--accsoft:#ffe6dc;--card:#fbfaf7;--ok:#1f7a4d;--oksoft:#dff3e8;--offsoft:#ecebe7;
+--serif:"Instrument Serif","Noto Serif SC","Songti SC","STSong",Georgia,serif;
+--sans:"Inter","Noto Sans SC","PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+--mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.7;-webkit-font-smoothing:antialiased}
+a{color:var(--acc)}
+.wrap{max-width:960px;margin:0 auto;padding:0 32px}
+header{position:sticky;top:0;z-index:9;background:rgba(245,243,238,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+header .row{display:flex;align-items:center;justify-content:space-between;height:70px}
+.brand{font-family:var(--serif);font-style:italic;font-size:32px}.brand a{color:inherit;text-decoration:none}
+.brand span{font-style:normal;font-size:20px;color:var(--dim);margin-left:10px}
+.back{font-family:var(--mono);font-size:13px;color:var(--ink2);text-decoration:none}.back:hover{color:var(--acc)}
+.langsw{display:inline-flex}.lang{font-family:var(--mono);font-size:12px;color:var(--ink);background:transparent;border:1px solid var(--ink);padding:4px 10px;cursor:pointer}.langsw .lang+.lang{border-left:none}.lang:hover{background:var(--ink);color:var(--bg)}.lang.on{background:var(--ink);color:var(--bg)}
+main{padding:54px 0 40px}
+.eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);display:flex;align-items:center;gap:10px}
+.eyebrow i{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;box-shadow:0 0 0 3px var(--oksoft)}
+.eyebrow.stale i{background:var(--dim);box-shadow:0 0 0 3px var(--offsoft)}
+h1{font-family:var(--serif);font-weight:400;font-size:clamp(34px,5vw,54px);line-height:1.05;margin:14px 0 12px;letter-spacing:-.01em;text-wrap:balance}
+h1 em{font-style:italic;color:var(--acc2)}
+.lead{font-size:15.5px;color:var(--ink2);line-height:1.6;max-width:66ch;margin:0 0 34px}
+h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;line-height:1.2}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{background:var(--card);border:1px solid var(--line);padding:14px 16px}
+.stat b{display:block;font-family:var(--mono);font-size:26px;font-weight:500;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.2}
+.stat small{color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.12em;font-family:var(--mono)}
+.stat.human b{color:var(--acc2)}
+.sessions{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.sess{background:var(--card);border:1px solid var(--line);padding:16px 18px}
+.sess .row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+.pill{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;background:var(--offsoft);color:var(--dim)}
+.pill.active{background:var(--oksoft);color:var(--ok)}.pill.revoked{background:var(--accsoft);color:var(--acc2)}
+.mono{font-family:var(--mono);font-size:12.5px;color:var(--ink2);word-break:break-all;line-height:1.5}
+.bar{height:8px;background:var(--offsoft);overflow:hidden;margin:10px 0 6px}
+.bar i{display:block;height:100%;background:var(--ink);transition:width .6s}
+.sess.revoked .bar i{background:var(--acc)}
+.kv{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:12.5px;color:var(--ink2);font-variant-numeric:tabular-nums}
+.timeline{border-top:1px solid var(--line)}
+.ev{display:grid;grid-template-columns:150px 1fr;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);align-items:start}
+.ev time{font-family:var(--mono);font-size:12px;color:var(--dim);padding-top:4px;font-variant-numeric:tabular-nums}
+.ev .who{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-right:8px;padding:2px 7px;background:var(--offsoft);color:var(--ink2)}
+.ev.human .who{background:var(--acc);color:#fff}
+.ev .what{font-size:15.5px;color:var(--ink)}
+.ev .meta{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:4px;word-break:break-all;line-height:1.6}
+.ev .meta a{color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--line)}.ev .meta a:hover{color:var(--acc)}
+.ev.human{background:linear-gradient(90deg,var(--accsoft),transparent 60%);margin:0 -12px;padding-left:12px;padding-right:12px}
+.empty{color:var(--dim);padding:24px 0;font-style:italic;font-family:var(--serif);font-size:18px}
+.how{margin-top:48px;border-top:1px solid var(--line);padding-top:24px}
+.how p{color:var(--ink2);font-size:15.5px;line-height:1.6;max-width:66ch;margin:0 0 12px}
+.how strong{color:var(--ink);font-weight:600}
+.how code{font-family:var(--mono);font-size:12.5px;background:var(--offsoft);padding:1px 5px}
+.upd{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-top:24px}
+footer{border-top:1px solid var(--line);margin-top:48px}
+footer .row{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:16px;padding:28px 0 60px}
+.flinks a{font-family:var(--mono);font-size:12.5px;color:var(--ink2);text-decoration:none;margin-right:22px}.flinks a:hover{color:var(--acc)}
+.bm{font-family:var(--serif);font-style:italic;font-size:28px;color:var(--ink)}
+.fine{font-size:12.5px;color:var(--dim);margin-top:12px;max-width:640px}
+@media (max-width:560px){.ev{grid-template-columns:1fr;gap:4px}.wrap{padding:0 18px}}
+@media (prefers-reduced-motion:reduce){.bar i{transition:none}}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <a class="brand" href="https://dfmi.app">dfmi<span>agents</span></a>
-    <div class="live" id="live"><i></i><span id="livetext">connecting…</span></div>
-  </header>
+<header><div class="wrap"><div class="row">
+  <div class="brand"><a href="/">dfmi</a><span data-i18n="h0">agents</span></div>
+  <div style="display:flex;align-items:center;gap:14px"><a class="back" href="https://dfmi.app/" data-i18n="t0">Home</a><span class="langsw"><button class="lang on" id="langEn" onclick="setLang('en')">EN</button><button class="lang" id="langZh" onclick="setLang('zh')">中</button></span></div>
+</div></div></header>
 
-  <h1>Two agents trading. <em>A human was present twice.</em></h1>
-  <p class="lede">A selling agent invoices and verifies settlement on the dfmi chain. A buying agent pays from a session key its owner granted, inside a cap the wallet contract enforces. Everything below is read from the ledger and the chain. The orange rows are the only moments a person acted.</p>
+<main><div class="wrap">
+  <div class="eyebrow" id="live"><i></i><span id="livetext" data-i18n="t1">connecting…</span></div>
+  <h1 data-i18n="t2">Two agents trading. <em>A human was present twice.</em></h1>
+  <p class="lead" data-i18n="t3">A selling agent invoices and verifies settlement on the dfmi chain. A buying agent pays from a session key its owner granted, inside a cap the wallet contract enforces. Everything below is read from the ledger and the chain. The orange rows are the only moments a person acted.</p>
 
   <div class="stats">
-    <div class="stat"><b id="s-purchases">–</b><small>agent purchases</small></div>
-    <div class="stat"><b id="s-volume">–</b><small>dUSD settled</small></div>
-    <div class="stat human"><b id="s-human">–</b><small>human actions</small></div>
-    <div class="stat"><b id="s-last" style="font-size:16px;padding-top:6px">–</b><small>last purchase</small></div>
+    <div class="stat"><b id="s-purchases">–</b><small data-i18n="t4">agent purchases</small></div>
+    <div class="stat"><b id="s-volume">–</b><small data-i18n="t5">dUSD settled</small></div>
+    <div class="stat human"><b id="s-human">–</b><small data-i18n="t6">human actions</small></div>
+    <div class="stat"><b id="s-last" style="font-size:16px;padding-top:6px">–</b><small data-i18n="t7">last purchase</small></div>
   </div>
 
-  <h2>Session keys the buyer holds</h2>
-  <div class="sessions" id="sessions"><div class="empty">no sessions yet</div></div>
+  <h2 data-i18n="t8">Session keys the buyer holds</h2>
+  <div class="sessions" id="sessions"></div>
 
-  <h2>Timeline</h2>
-  <div class="timeline" id="timeline"><div class="empty">nothing yet</div></div>
+  <h2 data-i18n="t9">Timeline</h2>
+  <div class="timeline" id="timeline"></div>
 
   <div class="how">
-    <p><b>Grant.</b> The owner funds a <code>SessionKeyWallet</code> and grants a session key a cap and an expiry. That is the first human action.</p>
-    <p><b>Trade.</b> The buyer agent asks the seller for an offer, checks its budget on-chain, requests an invoice, pays through the facilitator with no gas, and collects the goods. The seller agent releases goods only after it sees the exact amount settled on-chain. No prompt decides any of that; code and the contract do.</p>
-    <p><b>Revoke.</b> One transaction from the owner and the key on the buyer's machine can no longer spend a cent. That is the second human action.</p>
-    <p>Code: <a href="https://github.com/dfmi-app/dfmi-app">github.com/dfmi-app/dfmi-app</a> (<code>paykit</code>, <code>buykit</code>, <code>seller-agent</code>, <code>buyer-agent</code>, MIT).</p>
+    <p data-i18n="t10"><strong>Grant.</strong> The owner funds a <code>SessionKeyWallet</code> and grants a session key a cap and an expiry. That is the first human action.</p>
+    <p data-i18n="t11"><strong>Trade.</strong> The buyer agent asks the seller for an offer, checks its budget on-chain, requests an invoice, pays through the facilitator with no gas, and collects the goods. The seller agent releases goods only after it sees the exact amount settled on-chain. No prompt decides any of that; code and the contract do.</p>
+    <p data-i18n="t12"><strong>Revoke.</strong> One transaction from the owner and the key on the buyer's machine can no longer spend a cent. That is the second human action.</p>
+    <p data-i18n="t13">Code: <a href="https://github.com/dfmi-app/dfmi-app">github.com/dfmi-app/dfmi-app</a> (<code>paykit</code>, <code>buykit</code>, <code>seller-agent</code>, <code>buyer-agent</code>, MIT).</p>
   </div>
-  <footer>chain eip155:112172 · unit dUSD · experimental network, best effort · <span id="foot"></span></footer>
-</div>
+  <div class="upd" id="foot"></div>
+  <p class="fine" data-i18n="t14">dfmi is an experimental, non-custodial market for the x402 protocol. dUSD is a test token, not legal tender, and not an investment.</p>
+</div></main>
+
+<footer><div class="wrap"><div class="row">
+  <div class="flinks"><a href="/privacy.html" data-i18n="t32">Privacy Policy</a><a href="/terms.html" data-i18n="t33">Terms of Service</a><a href="/legal.html" data-i18n="t34">Legal Notice</a></div>
+  <div class="bm">dfmi</div>
+</div></div></footer>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const short = (a) => a ? a.slice(0, 6) + '…' + a.slice(-4) : '';
-const when = (t) => { if (!t) return ''; const d = new Date(t); return isNaN(d) ? esc(t) : d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC'; };
-const ago = (t) => { if (!t) return '–'; const s = (Date.now() - new Date(t)) / 1000; if (s < 90) return 'just now'; if (s < 5400) return Math.round(s / 60) + ' min ago'; if (s < 172800) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago'; };
+var ZH = {"h0":"agents","t0":"首页","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t13":"代码：<a href=\"https://github.com/dfmi-app/dfmi-app\">github.com/dfmi-app/dfmi-app</a>（<code>paykit</code>、<code>buykit</code>、<code>seller-agent</code>、<code>buyer-agent</code>，MIT）。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
+var EN = {};
+document.querySelectorAll("[data-i18n]").forEach(function(el){ EN[el.getAttribute("data-i18n")] = el.innerHTML; });
+var lang = "en";
+function setLang(l){ lang=l; var d=(l==="zh")?ZH:EN; document.querySelectorAll("[data-i18n]").forEach(function(el){ var k=el.getAttribute("data-i18n"); if(d[k]!=null) el.innerHTML=d[k]; }); document.documentElement.lang=(l==="zh")?"zh-CN":"en"; var e=document.getElementById("langEn"); if(e) e.classList.toggle("on",l==="en"); var z=document.getElementById("langZh"); if(z) z.classList.toggle("on",l==="zh"); try{localStorage.setItem("dfmi-lang",l);}catch(_){ } if(lastFeed) render(lastFeed); else setLive(liveOk); }
+function toggleLang(){ setLang(lang==="zh"?"en":"zh"); }
 
-function render(f) {
-  $('s-purchases').textContent = f.stats.purchases;
-  $('s-volume').textContent = Number(f.stats.volume).toFixed(4);
-  $('s-human').textContent = f.stats.humanActions;
-  $('s-last').textContent = ago(f.stats.lastPurchase);
-  $('foot').textContent = `block ${f.head} · updated ${when(f.updatedAt)}`;
+// ---- dynamic strings (timeline, cards) in both languages
+var S = {
+  en:{live:"live · refreshes every 15 s",stale:"feed unavailable",noSess:"no sessions yet",noEv:"nothing yet",agent:"agent",human:"human",
+      bought:function(d,a){return "bought "+d+" for <b>"+a+" dUSD</b>";},granted:function(k,c,e){return "granted session "+k+": cap <b>"+c+" dUSD</b>"+(e?", until "+e:"");},
+      revoked:function(k){return "revoked session "+k;},revNote:"the key still exists on the buyer's machine; it can no longer spend",
+      session:"session",wallet:"wallet",seller:"seller",tx:"tx",spent:"spent",cap:"cap",remaining:"remaining",expires:"expires",noExp:"no expiry",owner:"owner",
+      active:"active",revokedP:"revoked",expired:"expired",block:"block",updated:"updated",justNow:"just now",minAgo:function(n){return n+" min ago";},hAgo:function(n){return n+" h ago";},dAgo:function(n){return n+" d ago";},goods:"goods"},
+  zh:{live:"实时 · 每 15 秒刷新",stale:"数据源不可用",noSess:"暂无 session",noEv:"暂无记录",agent:"agent",human:"人",
+      bought:function(d,a){return "购买 "+d+"，<b>"+a+" dUSD</b>";},granted:function(k,c,e){return "授权 session "+k+"：额度 <b>"+c+" dUSD</b>"+(e?"，有效至 "+e:"");},
+      revoked:function(k){return "撤销 session "+k;},revNote:"钥匙仍在买家机器上，但已无法再花一分钱",
+      session:"session",wallet:"钱包",seller:"卖家",tx:"tx",spent:"已花",cap:"额度",remaining:"剩余",expires:"到期",noExp:"不过期",owner:"主人",
+      active:"有效",revokedP:"已撤销",expired:"已过期",block:"区块",updated:"更新于",justNow:"刚刚",minAgo:function(n){return n+" 分钟前";},hAgo:function(n){return n+" 小时前";},dAgo:function(n){return n+" 天前";},goods:"商品"}
+};
+var T = function(){ return S[lang]; };
+var lastFeed = null, liveOk = false;
+var $ = function(id){ return document.getElementById(id); };
+var esc = function(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];}); };
+var short = function(a){ return a ? a.slice(0,6)+"…"+a.slice(-4) : ""; };
+var when = function(t){ if(!t) return ""; var d=new Date(t); return isNaN(d) ? esc(t) : d.toISOString().replace("T"," ").slice(0,16)+" UTC"; };
+var ago = function(t){ if(!t) return "–"; var s=(Date.now()-new Date(t))/1000; if(s<90) return T().justNow; if(s<5400) return T().minAgo(Math.round(s/60)); if(s<172800) return T().hAgo(Math.round(s/3600)); return T().dAgo(Math.round(s/86400)); };
+var EXPLORER = null; // e.g. "https://explorer.dfmi.app/tx/" — set to link transaction hashes
+var txl = function(h){ return EXPLORER ? '<a href="'+EXPLORER+esc(h)+'" target="_blank" rel="noopener">'+esc(h)+'</a>' : esc(h); };
+function setLive(ok){ liveOk=ok; $("live").classList.toggle("stale",!ok); $("livetext").textContent = ok ? T().live : T().stale; }
 
-  const sess = [];
-  for (const w of f.wallets) for (const s of w.sessions) {
-    const st = !s.active ? 'revoked' : s.expired ? 'expired' : 'active';
-    const cap = Number(s.cap || 0), spent = Number(s.spent || 0), pct = cap ? Math.min(100, spent / cap * 100) : 0;
-    sess.push(`<div class="sess ${st}">
-      <div class="row"><span class="mono">wallet ${short(w.wallet)}</span><span class="pill ${st}">${st}</span></div>
-      <div class="mono">session key ${esc(s.sessionKey)}</div>
-      <div class="bar"><i style="width:${pct}%"></i></div>
-      <div class="kv"><span>spent ${esc(s.spent)} / cap ${esc(s.cap)} dUSD</span><span>remaining ${esc(s.remaining)}</span></div>
-      <div class="kv" style="margin-top:4px"><span>${s.expiry ? 'expires ' + when(s.expiry) : 'no expiry'}</span><span>owner ${short(w.owner)}</span></div>
-    </div>`);
-  }
-  $('sessions').innerHTML = sess.length ? sess.join('') : '<div class="empty">no sessions yet</div>';
+function render(f){
+  lastFeed = f; var t = T();
+  $("s-purchases").textContent = f.stats.purchases;
+  $("s-volume").textContent = Number(f.stats.volume).toFixed(4);
+  $("s-human").textContent = f.stats.humanActions;
+  $("s-last").textContent = ago(f.stats.lastPurchase);
+  $("foot").textContent = "eip155:"+ (f.chain||"").replace("eip155:","") +" · dUSD · "+t.block+" "+f.head+" · "+t.updated+" "+when(f.updatedAt);
 
-  const rows = [...f.events].reverse().map(e => {
-    if (e.kind === 'purchase') return `<div class="ev"><time>${when(e.time)}</time><div>
-      <span class="who">agent</span><span class="what">bought ${esc(e.description || 'goods')} for <b>${esc(e.amount)} dUSD</b></span>
-      <div class="meta">${e.scheme === 'dfmi-session' ? 'session ' + esc(short(e.sessionKey)) + ' of wallet ' + esc(short(e.buyer)) : 'wallet ' + esc(short(e.buyer))} → seller ${esc(short(e.seller))}${e.agentName ? ' · agent "' + esc(e.agentName) + '" #' + esc(e.agentId) : ''} · tx ${esc(e.tx)}</div></div></div>`;
-    if (e.kind === 'grant') return `<div class="ev human"><time>${when(e.time)}</time><div>
-      <span class="who">human</span><span class="what">granted session ${esc(short(e.sessionKey))}: cap <b>${esc(e.cap)} dUSD</b>${e.expiry ? ', until ' + when(e.expiry) : ''}</span>
-      <div class="meta">wallet ${esc(short(e.wallet))} · tx ${esc(e.tx)}</div></div></div>`;
-    if (e.kind === 'revoke') return `<div class="ev human"><time>${when(e.time)}</time><div>
-      <span class="who">human</span><span class="what">revoked session ${esc(short(e.sessionKey))}</span>
-      <div class="meta">wallet ${esc(short(e.wallet))} · tx ${esc(e.tx)} · the key still exists on the buyer's machine; it can no longer spend</div></div></div>`;
-    return '';
+  var sess = [];
+  f.wallets.forEach(function(w){ w.sessions.forEach(function(s){
+    var st = !s.active ? "revoked" : s.expired ? "expired" : "active";
+    var cap=Number(s.cap||0), spent=Number(s.spent||0), pct = cap ? Math.min(100, spent/cap*100) : 0;
+    sess.push('<div class="sess '+st+'"><div class="row"><span class="mono">'+t.wallet+' '+short(w.wallet)+'</span><span class="pill '+st+'">'+(st==="active"?t.active:st==="revoked"?t.revokedP:t.expired)+'</span></div>'+
+      '<div class="mono">'+t.session+' '+esc(s.sessionKey)+'</div><div class="bar"><i style="width:'+pct+'%"></i></div>'+
+      '<div class="kv"><span>'+t.spent+' '+esc(s.spent)+' / '+t.cap+' '+esc(s.cap)+' dUSD</span><span>'+t.remaining+' '+esc(s.remaining)+'</span></div>'+
+      '<div class="kv" style="margin-top:4px"><span>'+(s.expiry ? t.expires+" "+when(s.expiry) : t.noExp)+'</span><span>'+t.owner+' '+short(w.owner)+'</span></div></div>');
+  }); });
+  $("sessions").innerHTML = sess.length ? sess.join("") : '<div class="empty">'+t.noSess+'</div>';
+
+  var rows = f.events.slice().reverse().map(function(e){
+    if(e.kind==="purchase") return '<div class="ev"><time>'+when(e.time)+'</time><div><span class="who">'+t.agent+'</span><span class="what">'+t.bought(esc(e.description||t.goods), esc(e.amount))+'</span>'+
+      '<div class="meta">'+(e.scheme==="dfmi-session" ? t.session+' '+esc(short(e.sessionKey))+' · '+t.wallet+' '+esc(short(e.buyer)) : t.wallet+' '+esc(short(e.buyer)))+' → '+t.seller+' '+esc(short(e.seller))+(e.agentName ? ' · agent "'+esc(e.agentName)+'" #'+esc(e.agentId) : '')+' · '+t.tx+' '+txl(e.tx)+'</div></div></div>';
+    if(e.kind==="grant") return '<div class="ev human"><time>'+when(e.time)+'</time><div><span class="who">'+t.human+'</span><span class="what">'+t.granted(esc(short(e.sessionKey)), esc(e.cap), e.expiry?when(e.expiry):"")+'</span>'+
+      '<div class="meta">'+t.wallet+' '+esc(short(e.wallet))+' · '+t.tx+' '+txl(e.tx)+'</div></div></div>';
+    if(e.kind==="revoke") return '<div class="ev human"><time>'+when(e.time)+'</time><div><span class="who">'+t.human+'</span><span class="what">'+t.revoked(esc(short(e.sessionKey)))+'</span>'+
+      '<div class="meta">'+t.wallet+' '+esc(short(e.wallet))+' · '+t.tx+' '+txl(e.tx)+' · '+t.revNote+'</div></div></div>';
+    return "";
   });
-  $('timeline').innerHTML = rows.length ? rows.join('') : '<div class="empty">nothing yet</div>';
+  $("timeline").innerHTML = rows.length ? rows.join("") : '<div class="empty">'+t.noEv+'</div>';
+  setLive(true);
 }
 
-async function tick() {
-  try {
-    const r = await fetch('feed.json', { cache: 'no-store' }); if (!r.ok) throw new Error(r.status);
-    render(await r.json());
-    $('live').classList.remove('stale'); $('livetext').textContent = 'live · refreshes every 15 s';
-  } catch (e) { $('live').classList.add('stale'); $('livetext').textContent = 'feed unavailable'; }
+function tick(){
+  fetch("feed.json",{cache:"no-store"}).then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); }).then(render).catch(function(){ setLive(false); });
 }
+try{ var saved=localStorage.getItem("dfmi-lang"); if(saved==="zh") setLang("zh"); }catch(_){ }
 tick(); setInterval(tick, 15000);
 </script>
-</body>
-</html>
+</body></html>
