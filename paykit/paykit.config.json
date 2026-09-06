@@ -6,6 +6,10 @@
   "symbol": "dUSD",
   "decimals": 6,
   "facilitator": "https://facilitator.dfmi.app",
+  "tokenDomain": {
+    "name": "DFMI Dollar",
+    "version": "1"
+  },
   "confirmations": 1,
   "store": "./invoices.json"
 }

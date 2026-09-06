@@ -30,12 +30,14 @@ npm test          # 7 tests against a fake chain; no network needed
   "token": "0x03E25a5DC7aC15f32462652a4bF4986F378d5fcf",
   "symbol": "dUSD",
   "decimals": 6,
+  "facilitator": "https://facilitator.dfmi.app",
+  "tokenDomain": { "name": "DFMI Dollar", "version": "1" },
   "confirmations": 1,
   "store": "./invoices.json"
 }
 ```
 
-Nothing in it is secret. Point `store` somewhere else if you want the invoice file outside the repo.
+Nothing in it is secret. `facilitator` and `tokenDomain` are used only by the buyer-side `pay.mjs`; the seller tools need just the RPC. Point `store` somewhere else if you want the invoice file outside the repo.
 
 ## Use it from an agent (MCP)
 
@@ -68,11 +70,13 @@ node src/cli.mjs remind inv_2a45e5acb8e5 --tone firm
 node src/cli.mjs list   --status open
 ```
 
-To test the whole loop from one machine, pay an invoice from a buyer wallet (this is the buyer's key, not the seller's; the seller never holds one):
+To pay an invoice from the buyer side, sign offline and let the facilitator settle it (the buyer needs dUSD only, no native coin; this is the buyer's key, and the seller never holds one):
 
 ```bash
-BUYER_KEY=0x… node src/pay.mjs --invoice inv_2a45e5acb8e5     # plain dUSD transfer of the exact amount
-node src/cli.mjs check inv_2a45e5acb8e5                          # → "paid", with the tx hash and payer
+BUYER_KEY=0x…   node src/pay.mjs 0x<pay_to> 0.020516                    # EIP-3009 authorization → facilitator /settle
+BUYER_KEY=0x…   node src/pay.mjs --invoice inv_2a45e5acb8e5             # same, reading pay_to + exact_amount from the local store
+SESSION_KEY=0x… node src/pay.mjs --session 0x<wallet> 0x<pay_to> 0.020516   # pay from a SessionKeyWallet within its cap
+node src/cli.mjs check inv_2a45e5acb8e5 --tx 0x…                        # seller side → "paid", with the tx hash and payer
 ```
 
 ## How settlement is verified
