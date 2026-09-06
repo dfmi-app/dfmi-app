@@ -21,3 +21,11 @@ location /agents/ { proxy_pass http://127.0.0.1:4095/agents/; proxy_set_header H
 ```
 
 Then `https://dfmi.app/agents/`. Nothing on the page is writable; it holds no keys and never talks to the facilitator's write routes.
+
+## Linking it from the rest of the site
+
+`patch-agents-link.py` adds an "Agents" link (EN / "Agents 实况" ZH) to the shared footer of the static pages, idempotently, with a backup per file:
+
+```bash
+python3 agents-page/patch-agents-link.py /home/ubuntu/faucet/dfmi/faucet.html /home/ubuntu/faucet/dfmi/legal.html /home/ubuntu/faucet/dfmi/privacy.html /home/ubuntu/faucet/dfmi/terms.html
+```
