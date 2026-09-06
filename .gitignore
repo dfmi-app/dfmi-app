@@ -20,3 +20,13 @@ buyers/purchases.json
 .DS_Store
 Thumbs.db
 .vscode/
+
+# paykit local state
+paykit/invoices.json
+paykit/invoices.json.tmp
+paykit/node_modules/
+paykit/package-lock.json
+
+# seller-agent local state
+seller-agent/node_modules/
+seller-agent/package-lock.json
