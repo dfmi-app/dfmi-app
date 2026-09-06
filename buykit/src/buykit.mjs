@@ -82,9 +82,12 @@ export class BuyKit {
     const intent = await this.chain.allowed(this.wallet, this.sessionAddress, payTo);
     if (intent && !intent.ok) return refuse(intent.category === 0 ? 'payee is not a registered service (outside this session\'s intent)' : `payee category ${intent.category} is outside this session's intent`);
 
-    // idempotency against the chain: an exact-amount transfer wallet → payee in the recent past means it is already paid
+    // idempotency against the chain: an exact-amount transfer wallet → payee in the recent past means it is already paid.
+    // If that scan cannot be done, refuse: paying without knowing whether we already paid is how duplicates happen.
     const head = await this.chain.blockNumber();
-    const priorTx = await this.#findPaid(payTo, units, head);
+    let priorTx;
+    try { priorTx = await this.#findPaid(payTo, units, head); }
+    catch (e) { return refuse(`could not verify prior payments on-chain (${e.shortMessage ?? e.message}); not paying`, { retry_later: true }); }
     if (priorTx) return this.#record({ invoice_id, payTo, units, amount, memo, tx: priorTx, status: 'already_paid' });
 
     // sign the Pay intent with the session key

@@ -36,16 +36,26 @@ export class ChainReader {
    */
   async transfersTo(payee, fromBlock, toBlock = 'latest') {
     const to = getAddress(payee);
-    const logs = await this.provider.getLogs({
-      address: this.token,
-      fromBlock,
-      toBlock,
-      topics: [TRANSFER_TOPIC, null, ERC20.getAbiCoder().encode(['address'], [to])],
-    });
-    return logs.map(l => {
-      const { args } = ERC20.parseLog({ topics: l.topics, data: l.data });
-      return { from: args.from, to: args.to, value: BigInt(args.value), txHash: l.transactionHash, block: l.blockNumber, logIndex: l.index ?? l.logIndex };
-    });
+    const topics = [TRANSFER_TOPIC, null, ERC20.getAbiCoder().encode(['address'], [to])];
+    // Scan in chunks: many nodes cap the eth_getLogs block range. A chunk that still fails with a range error is halved.
+    const head = typeof toBlock === 'number' ? toBlock : await this.blockNumber();
+    let chunk = Number(this.cfg.logChunk ?? 1000);
+    const out = [];
+    for (let hi = head; hi >= fromBlock; ) {
+      const lo = Math.max(fromBlock, hi - chunk + 1);
+      let logs;
+      try { logs = await this.provider.getLogs({ address: this.token, fromBlock: lo, toBlock: hi, topics }); }
+      catch (e) {
+        if (chunk > 50 && /range|limit|too many|exceed/i.test(String(e?.message ?? e))) { chunk = Math.floor(chunk / 2); continue; }
+        throw e;
+      }
+      for (const l of logs) {
+        const { args } = ERC20.parseLog({ topics: l.topics, data: l.data });
+        out.push({ from: args.from, to: args.to, value: BigInt(args.value), txHash: l.transactionHash, block: l.blockNumber, logIndex: l.index ?? l.logIndex });
+      }
+      hi = lo - 1;
+    }
+    return out.sort((a, b) => a.block - b.block || a.logIndex - b.logIndex);
   }
 
   /**

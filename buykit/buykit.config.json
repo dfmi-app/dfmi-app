@@ -7,6 +7,7 @@
   "decimals": 6,
   "facilitator": "https://facilitator.dfmi.app",
   "confirmations": 1,
-  "lookbackBlocks": 20000,
+  "lookbackBlocks": 5000,
+  "logChunk": 1000,
   "store": "./purchases.json"
 }

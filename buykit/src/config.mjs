@@ -21,7 +21,8 @@ export function loadConfig(explicitPath) {
     if (cfg[k] === undefined) throw new Error(`buykit.config.json is missing "${k}"`);
   }
   cfg.confirmations = Number(cfg.confirmations ?? 1);
-  cfg.lookbackBlocks = Number(cfg.lookbackBlocks ?? 20000);
+  cfg.lookbackBlocks = Number(cfg.lookbackBlocks ?? 5000);
+  cfg.logChunk = Number(cfg.logChunk ?? 1000);
   cfg.store = resolve(dirname(path), cfg.store ?? './purchases.json');
   cfg.wallet = process.env.SESSION_WALLET ?? cfg.wallet ?? null;
   cfg._path = path;

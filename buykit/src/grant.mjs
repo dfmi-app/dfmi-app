@@ -54,12 +54,18 @@ try {
     const cap = parseUnits(String(rest[2]), cfg.decimals);
     const expiry = Math.floor(Date.now() / 1000) + Number(flag('--days', 7)) * 86400;
     const mask = BigInt(flag('--mask', 0));
-    let tx;
-    try { tx = await wallet['grantSession(address,uint256,uint64,uint256)'](sessionKey, cap, expiry, mask, { ...tx0, gasLimit: 300_000 }); }
-    catch { tx = await wallet['grantSession(address,uint256,uint64)'](sessionKey, cap, expiry, { ...tx0, gasLimit: 300_000 }); }
+    // v1 or v2? Simulate the v2 call first (no gas, nothing on-chain); a v1 wallet has no such function and reverts the simulation.
+    const v2 = wallet.getFunction('grantSession(address,uint256,uint64,uint256)');
+    const v1 = wallet.getFunction('grantSession(address,uint256,uint64)');
+    let isV2 = true;
+    try { await v2.staticCall(sessionKey, cap, expiry, mask, { from: owner.address }); } catch { isV2 = false; }
+    if (!isV2 && mask !== 0n) console.error('note: v1 SessionKeyWallet has no intent mask; --mask ignored');
+    if (!isV2) { try { await v1.staticCall(sessionKey, cap, expiry, { from: owner.address }); } catch (e) { throw new Error(`grantSession would revert: ${e.reason ?? e.shortMessage ?? e.message} (is OWNER_KEY the wallet owner?)`); } }
+    const tx = isV2 ? await v2.send(sessionKey, cap, expiry, mask, { ...tx0, gasLimit: 300_000 }) : await v1.send(sessionKey, cap, expiry, { ...tx0, gasLimit: 300_000 });
     const rc = await tx.wait();
     console.log(JSON.stringify({ granted: true, tx: rc.hash, ...(await status()) }, null, 2));
   } else if (cmd === 'revoke') {
+    try { await wallet.revokeSession.staticCall(sessionKey, { from: owner.address }); } catch (e) { throw new Error(`revokeSession would revert: ${e.reason ?? e.shortMessage ?? e.message}`); }
     const rc = await (await wallet.revokeSession(sessionKey, { ...tx0, gasLimit: 100_000 })).wait();
     console.log(JSON.stringify({ revoked: true, tx: rc.hash, ...(await status()) }, null, 2));
   } else if (cmd === 'fund') {

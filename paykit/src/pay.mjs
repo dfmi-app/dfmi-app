@@ -56,7 +56,7 @@ const payerAddr = session ? wallet : signer.address;
 
 // ---- idempotency: a 5xx from the facilitator is not proof the payment failed. Before paying, look for an
 //      exact-amount transfer from this payer to this payee in the recent past; if it exists, report it and stop.
-const LOOKBACK = Number(process.env.PAY_LOOKBACK_BLOCKS ?? 20000);
+const LOOKBACK = Number(process.env.PAY_LOOKBACK_BLOCKS ?? 5000);
 async function alreadyPaid() {
   const head = await reader.blockNumber();
   const xfers = await reader.transfersTo(payTo, Math.max(0, head - LOOKBACK), head);
@@ -64,7 +64,9 @@ async function alreadyPaid() {
 }
 const done = (t, note) => { console.error(note); console.log(JSON.stringify({ tx_hash: t.txHash, block: t.block, payer: t.from, to: payTo, amount, symbol: cfg.symbol, already_paid: true }, null, 2)); process.exit(0); };
 if (!process.env.PAY_FORCE) {
-  const prior = await alreadyPaid().catch(() => null);
+  let prior;
+  try { prior = await alreadyPaid(); }
+  catch (e) { console.error(`could not verify prior payments on-chain (${e.shortMessage ?? e.message}); not paying. Set PAY_FORCE=1 to pay anyway.`); process.exit(1); }
   if (prior) done(prior, `already paid: ${amount} ${cfg.symbol} from ${payerAddr} → ${payTo} in tx ${prior.txHash} (block ${prior.block}). Not paying twice; set PAY_FORCE=1 to override.`);
 }
 

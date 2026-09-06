@@ -51,15 +51,30 @@ export class ChainReader {
     catch { return null; }
   }
 
-  /** Token transfers FROM the session wallet TO payee in [fromBlock, toBlock]. */
-  async transfersFromTo(walletAddr, payTo, fromBlock, toBlock = 'latest') {
+  /**
+   * Token transfers FROM the session wallet TO payee in [fromBlock, toBlock].
+   * Scans in chunks (cfg.logChunk blocks, default 1000) because many nodes cap the eth_getLogs range;
+   * a chunk that still fails with a range error is halved and retried.
+   */
+  async transfersFromTo(walletAddr, payTo, fromBlock, toBlock) {
     const enc = ERC20.getAbiCoder();
-    const logs = await this.provider.getLogs({
-      address: this.token, fromBlock, toBlock,
-      topics: [TRANSFER_TOPIC, enc.encode(['address'], [getAddress(walletAddr)]), enc.encode(['address'], [getAddress(payTo)])],
-    });
-    return logs.map(l => { const { args } = ERC20.parseLog({ topics: l.topics, data: l.data });
-      return { from: args.from, to: args.to, value: BigInt(args.value), txHash: l.transactionHash, block: l.blockNumber }; });
+    const topics = [TRANSFER_TOPIC, enc.encode(['address'], [getAddress(walletAddr)]), enc.encode(['address'], [getAddress(payTo)])];
+    const head = typeof toBlock === 'number' ? toBlock : await this.blockNumber();
+    let chunk = Number(this.cfg.logChunk ?? 1000);
+    const out = [];
+    for (let hi = head; hi >= fromBlock; ) {
+      const lo = Math.max(fromBlock, hi - chunk + 1);
+      let logs;
+      try { logs = await this.provider.getLogs({ address: this.token, fromBlock: lo, toBlock: hi, topics }); }
+      catch (e) {
+        if (chunk > 50 && /range|limit|too many|exceed/i.test(String(e?.message ?? e))) { chunk = Math.floor(chunk / 2); continue; }
+        throw e;
+      }
+      for (const l of logs) { const { args } = ERC20.parseLog({ topics: l.topics, data: l.data });
+        out.push({ from: args.from, to: args.to, value: BigInt(args.value), txHash: l.transactionHash, block: l.blockNumber }); }
+      hi = lo - 1;
+    }
+    return out.sort((a, b) => a.block - b.block);
   }
 
   units(amountDecimal) { return parseUnits(String(amountDecimal), this.cfg.decimals); }
