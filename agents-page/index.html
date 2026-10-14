@@ -19,7 +19,7 @@ a{color:var(--acc)}
 header{position:sticky;top:0;z-index:9;background:rgba(245,243,238,.9);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
 header .row{display:flex;align-items:center;justify-content:space-between;height:74px}
 .brand{font-family:var(--serif);font-style:italic;font-size:32px}.brand a{color:inherit;text-decoration:none}
-.brand span{font-style:normal;font-size:20px;color:var(--dim);margin-left:10px}
+.brand span{font-style:normal;font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:var(--dim);margin-left:10px}
 .back{font-family:var(--mono);font-size:13px;color:var(--ink2);text-decoration:none}.back:hover{color:var(--acc)}
 .langsw{display:inline-flex}.lang{font-family:var(--mono);font-size:12px;color:var(--ink);background:transparent;border:1px solid var(--ink);padding:4px 10px;cursor:pointer}.langsw .lang+.lang{border-left:none}.lang:hover{background:var(--ink);color:var(--bg)}.lang.on{background:var(--ink);color:var(--bg)}
 .right{display:flex;align-items:center;gap:16px}
@@ -91,7 +91,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
 </head>
 <body>
 <header><div class="wrap"><div class="row">
-  <div class="brand"><a href="/">dfmi</a><span data-i18n="h0">agents</span></div>
+  <div class="brand"><a href="/">dfmi</a><span data-i18n="h0">AGENTS</span></div>
   <div class="right">
     <nav class="hnav" id="nav-links">
       <a href="https://points.dfmi.me/" data-i18n="navPoints">Points</a>
@@ -140,7 +140,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
 </div></div></footer>
 
 <script>
-var ZH = {"h0":"agents","t0":"首页","navPoints":"积分","navWallets":"钱包","navId":"认证","navContact":"联络","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t16":"这个买家用<b>发票</b>付款;市场的另一扇门是按次付的 <b>x402</b>。<a href=\"/pay.html\">两种开口,一种结算</a>","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
+var ZH = {"h0":"AGENTS","t0":"首页","navPoints":"积分","navWallets":"钱包","navId":"认证","navContact":"联络","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t16":"这个买家用<b>发票</b>付款;市场的另一扇门是按次付的 <b>x402</b>。<a href=\"/pay.html\">两种开口,一种结算</a>","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
 var EN = {};
 document.querySelectorAll("[data-i18n]").forEach(function(el){ EN[el.getAttribute("data-i18n")] = el.innerHTML; });
 var lang = "en";
