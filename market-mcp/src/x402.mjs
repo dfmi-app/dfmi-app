@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto';
 
 // Network → chainId + default EIP-712 domain of the asset (accepts[].extra wins when present).
 export const CHAINS = {
-  'eip155:112172': { chainId: 112172, mainnet: false, domain: { name: 'DFMI Dollar', version: '1' }, label: 'dfmi (dUSD, test unit)' },
+  'eip155:112172': { chainId: 112172, mainnet: false, domain: { name: 'DFMI Dollar', version: '1' }, label: 'dfmi (dUSD points)' },
   'base-sepolia':  { chainId: 84532,  mainnet: false, domain: { name: 'USDC', version: '2' },        label: 'Base Sepolia (test USDC)' },
   'eip155:84532':  { chainId: 84532,  mainnet: false, domain: { name: 'USDC', version: '2' },        label: 'Base Sepolia (test USDC)' },
   'base':          { chainId: 8453,   mainnet: true,  domain: { name: 'USD Coin', version: '2' },    label: 'Base mainnet (USDC)' },

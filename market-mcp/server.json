@@ -2,19 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dfmi-app/dfmi-market",
   "title": "dfmi x402 market",
-  "description": "Shop the dfmi x402 agent market: find services, get quotes, free test dUSD, capped buying.",
+  "description": "Shop the dfmi x402 agent market: find services, get quotes, free dUSD points, capped buying.",
   "repository": {
     "url": "https://github.com/dfmi-app/dfmi-app",
     "source": "github",
     "subfolder": "market-mcp"
   },
   "websiteUrl": "https://dfmi.app",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "dfmi-market-mcp",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         { "name": "DFMI_BUYER_PRIVATE_KEY", "description": "Optional throwaway buyer key. If unset, dfmi_create_wallet makes one in ~/.dfmi.", "isRequired": false, "isSecret": true },

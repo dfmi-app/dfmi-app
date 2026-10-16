@@ -7,7 +7,7 @@
  * Safety, enforced in code (not in the model's prompt):
  *   - per-call cap   DFMI_MAX_PRICE        (default 0.10) — the model can lower it per call, never raise it
  *   - session budget DFMI_SESSION_BUDGET   (default 1.00) — total spend for the life of this server process
- *   - mainnet        DFMI_ALLOW_MAINNET=1  required; testnets (dfmi dUSD, Base Sepolia) only by default
+ *   - mainnet        DFMI_ALLOW_MAINNET=1  required; only dfmi dUSD points and Base Sepolia test USDC by default
  *
  * Wallet: DFMI_BUYER_PRIVATE_KEY, else ~/.dfmi/buyer-wallet.json (created by dfmi_create_wallet, mode 0600).
  * Use a throwaway buyer wallet only. The key never leaves this process; only signatures are sent.
@@ -55,7 +55,7 @@ async function getJson(url) {
 const ok = obj => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 const tool = fn => async (args) => { try { return ok(await fn(args ?? {})); } catch (e) { return { isError: true, content: [{ type: 'text', text: String(e?.message ?? e) }] }; } };
 
-const server = new McpServer({ name: 'dfmi-market', version: '0.1.0' });
+const server = new McpServer({ name: 'dfmi-market', version: '0.1.1' });
 
 server.registerTool('dfmi_list_services', {
   title: 'List dfmi services',
@@ -107,8 +107,8 @@ server.registerTool('dfmi_create_wallet', {
 }));
 
 server.registerTool('dfmi_claim_faucet', {
-  title: 'Claim free test dUSD',
-  description: 'Claim 10 dUSD (test unit, no monetary value) from the dfmi faucet to the buyer wallet. Once per address, ever.',
+  title: 'Claim free dUSD',
+  description: 'Claim 10 dUSD (points, no monetary value; not refundable or redeemable) from the dfmi faucet to the buyer wallet. Once per address, ever.',
   inputSchema: {},
   annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: true },
 }, tool(async () => {

@@ -1,6 +1,6 @@
 # dfmi-market-mcp
 
-MCP server for the [dfmi](https://dfmi.app) x402 agent market. Plug it into Claude, Cursor, Codex or any MCP client and the agent can browse services, get quotes, get free test funds and buy — with hard spend limits enforced in code.
+MCP server for the [dfmi](https://dfmi.app) x402 agent market. Plug it into Claude, Cursor, Codex or any MCP client and the agent can browse services, get quotes, claim free dUSD points and buy — with hard spend limits enforced in code.
 
 | Tool | What it does | Pays? |
 |---|---|---|
@@ -33,10 +33,10 @@ Then ask: *"Find a market report on dfmi, check the price, and buy it."*
 |---|---|---|
 | `DFMI_MAX_PRICE` | `0.10` | Max per purchase. The model may lower it per call, never raise it. |
 | `DFMI_SESSION_BUDGET` | `1.00` | Total spend for one server run. |
-| `DFMI_ALLOW_MAINNET` | off | Testnets only (dfmi dUSD, Base Sepolia USDC) unless set to `1`. |
+| `DFMI_ALLOW_MAINNET` | off | Only dfmi dUSD points and Base Sepolia test USDC unless set to `1`. |
 | `DFMI_BUYER_PRIVATE_KEY` | — | Use your own throwaway key instead of `~/.dfmi/buyer-wallet.json`. |
 
-dUSD is a test unit with no monetary value. Use a throwaway wallet only.
+dUSD is a points unit with no monetary value: claim it free from the faucet or buy it with a card on dfmi.app; it cannot be refunded or cashed out. Use a throwaway wallet only.
 
 ## Develop
 
