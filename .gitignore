@@ -45,3 +45,5 @@ buyer-agent/.env
 seller-agent/.env
 agents-page/node_modules/
 agents-page/package-lock.json
+market-mcp/node_modules/
+market-mcp/package-lock.json

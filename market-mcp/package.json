@@ -1,0 +1,25 @@
+{
+  "name": "dfmi-market-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the dfmi x402 agent market: browse services, get quotes, claim test dUSD, and buy pay-per-request services with spend caps.",
+  "type": "module",
+  "bin": { "dfmi-market-mcp": "src/index.mjs" },
+  "files": ["src", "README.md"],
+  "mcpName": "io.github.dfmi-app/dfmi-market",
+  "homepage": "https://dfmi.app",
+  "repository": { "type": "git", "url": "git+https://github.com/dfmi-app/dfmi-app.git", "directory": "market-mcp" },
+  "bugs": { "email": "admin@dfmi.app" },
+  "author": "dfmi Labs contributors",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": { "node": ">=18" },
+  "keywords": ["mcp", "x402", "agent-payments", "eip-3009", "dfmi"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "ethers": "^6.17.0",
+    "zod": "^3.25.0"
+  }
+}
