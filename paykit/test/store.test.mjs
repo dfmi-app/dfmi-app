@@ -5,8 +5,10 @@ import { mkdtempSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { InvoiceStore, ownerState } from '../src/store.mjs';
+
+const LOCKWORKER = new URL('./lockworker.mjs', import.meta.url).pathname;
 
 const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
 const freshStore = () => join(mkdtempSync(join(tmpdir(), 'paykit4-')), 'invoices.json');
@@ -99,27 +101,49 @@ const holderCode =
   `const old = (Date.now() - 600000) / 1000; try { utimesSync(lf, old, old); } catch {}` + // mtime 10 min ago
   `process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);`;
 
-test('#4 a paused holder (ancient mtime, still alive) is NOT stolen; recovery is safe after it exits', async () => {
+test('#4 a paused holder (ancient mtime, still alive) is NOT stolen; a crashed holder needs manual cleanup', { timeout: 30_000 }, async () => {
   const p = freshStore();
   const lockFile = p + '.lock';
   const holder = spawn(process.execPath, ['--input-type=module', '-e', holderCode], { env: { ...process.env, LF: lockFile }, stdio: 'inherit' });
   try {
-    // wait until the holder has written the lock
     for (let i = 0; i < 200 && !existsSync(lockFile); i++) await new Promise(r => setTimeout(r, 25));
     assert.ok(existsSync(lockFile), 'holder took the lock');
-    // competitor must NOT steal a live holder's lock, however old the mtime: it waits, then errors
+    const before = readFileSync(lockFile, 'utf8');
+    // a contender must NOT steal a live holder's lock, however old the mtime: it waits, then errors
     assert.throws(() => new InvoiceStore(p).put({ id: 'inv_steal', payee: PAYEE, status: 'open', amount_units: '1' }),
       /timed out acquiring store lock/, 'a live (paused) holder is never stolen from');
-    assert.ok(existsSync(lockFile), 'the holder still owns the lock after the failed attempt');
+    assert.equal(readFileSync(lockFile, 'utf8'), before, 'the contender did not move or rewrite the holder\'s lock');
   } finally {
     holder.kill('SIGKILL'); // crash the holder WITHOUT releasing the lock
     await new Promise(res => holder.on('exit', res));
   }
-  // now the owner is confirmed gone: a fresh store reclaims the dead lock and proceeds — safe recovery
+  // Interim policy: a crashed owner's lock is NOT auto-reclaimed. Acquisition fails and asks for manual cleanup.
+  assert.throws(() => new InvoiceStore(p).get('x'), /remove the lock file manually/, 'a stale lock requires manual cleanup — no auto-steal');
+  // operator stops all writers, verifies quiescence, removes the lock -> normal operation resumes
+  unlinkSync(lockFile);
   const s = new InvoiceStore(p);
   s.put({ id: 'inv_after', payee: PAYEE, status: 'open', amount_units: '1' });
-  assert.equal(new InvoiceStore(p).get('inv_after').id, 'inv_after', 'recovered after the holder exited');
-  assert.equal(existsSync(lockFile), false, 'the lock was released, not left dangling');
+  assert.equal(new InvoiceStore(p).get('inv_after').id, 'inv_after', 'resumes after manual cleanup');
+});
+
+test('#4 [deterministic] a live holder is never displaced; a contender fails cleanly without touching the lock', { timeout: 30_000 }, async () => {
+  const p = freshStore();
+  const lockFile = p + '.lock';
+  const A = spawn(process.execPath, [LOCKWORKER], { env: { ...process.env, LWP: p }, stdio: ['pipe', 'pipe', 'inherit'] });
+  await new Promise((res) => { let s = ''; A.stdout.on('data', d => { s += d; if (s.includes('ACQUIRED')) res(); }); }); // barrier: A is in the CS (not a sleep)
+  const held = readFileSync(lockFile, 'utf8');
+  assert.match(held, /^\d+:[0-9a-f]+$/, 'A owns the lock');
+  // contender B, while A is in the critical section: fails with a bounded timeout and does NOT move/delete the lock
+  assert.throws(() => new InvoiceStore(p).put({ id: 'inv_B', payee: PAYEE, status: 'open', amount_units: '1' }), /timed out acquiring store lock/);
+  assert.equal(existsSync(lockFile), true, 'lock still present after B failed');
+  assert.equal(readFileSync(lockFile, 'utf8'), held, 'B did not move, rewrite, or delete A\'s lock');
+  A.stdin.write('x'); // barrier 2: release A
+  await new Promise(res => A.on('exit', res));
+  assert.equal(existsSync(lockFile), false, 'A released its own lock on exit');
+  // only after A left could a new writer enter -> at most one process was ever in the critical section
+  const s = new InvoiceStore(p); s.put({ id: 'inv_C', payee: PAYEE, status: 'open', amount_units: '1' });
+  assert.equal(new InvoiceStore(p).get('inv_B'), null, 'the contender never entered the critical section');
+  assert.equal(new InvoiceStore(p).get('inv_C').id, 'inv_C');
 });
 
 test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {

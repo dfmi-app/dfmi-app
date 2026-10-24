@@ -24,12 +24,12 @@ const LOCK_WAIT_MS = 5_000; // wait this long for a lock, then throw — never s
 function sleep(ms) { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { const u = Date.now() + ms; while (Date.now() < u); } }
 
 /**
- * The state of a lock's owner, parsed from its "pid:token" content. Only a CONFIRMED-dead owner — the PID does
- * not exist (ESRCH) — may have its lock reclaimed. A live owner, an owner we lack permission to probe (EPERM),
- * a reused PID, or incomplete content are all treated as NOT reclaimable: we wait and then error rather than
- * ever stealing a lock whose owner might still be writing. There is NO time-based reclaim, so a holder that
- * pauses (GC, swap, SIGSTOP, debugger) for any duration keeps its lock. Exported for test.
- * Same-host only: process liveness is not meaningful across NFS, so this store must not be shared over NFS.
+ * The state of a lock's owner, parsed from its "pid:token" content: 'live', 'dead' (the PID returns ESRCH), or
+ * 'unknown' (incomplete / unparseable). DIAGNOSTIC ONLY — it is used to make the acquire-timeout message more
+ * helpful. It does NOT drive automatic reclamation: this store never deletes or moves a lock it did not create
+ * (see #acquire), because reclaiming another process's lock cannot be done race-free with plain files. A stale
+ * lock left by a crashed writer is cleared MANUALLY by an operator after confirming no writer is running.
+ * Exported for test. Same-host only: liveness is not meaningful across NFS, so do not share this store over NFS.
  */
 export function ownerState(content) {
   if (!content || !String(content).trim()) return 'unknown';  // created but owner not yet written: do not steal
@@ -46,7 +46,7 @@ export class InvoiceStore {
     this._lockToken = null;
     // One-time backfill of the consumed index from invoices settled before this guard existed — under the lock,
     // so two processes starting at once do not both write.
-    this.#withLock(() => {
+    this.withLock(() => {
       const d = this.#readOrThrow();
       let dirty = false;
       for (const inv of Object.values(d.invoices)) {
@@ -83,45 +83,33 @@ export class InvoiceStore {
   }
 
   // ---------------------------------------------------------------- cross-process lock
-  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). A held lock is reclaimed ONLY when its
-  // owner is confirmed exited (ESRCH) — never on a timeout, and never while the owner is alive or unprovable.
-  // Because a confirmed-dead owner cannot write, reclaiming its lock cannot cause a concurrent write; a possibly
-  // -live owner is never reclaimed, so there is nothing to fence. Release removes the lockfile only when its
-  // token is still ours, so one process can never delete a lock another process now holds.
+  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). This store NEVER deletes or moves a lock
+  // it did not create — reclaiming another process's lock cannot be done race-free with plain files — so a stale
+  // lock from a crashed writer is cleared MANUALLY by an operator after confirming no writer runs. Acquisition
+  // waits up to LOCK_WAIT_MS, checking the deadline on every retry, then throws (bounded; no auto-steal).
+  // Release removes the lockfile only when its token is still ours, so one process never deletes another's lock.
   #acquire() {
     const mine = `${process.pid}:${randomBytes(8).toString('hex')}`;
     const deadline = Date.now() + LOCK_WAIT_MS;
     for (;;) {
       try { const fd = openSync(this.lockFile, 'wx'); try { writeSync(fd, mine); fsyncSync(fd); } finally { closeSync(fd); } this._lockToken = mine; return; }
       catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        let content;
-        try { content = readFileSync(this.lockFile, 'utf8'); } catch { continue; } // vanished between create-fail and read: re-race
-        if (ownerState(content) === 'dead') { this.#reclaimDead(content); continue; } // only a confirmed-dead owner
-        if (Date.now() > deadline)
-          throw new Error(`timed out acquiring store lock ${this.lockFile}; held by pid ${String(content).split(':')[0]} (not confirmed exited). If that process is gone, remove the lock file manually.`);
+        if (e.code !== 'EEXIST') throw e;   // a real error (not "already held"): fail now
+        if (Date.now() > deadline) {        // bounded wait elapsed — fail, never reclaim automatically
+          let who = '';
+          try { const c = readFileSync(this.lockFile, 'utf8'); who = ` held by pid ${String(c).split(':')[0]} (${ownerState(c)})`; } catch { /* vanished */ }
+          throw new Error(`timed out acquiring store lock ${this.lockFile}${who}. Stop all writers, verify none is running, then remove the lock file manually.`);
+        }
         sleep(20);
       }
     }
-  }
-  // Reclaim a confirmed-dead owner's lock without ever deleting a lock whose content changed in the meantime
-  // (e.g. a new owner that appeared). Move it aside atomically — only one racer wins the rename — then re-check:
-  // if what we moved is actually live/unknown, put it back untouched; otherwise drop it so an O_EXCL create can win.
-  #reclaimDead(expected) {
-    const tomb = `${this.lockFile}.stale.${process.pid}.${randomBytes(4).toString('hex')}`;
-    try { renameSync(this.lockFile, tomb); } catch { return; } // ENOENT/raced: someone else handled it; retry the create
-    let moved = ''; try { moved = readFileSync(tomb, 'utf8'); } catch { /* empty */ }
-    if (moved !== expected && ownerState(moved) !== 'dead') {
-      try { renameSync(tomb, this.lockFile); } catch { try { unlinkSync(tomb); } catch { } } // replaced by a live owner: restore, do not steal
-      return;
-    }
-    try { unlinkSync(tomb); } catch { } // confirmed dead: drop it
   }
   #release() {
     try { if (readFileSync(this.lockFile, 'utf8') === this._lockToken) unlinkSync(this.lockFile); } catch { /* already gone */ }
     this._lockToken = null;
   }
-  #withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
+  /** Run `fn` with the store exclusively locked. Public so callers (and deterministic tests) can batch or hold. */
+  withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
 
   // ---------------------------------------------------------------- helpers over a snapshot
   #consumedBy(d, txHash) {
@@ -133,21 +121,21 @@ export class InvoiceStore {
   newId() { return 'inv_' + randomBytes(6).toString('hex'); }
 
   // ---------------------------------------------------------------- reads (fresh each call)
-  get(id) { return this.#withLock(() => this.#readOrThrow().invoices[id] ?? null); }
+  get(id) { return this.withLock(() => this.#readOrThrow().invoices[id] ?? null); }
   list(filter = {}) {
-    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).filter(i =>
+    return this.withLock(() => Object.values(this.#readOrThrow().invoices).filter(i =>
       (!filter.status || i.status === filter.status) && (!filter.payee || i.payee.toLowerCase() === filter.payee.toLowerCase())));
   }
   /** exact_amount uniqueness is per payee: two open invoices to the same address must not share an amount. */
   hasOpenExactAmount(payee, amountUnits) {
-    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).some(i =>
+    return this.withLock(() => Object.values(this.#readOrThrow().invoices).some(i =>
       i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits)));
   }
   /** Which invoice (if any) has already settled from this transaction. */
-  txConsumedBy(txHash) { return this.#withLock(() => this.#consumedBy(this.#readOrThrow(), txHash)); }
+  txConsumedBy(txHash) { return this.withLock(() => this.#consumedBy(this.#readOrThrow(), txHash)); }
 
   // ---------------------------------------------------------------- writes
-  put(inv) { return this.#withLock(() => { const d = this.#readOrThrow(); d.invoices[inv.id] = inv; this.#write(d); return inv; }); }
+  put(inv) { return this.withLock(() => { const d = this.#readOrThrow(); d.invoices[inv.id] = inv; this.#write(d); return inv; }); }
 
   /**
    * Atomically settle an invoice from one payment event: claim the transfer (consume-once) AND mark the invoice
@@ -155,7 +143,7 @@ export class InvoiceStore {
    * No half-state: either both the claim and the settlement are persisted, or neither is.
    */
   settle(invoiceId, { txHash, logIndex = null }, settlement) {
-    return this.#withLock(() => {
+    return this.withLock(() => {
       const d = this.#readOrThrow();
       const inv = d.invoices[invoiceId];
       if (!inv) return { ok: false, reason: 'unknown invoice' };
@@ -174,7 +162,7 @@ export class InvoiceStore {
 
   /** Mark a non-settling status (open/partial/overdue/unknown) with a last_check detail. */
   mark(invoiceId, status, detail) {
-    return this.#withLock(() => {
+    return this.withLock(() => {
       const d = this.#readOrThrow();
       const inv = d.invoices[invoiceId];
       if (!inv) return null;
