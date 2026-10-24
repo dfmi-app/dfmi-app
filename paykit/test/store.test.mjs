@@ -158,6 +158,15 @@ test('#4 [deterministic] a live holder is never displaced; a contender fails cle
   }
 });
 
+test('#4 withLock is synchronous-only: an async/Promise-returning callback is rejected and the lock is released', () => {
+  const p = freshStore();
+  const s = new InvoiceStore(p);
+  assert.throws(() => s.withLock(async () => { await Promise.resolve(); }), /synchronous-only/, 'a thenable-returning callback is rejected loudly');
+  // the lock was released despite the throw (a leaked lock would make the next op time out)
+  s.put({ id: 'inv_sync', payee: PAYEE, status: 'open', amount_units: '1' });
+  assert.equal(new InvoiceStore(p).get('inv_sync').id, 'inv_sync', 'lock was freed; normal ops continue');
+});
+
 test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {
   const p = freshStore();
   // simulate a pre-atomic crash state: tx claimed for inv_a, but inv_a was never marked paid

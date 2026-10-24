@@ -108,8 +108,23 @@ export class InvoiceStore {
     try { if (readFileSync(this.lockFile, 'utf8') === this._lockToken) unlinkSync(this.lockFile); } catch { /* already gone */ }
     this._lockToken = null;
   }
-  /** Run `fn` with the store exclusively locked. Public so callers (and deterministic tests) can batch or hold. */
-  withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
+  /**
+   * Run `fn` with the store exclusively locked, then release. SYNCHRONOUS-ONLY: `fn` must complete ALL protected
+   * work before it returns. Do NOT pass an async / Promise-returning callback, and do not schedule deferred work
+   * (timers, microtasks, I/O callbacks) from inside it — the lock is released the instant `fn()` returns, not when
+   * a Promise settles, so any continuation would run UNPROTECTED. As a tripwire we throw if `fn` returns a
+   * thenable; this only flags misuse loudly — it does NOT make async use safe, because the async work may already
+   * have started and throwing does not cancel it. Public so callers (and deterministic tests) can batch or hold.
+   */
+  withLock(fn) {
+    this.#acquire();
+    try {
+      const r = fn();
+      if (r != null && typeof r.then === 'function')
+        throw new Error('InvoiceStore.withLock is synchronous-only: fn returned a thenable. All protected work must finish before fn returns.');
+      return r;
+    } finally { this.#release(); }
+  }
 
   // ---------------------------------------------------------------- helpers over a snapshot
   #consumedBy(d, txHash) {
