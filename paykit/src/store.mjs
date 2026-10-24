@@ -11,11 +11,24 @@ import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
 export class InvoiceStore {
-  constructor(path) { this.path = path; this.data = this.#read(); }
+  constructor(path) {
+    this.path = path;
+    this.data = this.#read();
+    this.data.invoices ??= {};
+    this.data.consumed ??= {}; // transferKey -> invoice_id: a payment event can settle at most one invoice
+    // Backfill the consumed index from invoices already settled before this guard existed,
+    // so an old payment cannot be replayed onto a new invoice right after upgrade.
+    let dirty = false;
+    for (const inv of Object.values(this.data.invoices)) {
+      const h = inv.settlement?.tx_hash;
+      if (inv.status === 'paid' && h && !this.txConsumedBy(h)) { this.data.consumed[String(h).toLowerCase()] = inv.id; dirty = true; }
+    }
+    if (dirty) this.#write();
+  }
 
   #read() {
-    if (!existsSync(this.path)) return { invoices: {} };
-    try { return JSON.parse(readFileSync(this.path, 'utf8')); } catch { return { invoices: {} }; }
+    if (!existsSync(this.path)) return { invoices: {}, consumed: {} };
+    try { return JSON.parse(readFileSync(this.path, 'utf8')); } catch { return { invoices: {}, consumed: {} }; }
   }
   #write() {
     const tmp = this.path + '.tmp';
@@ -29,6 +42,26 @@ export class InvoiceStore {
   hasOpenExactAmount(payee, amountUnits) {
     return Object.values(this.data.invoices).some(i =>
       i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits));
+  }
+
+  /** Which invoice (if any) has already settled from this transaction. One payment event settles one invoice. */
+  txConsumedBy(txHash) {
+    const h = String(txHash).toLowerCase();
+    const c = this.data.consumed ?? {};
+    for (const [key, invId] of Object.entries(c)) {
+      if (key === h || key.startsWith(h + ':')) return invId;
+    }
+    return null;
+  }
+
+  /** Atomically claim a payment event (txHash, optional logIndex) for an invoice. False if another invoice already owns this tx. */
+  claimTransfer(invoiceId, txHash, logIndex = null) {
+    const h = String(txHash).toLowerCase();
+    const owner = this.txConsumedBy(h);
+    if (owner && owner !== invoiceId) return false;
+    (this.data.consumed ??= {})[logIndex == null ? h : `${h}:${logIndex}`] = invoiceId;
+    this.#write();
+    return true;
   }
 
   put(inv) { this.data.invoices[inv.id] = inv; this.#write(); return inv; }

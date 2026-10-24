@@ -13,9 +13,10 @@ const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
 const PAYER = '0x86CF69D403B1F419eEc5d66ACd661DD0EEc22DeB';
 
 /** A fake provider: a list of Transfer logs and a head block. */
+let _txSeq = 0; // suite shares one store; give each unlabelled transfer a globally-unique tx hash so the consume-once guard isn't tripped by fixture reuse
 function fakeProvider(transfers, head = 100) {
   const logs = transfers.map((t, i) => ({
-    address: cfg.token, blockNumber: t.block, transactionHash: t.tx ?? `0x${String(i + 1).padStart(64, '0')}`, index: i,
+    address: cfg.token, blockNumber: t.block, transactionHash: t.tx ?? `0x${String(++_txSeq).padStart(64, '0')}`, index: i,
     topics: [ERC20.getEvent('Transfer').topicHash, AbiCoder.defaultAbiCoder().encode(['address'], [t.from]), AbiCoder.defaultAbiCoder().encode(['address'], [t.to])],
     data: AbiCoder.defaultAbiCoder().encode(['uint256'], [t.value]),
   }));
@@ -99,4 +100,19 @@ test('send_reminder drafts text, escalates, and refuses on paid invoices', async
   Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 101 }], 105));
   await kit.checkPayment({ invoice_id: inv.invoice_id });
   assert.equal(kit.draftReminder({ invoice_id: inv.invoice_id }).skip, true);
+});
+
+test('check_payment: one payment cannot settle two invoices (consume-once)', async () => {
+  const prov = fakeProvider([]);
+  const kit = new PayKit(cfg, { provider: prov });
+  const tx = '0x' + 'cd'.repeat(32);
+  const a = await kit.createInvoice({ payee_address: PAYEE, amount: '3.00' }); // created_block = 100
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(a.amount_units), block: 101, tx }], 105));
+  assert.equal((await kit.checkPayment({ invoice_id: a.invoice_id, tx_hash: tx })).status, 'paid');
+  // A second invoice, even for the same amount, cannot be settled by the same on-chain transaction.
+  const b = await kit.createInvoice({ payee_address: PAYEE, amount: '3.00' }); // created_block = 105
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(b.amount_units), block: 106, tx }], 107));
+  const rb = await kit.checkPayment({ invoice_id: b.invoice_id, tx_hash: tx });
+  assert.notEqual(rb.status, 'paid');
+  assert.match(rb.last_check.reason, /already settled/);
 });

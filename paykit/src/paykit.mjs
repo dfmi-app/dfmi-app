@@ -60,6 +60,11 @@ export class PayKit {
       if (tx_hash) {
         const v = await this.chain.verifyTx(tx_hash, inv.payee, inv.amount_units);
         if (v.found && v.success && v.confirmations >= this.cfg.confirmations) {
+          // A settlement must not predate the invoice, and each payment event settles at most one invoice.
+          if (inv.created_block != null && v.block < inv.created_block)
+            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction predates the invoice' }));
+          if (!this.store.claimTransfer(inv.id, tx_hash))
+            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction already settled another invoice' }));
           return this.#present(this.#settle(inv, { txHash: tx_hash, from: v.from, block: v.block, value: BigInt(v.paid_units) }, v.confirmations));
         }
         if (v.found && !v.success) return this.#present(this.#mark(inv, 'partial', { tx_hash, paid: v.paid_units, reason: v.reason ?? 'insufficient amount' }));
@@ -71,11 +76,16 @@ export class PayKit {
       const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, from - 5), head);
       const want = BigInt(inv.amount_units);
       // The exact amount is the matching key; payer_hint only breaks ties (it is a hint, not a filter).
-      const exact = transfers.filter(t => t.value === want);
+      // Skip any transfer already consumed by another invoice so one payment can never settle two invoices.
+      const exact = transfers.filter(t => t.value === want && !this.store.txConsumedBy(t.txHash));
       const hit = (inv.payer_hint && exact.find(t => t.from.toLowerCase() === inv.payer_hint.toLowerCase())) || exact[0];
       if (hit) {
         const conf = head - hit.block + 1;
-        if (conf >= this.cfg.confirmations) return this.#present(this.#settle(inv, hit, conf));
+        if (conf >= this.cfg.confirmations) {
+          if (!this.store.claimTransfer(inv.id, hit.txHash, hit.logIndex))
+            return this.#present(this.#mark(inv, inv.status, { pending_tx: hit.txHash, reason: 'matching transfer already settled another invoice' }));
+          return this.#present(this.#settle(inv, hit, conf));
+        }
         return this.#present(this.#mark(inv, 'open', { pending_tx: hit.txHash, confirmations: conf, needs: this.cfg.confirmations }));
       }
       // A smaller transfer from the hinted payer counts as partial (informational; the invoice stays unsettled).
