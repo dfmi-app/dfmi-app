@@ -19,9 +19,14 @@ interface IERC20 {
  * payment it tries reverts. Funds stay safe, the account survives, the owner can still withdraw.
  *
  * Payment flow (agent-speed, offline-signed, no owner key in the loop):
- *   1. agent signs an EIP-712 Pay(to, amount, nonce, deadline) with its SESSION key
+ *   1. agent signs an EIP-712 Pay(to, amount, nonce, generation, deadline) with its SESSION key
  *   2. anyone (a relayer / the facilitator) submits it via pay()
- *   3. the contract enforces: granted, not revoked, not expired, within cap, correct nonce, valid sig
+ *   3. the contract enforces: granted, not revoked, not expired, within cap, correct nonce,
+ *      current generation, valid sig
+ *
+ * Re-granting a (revoked) key bumps its generation, so any signature produced under an earlier
+ * grant — even an unused one whose nonce and deadline would otherwise still pass — is permanently
+ * void. Revocation therefore stays final: it cannot be undone by re-authorizing the same key.
  *
  * Revocation lives in the authorization path (the pay() gate), not in the balance. That is the point.
  */
@@ -38,12 +43,13 @@ contract SessionKeyWallet {
 
     mapping(address => Session) public sessions; // sessionKey => Session
     mapping(address => uint256) public sessionNonce; // sessionKey => next expected nonce (replay guard)
+    mapping(address => uint256) public sessionGeneration; // sessionKey => current grant generation; bumped each grant so pre-grant signatures die
 
     bytes32 public immutable DOMAIN_SEPARATOR;
     bytes32 private constant PAY_TYPEHASH =
-        keccak256("Pay(address to,uint256 amount,uint256 nonce,uint256 deadline)");
+        keccak256("Pay(address to,uint256 amount,uint256 nonce,uint256 generation,uint256 deadline)");
 
-    event SessionGranted(address indexed sessionKey, uint256 cap, uint64 expiry);
+    event SessionGranted(address indexed sessionKey, uint256 cap, uint64 expiry, uint256 generation);
     event SessionRevoked(address indexed sessionKey);
     event Paid(address indexed sessionKey, address indexed to, uint256 amount, uint256 nonce);
     event OwnerWithdraw(address indexed to, uint256 amount);
@@ -71,8 +77,12 @@ contract SessionKeyWallet {
     /// Owner grants an agent a scoped session key: a spend cap and an optional expiry.
     function grantSession(address sessionKey, uint256 cap, uint64 expiry) external onlyOwner {
         require(sessionKey != address(0), "zero key");
+        // Bump the generation so any signature from a previous grant is permanently void,
+        // and reset the nonce so a re-granted key starts a fresh session at nonce 0.
+        uint256 gen = ++sessionGeneration[sessionKey];
+        sessionNonce[sessionKey] = 0;
         sessions[sessionKey] = Session({active: true, expiry: expiry, cap: cap, spent: 0});
-        emit SessionGranted(sessionKey, cap, expiry);
+        emit SessionGranted(sessionKey, cap, expiry, gen);
     }
 
     /// The kill switch. One tx, instant, irreversible for that key. Funds untouched, account survives.
@@ -98,7 +108,7 @@ contract SessionKeyWallet {
         require(nonce == sessionNonce[sessionKey], "bad nonce");
         require(s.spent + amount <= s.cap, "over session cap");
 
-        bytes32 structHash = keccak256(abi.encode(PAY_TYPEHASH, to, amount, nonce, deadline));
+        bytes32 structHash = keccak256(abi.encode(PAY_TYPEHASH, to, amount, nonce, sessionGeneration[sessionKey], deadline));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         require(_recover(digest, signature) == sessionKey, "bad session signature");
 

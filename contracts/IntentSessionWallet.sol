@@ -30,8 +30,11 @@ interface IServiceRegistry {
  * cryptography and no synchronous issuer hop — the missing piece for the full
  * problem is a shared semantic vocabulary, not enforcement machinery.
  *
- * The agent-side flow is unchanged from v1: same EIP-712 Pay, same domain name,
- * same relayer path. Intent lives in the grant, not in the signature.
+ * The agent-side flow mirrors v1: same EIP-712 Pay (now including the session
+ * generation, in lockstep with v1), same domain name, same relayer path. Intent
+ * lives in the grant, not in the signature. Re-granting a (revoked) key bumps its
+ * generation, so any signature produced under an earlier grant is permanently void —
+ * revocation cannot be undone by re-authorizing the same key.
  */
 contract IntentSessionWallet {
     address public owner;
@@ -48,12 +51,13 @@ contract IntentSessionWallet {
 
     mapping(address => Session) public sessions;
     mapping(address => uint256) public sessionNonce;
+    mapping(address => uint256) public sessionGeneration; // sessionKey => current grant generation; bumped each grant so pre-grant signatures die
 
     bytes32 public immutable DOMAIN_SEPARATOR;
     bytes32 private constant PAY_TYPEHASH =
-        keccak256("Pay(address to,uint256 amount,uint256 nonce,uint256 deadline)");
+        keccak256("Pay(address to,uint256 amount,uint256 nonce,uint256 generation,uint256 deadline)");
 
-    event SessionGranted(address indexed sessionKey, uint256 cap, uint64 expiry, uint256 intentMask);
+    event SessionGranted(address indexed sessionKey, uint256 cap, uint64 expiry, uint256 intentMask, uint256 generation);
     event SessionRevoked(address indexed sessionKey);
     event Paid(address indexed sessionKey, address indexed to, uint256 amount, uint256 nonce, uint8 category);
     event OwnerWithdraw(address indexed to, uint256 amount);
@@ -82,8 +86,12 @@ contract IntentSessionWallet {
     /// Grant a scoped session: spend cap, expiry, and an intent (category bitmask; 0 = unrestricted).
     function grantSession(address sessionKey, uint256 cap, uint64 expiry, uint256 intentMask) external onlyOwner {
         require(sessionKey != address(0), "zero key");
+        // Bump the generation so any signature from a previous grant is permanently void,
+        // and reset the nonce so a re-granted key starts a fresh session at nonce 0.
+        uint256 gen = ++sessionGeneration[sessionKey];
+        sessionNonce[sessionKey] = 0;
         sessions[sessionKey] = Session({active: true, expiry: expiry, cap: cap, spent: 0, intentMask: intentMask});
-        emit SessionGranted(sessionKey, cap, expiry, intentMask);
+        emit SessionGranted(sessionKey, cap, expiry, intentMask, gen);
     }
 
     /// Kill switch #1: cancel this credential. Funds untouched, account survives.
@@ -126,7 +134,7 @@ contract IntentSessionWallet {
             require(s.intentMask & (uint256(1) << category) != 0, "outside intent");
         }
 
-        bytes32 structHash = keccak256(abi.encode(PAY_TYPEHASH, to, amount, nonce, deadline));
+        bytes32 structHash = keccak256(abi.encode(PAY_TYPEHASH, to, amount, nonce, sessionGeneration[sessionKey], deadline));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         require(_recover(digest, signature) == sessionKey, "bad session signature");
 
