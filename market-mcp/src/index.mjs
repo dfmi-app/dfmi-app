@@ -16,7 +16,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { Wallet } from 'ethers';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { quote, buy } from './x402.mjs';
@@ -105,6 +105,7 @@ server.registerTool('dfmi_create_wallet', {
   const w = Wallet.createRandom();
   mkdirSync(HOME, { recursive: true, mode: 0o700 });
   writeFileSync(WALLET_FILE, JSON.stringify({ address: w.address, privateKey: w.privateKey, createdAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+  try { chmodSync(WALLET_FILE, 0o600); } catch {} // tighten even if the file somehow pre-existed (create-mode alone won't)
   return { address: w.address, created: true, next: 'Call dfmi_claim_faucet to get 10 free dUSD.' };
 }));
 

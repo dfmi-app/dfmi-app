@@ -44,7 +44,9 @@ server.registerTool('check_payment', {
     invoice_id: z.string().describe('Invoice id from create_invoice'),
     tx_hash: z.string().optional().describe('Optional settlement transaction hash (e.g. from an x402 PAYMENT-RESPONSE receipt) to verify directly'),
   },
-}, async (a) => { try { return json(await kit.checkPayment(a)); } catch (e) { return fail(e); } });
+  // Only invoice_id and tx_hash are forwarded: `reconcile` is an operator-only escape hatch (local CLI) and must
+  // never be settable by a remote MCP caller, or it would bypass the invoice creation-boundary check.
+}, async (a) => { try { return json(await kit.checkPayment({ invoice_id: a.invoice_id, tx_hash: a.tx_hash })); } catch (e) { return fail(e); } });
 
 server.registerTool('send_reminder', {
   title: 'Draft payment reminder',

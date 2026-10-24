@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
-import { InvoiceStore } from '../src/store.mjs';
+import { InvoiceStore, lockReclaimable } from '../src/store.mjs';
 
 const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
 const freshStore = () => join(mkdtempSync(join(tmpdir(), 'paykit4-')), 'invoices.json');
@@ -82,6 +82,29 @@ function settleWorker(p, id, tx) {
     c.on('exit', (code) => res(code === 0));
   });
 }
+
+test('#4 a live owner keeps its lock; only a dead owner (or the TTL backstop) is reclaimable', async () => {
+  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now()), false, 'a live owner with a fresh lock is never stolen');
+  assert.equal(lockReclaimable('', Date.now()), false, 'a just-created lock (owner not yet written) is not stolen');
+  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now() - 61_000), true, 'TTL backstop reclaims a very old lock (PID reuse)');
+  const deadPid = await new Promise(res => { const c = spawn(process.execPath, ['-e', '0']); c.on('exit', () => res(c.pid)); });
+  assert.equal(lockReclaimable(`${deadPid}:tok`, Date.now()), true, 'a dead owner is reclaimable immediately');
+});
+
+test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {
+  const p = freshStore();
+  // simulate a pre-atomic crash state: tx claimed for inv_a, but inv_a was never marked paid
+  writeFileSync(p, JSON.stringify({
+    invoices: { inv_a: { id: 'inv_a', payee: PAYEE, status: 'open', amount_units: '100' }, inv_b: { id: 'inv_b', payee: PAYEE, status: 'open', amount_units: '100' } },
+    consumed: { '0xorphan': 'inv_a' },
+  }));
+  const s = new InvoiceStore(p);
+  const bad = s.settle('inv_b', { txHash: '0xorphan' }, { tx_hash: '0xorphan', block: 5 });
+  assert.equal(bad.ok, false, 'another invoice cannot take the orphaned tx');
+  const good = s.settle('inv_a', { txHash: '0xorphan' }, { tx_hash: '0xorphan', block: 5 });
+  assert.equal(good.ok, true, 'the rightful invoice completes its settlement');
+  assert.equal(new InvoiceStore(p).get('inv_a').status, 'paid');
+});
 
 test('#4 concurrent claims of one tx from two processes: exactly one wins', async () => {
   const p = freshStore();

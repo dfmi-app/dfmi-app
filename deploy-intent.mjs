@@ -9,7 +9,7 @@
  *
  * Usage: node deploy-intent.mjs   (requires DEPLOYER_PRIVATE_KEY in .env; .env may live in this directory or its parent)
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits, ZeroAddress } from 'ethers';
 
 const cfgUrl = new URL('./dfmi.json', import.meta.url);
@@ -81,12 +81,14 @@ await (await w.grantSession(session.address, cap, expiry, intentMask, { ...tx0, 
 console.log(`✓ Session granted ${session.address} | cap 0.50 | 7 days | intent = market-data only (mask ${intentMask})`);
 
 // 5. record it (contains a private key — never commit)
-writeFileSync(new URL('./intent-wallet.deployed.json', import.meta.url), JSON.stringify({
+const deployedPath = new URL('./intent-wallet.deployed.json', import.meta.url);
+writeFileSync(deployedPath, JSON.stringify({
   chain: cfg.rpc, chainId: cfg.chainId, token: cfg.token,
   registry: regAddr, wallet: walletAddr, owner: owner.address,
   session: { address: session.address, privateKey: session.privateKey },
   cap: String(cap), expiry, intentMask: String(intentMask),
-}, null, 2), { mode: 0o600 }); // contains a private key: owner-only, never world-readable
+}, null, 2), { mode: 0o600 });                 // mode on CREATE
+try { chmodSync(deployedPath, 0o600); } catch {} // and tighten an already-existing file (create-mode alone won't)
 console.log(`\nDone. Next, the three-line proof of the intent layer:`);
 console.log(`  node intent-pay.mjs ${cfg.splitter} 0.02        # → ✓ settled (market-data, within intent)`);
 console.log(`  node intent-pay.mjs ${cfg.centralBank} 0.02     # → ⛔ reverted "unregistered payee" (outside intent)`);
