@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
-import { Interface, AbiCoder, Wallet, verifyTypedData, getAddress } from 'ethers';
+import { Interface, AbiCoder, Wallet, verifyTypedData, getAddress, TypedDataEncoder } from 'ethers';
 import { BuyKit } from '../src/buykit.mjs';
 
 const TOKEN = '0x03E25a5DC7aC15f32462652a4bF4986F378d5fcf';
@@ -15,7 +15,7 @@ const cfg = () => ({ chain: 'eip155:112172', chainId: 112172, rpc: 'http://unuse
 const ERC20 = new Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
 const WALLET_IFACE = new Interface([
   'function token() view returns (address)', 'function sessions(address) view returns (bool,uint64,uint256,uint256)',
-  'function sessionNonce(address) view returns (uint256)', 'function allowed(address,address) view returns (bool,uint8)']);
+  'function sessionNonce(address) view returns (uint256)', 'function sessionGeneration(address) view returns (uint256)', 'function allowed(address,address) view returns (bool,uint8)']);
 const TOKEN_IFACE = new Interface(['function balanceOf(address) view returns (uint256)']);
 
 /** a provider that answers eth_call for the wallet + token and eth_getLogs with `transfers` */
@@ -30,6 +30,7 @@ function fakeProvider(state) {
         if (fn.name === 'token') return enc.encode(['address'], [TOKEN]);
         if (fn.name === 'sessions') return enc.encode(['bool', 'uint64', 'uint256', 'uint256'], [state.active, state.expiry, state.cap, state.spent]);
         if (fn.name === 'sessionNonce') return enc.encode(['uint256'], [state.nonce]);
+        if (fn.name === 'sessionGeneration') return enc.encode(['uint256'], [state.generation]);
         if (fn.name === 'allowed') { if (state.allowed == null) throw new Error('execution reverted'); return enc.encode(['bool', 'uint8'], [state.allowed, 1]); }
       }
       if (to === getAddress(TOKEN)) return enc.encode(['uint256'], [state.balance]);
@@ -43,7 +44,14 @@ function fakeProvider(state) {
     async getNetwork() { return { chainId: 112172n }; }, async resolveName(n) { return n; }, _isProvider: true, provider: null,
   };
 }
-const base = () => ({ active: true, expiry: 0, cap: 500_000n, spent: 100_000n, nonce: 3n, balance: 1_000_000n, allowed: null, transfers: [] });
+const base = () => ({ active: true, expiry: 0, cap: 500_000n, spent: 100_000n, nonce: 3n, generation: 7n, balance: 1_000_000n, allowed: null, transfers: [] });
+
+// The wallet contract's exact EIP-712 Pay type (SessionKeyWallet.sol / IntentSessionWallet.sol), generation included.
+const PAY_TYPES = { Pay: [
+  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] };
+const PAY_TYPES_OLD = { Pay: [
+  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] };
+const payDomain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: 112172, verifyingContract: WALLET };
 const fakeFetch = (reply) => async (url, init) => { fakeFetch.last = { url, body: JSON.parse(init.body) }; return { status: 200, json: async () => reply }; };
 
 test('check_budget reads cap / spent / remaining from the wallet', async () => {
@@ -61,9 +69,9 @@ test('pay_invoice signs a valid Pay intent and sends the dfmi-session payload to
   assert.equal(pp.scheme, 'dfmi-session'); assert.equal(rq.maxAmountRequired, '20287'); assert.equal(rq.payTo, PAYEE);
   const a = pp.payload.authorization;
   assert.equal(a.nonce, '3');
-  const signer = verifyTypedData({ name: 'dfmi SessionKeyWallet', version: '1', chainId: 112172, verifyingContract: WALLET },
-    { Pay: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] },
-    { to: a.to, amount: BigInt(a.amount), nonce: BigInt(a.nonce), deadline: BigInt(a.deadline) }, pp.payload.signature);
+  assert.equal(a.generation, '7', 'authorization carries the on-chain generation');
+  const signer = verifyTypedData(payDomain, PAY_TYPES,
+    { to: a.to, amount: BigInt(a.amount), nonce: BigInt(a.nonce), generation: BigInt(a.generation), deadline: BigInt(a.deadline) }, pp.payload.signature);
   assert.equal(signer, session.address);
   // second call with the same invoice id: local log, no second settle
   const before = fakeFetch.last; const r2 = await kit.payInvoice({ pay_to: PAYEE, exact_amount: '0.020287', invoice_id: 'inv_1' });
@@ -95,6 +103,33 @@ test('does not pay twice: an exact-amount transfer already on-chain is reported,
   const kit = new BuyKit(cfg(), session.privateKey, { provider: fakeProvider({ ...base(), transfers: [{ value: 20287n, tx: '0xprior' }] }), fetch: f });
   const r = await kit.payInvoice({ pay_to: PAYEE, exact_amount: '0.020287', invoice_id: 'inv_2' });
   assert.equal(r.already_paid, true); assert.equal(r.tx_hash, '0xprior'); assert.equal(fakeFetch.last, undefined);
+});
+
+// ---- finding #1: session-signature compatibility with the generation-bound contract ----
+
+test('#1 client Pay type matches the contract PAY_TYPEHASH string exactly', () => {
+  assert.equal(TypedDataEncoder.from(PAY_TYPES).encodeType('Pay'),
+    'Pay(address to,uint256 amount,uint256 nonce,uint256 generation,uint256 deadline)');
+});
+
+test('#1 a signature over the OLD Pay type (no generation) fails the contract verification', async () => {
+  const v = { to: PAYEE, amount: 20287n, nonce: 3n, deadline: 9999999999n };
+  // an old client signs without generation; the contract recovers over the generation-bound type
+  const oldSig = await session.signTypedData(payDomain, PAY_TYPES_OLD, v);
+  const recovered = verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n }, oldSig);
+  assert.notEqual(recovered, session.address, 'old-format signature must not verify against the new contract type');
+});
+
+test('#1 a stale-generation signature dies after regrant; a fresh one verifies', async () => {
+  const v = { to: PAYEE, amount: 20287n, nonce: 0n, deadline: 9999999999n };
+  const sigGen7 = await session.signTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n });
+  // same grant (generation 7): verifies
+  assert.equal(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n }, sigGen7), session.address);
+  // owner re-grants the same key -> contract generation becomes 8; the old signature no longer recovers to the key
+  assert.notEqual(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n }, sigGen7), session.address);
+  // a fresh signature for generation 8 verifies
+  const sigGen8 = await session.signTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n });
+  assert.equal(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n }, sigGen8), session.address);
 });
 
 test('an unclear facilitator reply is resolved from the chain, not reported as failure', async () => {

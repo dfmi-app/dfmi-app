@@ -66,8 +66,8 @@ export function pickable(accepts, { allowMainnet = false } = {}) {
     .sort((a, b) => (CHAINS[a.n.network].mainnet - CHAINS[b.n.network].mainnet) || (a.price - b.price));
 }
 
-async function first402(url, method) {
-  const res = await fetch(url, { method, headers: { accept: 'application/json', 'user-agent': UA }, signal: AbortSignal.timeout(15_000) });
+async function first402(url, method, doFetch = globalThis.fetch) {
+  const res = await doFetch(url, { method, headers: { accept: 'application/json', 'user-agent': UA }, signal: AbortSignal.timeout(15_000) });
   const text = await res.text();
   if (res.status !== 402) return { status: res.status, preview: text.slice(0, 300) };
   return { status: 402, ...extractRequirements(res.headers, text) };
@@ -91,9 +91,11 @@ export async function quote(url, { method = 'GET', allowMainnet = false } = {}) 
  * Pay for and fetch `url`. `limits.maxPrice` caps this call; `limits.reserve(price)` is called right before signing
  * and must throw to refuse (used for the session budget). Nothing is signed unless both pass.
  */
-export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowMainnet = false, timeoutSec = 120, reserve = () => {} } = {}) {
-  const q = await first402(url, method);
-  if (q.status !== 402) return { paid: false, status: q.status, note: 'Not an x402 endpoint (did not answer 402); nothing paid.', preview: q.preview };
+export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowMainnet = false, timeoutSec = 120, reserve = () => {}, fetchImpl } = {}) {
+  const doFetch = fetchImpl ?? globalThis.fetch;
+  let disclosed = false; // becomes true once the signed authorization has left this process
+  const q = await first402(url, method, doFetch);
+  if (q.status !== 402) return { paid: false, disclosed, status: q.status, note: 'Not an x402 endpoint (did not answer 402); nothing paid.', preview: q.preview };
   const usable = pickable(q.accepts, { allowMainnet });
   if (!usable.length) throw new Error(`No supported payment option. Offered: ${JSON.stringify(q.accepts.map(a => a.network))}${allowMainnet ? '' : ' (mainnet disabled)'}`);
   const chosen = usable[0];
@@ -117,7 +119,10 @@ export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowM
   const header = b64(payment);
 
   const t0 = Date.now();
-  const res = await fetch(url, {
+  // The signed authorization now leaves this process. Mark it disclosed BEFORE the request, so a timeout or
+  // exception cannot let the caller release budget for an authorization the seller may still settle.
+  disclosed = true;
+  const res = await doFetch(url, {
     method,
     headers: { accept: 'application/json', 'user-agent': UA, 'X-PAYMENT': header, 'PAYMENT-SIGNATURE': header },
     signal: AbortSignal.timeout(timeoutSec * 1000),
@@ -126,6 +131,7 @@ export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowM
   const settlement = unb64(res.headers.get('x-payment-response') ?? res.headers.get('payment-response') ?? '');
   return {
     paid: !!settlement?.success,
+    disclosed,
     delivered: res.status === 200 && body.length > 0,
     status: res.status, latencyMs: Date.now() - t0,
     price: chosen.price, coin: chosen.coin, network: n.network, payTo: n.payTo, buyer: wallet.address,

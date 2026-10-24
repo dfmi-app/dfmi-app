@@ -16,8 +16,10 @@ import { Wallet, getAddress } from 'ethers';
 import { ChainReader } from './chain.mjs';
 import { PurchaseStore } from './store.mjs';
 
+// Must match the wallet contract's PAY_TYPEHASH exactly, including field order.
+// `generation` is bound so a signature made under one grant dies when the owner re-grants the same key.
 const PAY_TYPES = { Pay: [
-  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
 ] };
 
 export class BuyKit {
@@ -94,9 +96,9 @@ export class BuyKit {
     const now = Math.floor(Date.now() / 1000);
     const deadline = now + 300;
     const domain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: this.cfg.chainId, verifyingContract: this.wallet };
-    const signature = await this.signer.signTypedData(domain, PAY_TYPES, { to: payTo, amount: units, nonce: s.nonce, deadline: BigInt(deadline) });
+    const signature = await this.signer.signTypedData(domain, PAY_TYPES, { to: payTo, amount: units, nonce: s.nonce, generation: s.generation, deadline: BigInt(deadline) });
     const paymentPayload = { x402Version: 1, scheme: 'dfmi-session', network: this.cfg.chain,
-      payload: { wallet: this.wallet, sessionKey: this.sessionAddress, signature, authorization: { to: payTo, amount: units.toString(), nonce: s.nonce.toString(), deadline: String(deadline) } } };
+      payload: { wallet: this.wallet, sessionKey: this.sessionAddress, signature, authorization: { to: payTo, amount: units.toString(), nonce: s.nonce.toString(), generation: s.generation.toString(), deadline: String(deadline) } } };
     const paymentRequirements = { scheme: 'dfmi-session', network: this.cfg.chain, asset: this.cfg.token, payTo, maxAmountRequired: units.toString(),
       resource: 'paykit://invoice', description: invoice_id ? `invoice ${invoice_id}` : 'buykit payment', maxTimeoutSeconds: 300 };
 

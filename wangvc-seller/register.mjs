@@ -2,12 +2,12 @@
 /**
  * register.mjs — list the seller on dfmi by giving its payout address a public category.
  *
- * Calls ServiceRegistry.register(payTo, category, label). First-come and immutable:
- * if the address already has a category, this prints it and exits (nothing to undo).
- * Registration is permissionless — any funded key may register any address; gas is ~free
- * on this chain — so REGISTRANT_KEY just needs a little native coin, not special rights.
+ * Calls ServiceRegistry.register(payTo, category, label). ServiceRegistry now requires proof of control
+ * (msg.sender == payTo), so REGISTRANT_KEY MUST be the seller address's own key — you can only categorize
+ * your own payout address, not someone else's. A controller may re-run this to correct its category (no
+ * longer first-come-immutable). REGISTRANT_KEY needs a little native coin for gas.
  *
- *   SELLER_ADDRESS=0x… REGISTRANT_KEY=0x… node register.mjs
+ *   SELLER_ADDRESS=0x… REGISTRANT_KEY=0x<key for SELLER_ADDRESS> node register.mjs
  *   Optional: SERVICE_CATEGORY (default 1 = market-data), SERVICE_LABEL (default wangvc-signals),
  *             SERVICE_REGISTRY, RPC, INSECURE_TLS=1
  *
@@ -32,14 +32,19 @@ const reg = new Contract(REGISTRY, ABI, provider);
 
 const cur = Number(await reg.categoryOf(SELLER));
 if (cur !== 0) {
-  console.log(`✓ already registered: ${SELLER} → category ${cur} (first-come, immutable). Nothing to do.`);
+  console.log(`✓ already registered: ${SELLER} → category ${cur}. Re-run with REGISTRANT_KEY = this address's key to change it.`);
   process.exit(0);
 }
 if (!KEY) {
-  console.error('Not registered yet. Set REGISTRANT_KEY (any key with a little native coin; register is permissionless).');
+  console.error('Not registered yet. Set REGISTRANT_KEY = the private key of SELLER_ADDRESS (the registry requires msg.sender == payTo).');
   process.exit(1);
 }
 const wallet = new Wallet(KEY, provider);
+// Proof of control: the registry will revert unless the sender is the address being categorized. Fail early with a clear message.
+if (wallet.address.toLowerCase() !== SELLER.toLowerCase()) {
+  console.error(`REGISTRANT_KEY (${wallet.address}) must be the key for SELLER_ADDRESS (${SELLER}); the registry only lets an address categorize itself.`);
+  process.exit(1);
+}
 console.log(`registering ${SELLER} → category ${CATEGORY} "${LABEL}" via ${wallet.address} …`);
 const tx = await reg.connect(wallet).register(SELLER, CATEGORY, LABEL, { type: 0, gasPrice: 1_000_000_000n, gasLimit: 120_000 });
 const r = await tx.wait();

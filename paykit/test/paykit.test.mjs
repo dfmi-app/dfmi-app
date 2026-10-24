@@ -116,3 +116,48 @@ test('check_payment: one payment cannot settle two invoices (consume-once)', asy
   assert.notEqual(rb.status, 'paid');
   assert.match(rb.last_check.reason, /already settled/);
 });
+
+// ---- finding #3: invoice attribution / creation boundary ----
+
+test('#3 a transfer before the invoice was created is not attributed (scan path)', async () => {
+  const prov = fakeProvider([]);                                  // head 100 at creation
+  const kit = new PayKit(cfg, { provider: prov });
+  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
+  // a matching-amount transfer that happened at block 99, i.e. before this invoice existed
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 99 }], 105));
+  const r = await kit.checkPayment({ invoice_id: inv.invoice_id });
+  assert.notEqual(r.status, 'paid', 'a pre-invoice payment must not settle it');
+});
+
+test('#3 a transfer in the invoice creation block settles (same-block allowed)', async () => {
+  const prov = fakeProvider([]);
+  const kit = new PayKit(cfg, { provider: prov });
+  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 100 }], 105));
+  const r = await kit.checkPayment({ invoice_id: inv.invoice_id });
+  assert.equal(r.status, 'paid');
+});
+
+test('#3 a direct tx_hash that predates the invoice is rejected (Path A)', async () => {
+  const prov = fakeProvider([]);
+  const kit = new PayKit(cfg, { provider: prov });
+  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
+  const tx = '0x' + '3c'.repeat(32);
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 90, tx }], 105));
+  const r = await kit.checkPayment({ invoice_id: inv.invoice_id, tx_hash: tx });
+  assert.notEqual(r.status, 'paid');
+  assert.match(r.last_check.reason, /predates/);
+});
+
+test('#3 unknown creation block fails closed; reconcile settles explicitly', async () => {
+  const prov = fakeProvider([]);
+  const kit = new PayKit(cfg, { provider: prov });
+  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' });
+  const stored = kit.store.get(inv.invoice_id); stored.created_block = null; kit.store.put(stored); // chain was unreachable at creation
+  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 50 }], 105));
+  const closed = await kit.checkPayment({ invoice_id: inv.invoice_id });
+  assert.notEqual(closed.status, 'paid');
+  assert.match(closed.last_check.reason, /reconciliation/);
+  const open = await kit.checkPayment({ invoice_id: inv.invoice_id, reconcile: true });
+  assert.equal(open.status, 'paid');
+});

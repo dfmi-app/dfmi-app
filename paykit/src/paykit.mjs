@@ -50,7 +50,7 @@ export class PayKit {
   }
 
   // ---------------------------------------------------------------- check_payment
-  async checkPayment({ invoice_id, tx_hash = null }) {
+  async checkPayment({ invoice_id, tx_hash = null, reconcile = false }) {
     const inv = this.store.get(invoice_id);
     if (!inv) throw new Error(`unknown invoice ${invoice_id}`);
     if (inv.status === 'paid') return this.#present(inv);
@@ -60,32 +60,33 @@ export class PayKit {
       if (tx_hash) {
         const v = await this.chain.verifyTx(tx_hash, inv.payee, inv.amount_units);
         if (v.found && v.success && v.confirmations >= this.cfg.confirmations) {
-          // A settlement must not predate the invoice, and each payment event settles at most one invoice.
-          if (inv.created_block != null && v.block < inv.created_block)
-            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction predates the invoice' }));
-          if (!this.store.claimTransfer(inv.id, tx_hash))
-            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction already settled another invoice' }));
+          // Same creation-boundary rule as the scan path: a settlement must be at or after the invoice's
+          // creation block; when that boundary is unknown, fail closed unless the caller explicitly reconciles.
+          const att = this.#attributable(inv, v.block, reconcile);
+          if (!att.ok) return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: att.reason }));
+          // #settle claims the tx and marks paid atomically; a conflict (already consumed) is reported by #settle.
           return this.#present(this.#settle(inv, { txHash: tx_hash, from: v.from, block: v.block, value: BigInt(v.paid_units) }, v.confirmations));
         }
         if (v.found && !v.success) return this.#present(this.#mark(inv, 'partial', { tx_hash, paid: v.paid_units, reason: v.reason ?? 'insufficient amount' }));
       }
 
       // Path B: scan transfers into the payee since the invoice was created and match the exact amount.
+      // When the creation block is unknown we cannot attribute a scanned transfer to this invoice: fail closed
+      // (a caller may pass reconcile to scan from genesis and accept the attribution explicitly).
+      if (inv.created_block == null && !reconcile)
+        return this.#present(this.#mark(inv, inv.status, { reason: 'invoice creation block unknown; manual reconciliation required (reconcile)' }));
       const head = await this.chain.blockNumber();
-      const from = inv.created_block ?? 0;
-      const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, from - 5), head);
+      const floor = inv.created_block ?? 0;
+      const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, floor), head);
       const want = BigInt(inv.amount_units);
       // The exact amount is the matching key; payer_hint only breaks ties (it is a hint, not a filter).
-      // Skip any transfer already consumed by another invoice so one payment can never settle two invoices.
-      const exact = transfers.filter(t => t.value === want && !this.store.txConsumedBy(t.txHash));
+      // A settling transfer must be at or after the invoice's creation block (no pre-invoice payment counts)
+      // and must not already be consumed by another invoice (one payment settles at most one invoice).
+      const exact = transfers.filter(t => t.value === want && t.block >= floor && !this.store.txConsumedBy(t.txHash));
       const hit = (inv.payer_hint && exact.find(t => t.from.toLowerCase() === inv.payer_hint.toLowerCase())) || exact[0];
       if (hit) {
         const conf = head - hit.block + 1;
-        if (conf >= this.cfg.confirmations) {
-          if (!this.store.claimTransfer(inv.id, hit.txHash, hit.logIndex))
-            return this.#present(this.#mark(inv, inv.status, { pending_tx: hit.txHash, reason: 'matching transfer already settled another invoice' }));
-          return this.#present(this.#settle(inv, hit, conf));
-        }
+        if (conf >= this.cfg.confirmations) return this.#present(this.#settle(inv, hit, conf));
         return this.#present(this.#mark(inv, 'open', { pending_tx: hit.txHash, confirmations: conf, needs: this.cfg.confirmations }));
       }
       // A smaller transfer from the hinted payer counts as partial (informational; the invoice stays unsettled).
@@ -148,14 +149,22 @@ export class PayKit {
   }
 
   // ---------------------------------------------------------------- helpers
-  #settle(inv, t, confirmations) {
-    inv.status = 'paid';
-    inv.settlement = { tx_hash: t.txHash, payer_address: t.from, block: t.block, confirmations, paid_units: t.value.toString(),
-                       paid_amount: formatUnits(t.value, this.cfg.decimals), settled_at: new Date().toISOString() };
-    inv.last_check = null;
-    return this.store.put(inv);
+  // A settling transfer at `block` is attributable to this invoice only if it is at or after the invoice's
+  // creation block. When created_block is unknown, fail closed unless the caller explicitly reconciles.
+  #attributable(inv, block, reconcile) {
+    if (inv.created_block == null) return reconcile ? { ok: true } : { ok: false, reason: 'invoice creation block unknown; manual reconciliation required (reconcile)' };
+    if (block < inv.created_block) return { ok: false, reason: 'transaction predates the invoice' };
+    return { ok: true };
   }
-  #mark(inv, status, detail) { inv.status = status; inv.last_check = { at: new Date().toISOString(), ...detail }; return this.store.put(inv); }
+  #settle(inv, t, confirmations) {
+    const settlement = { tx_hash: t.txHash, payer_address: t.from, block: t.block, confirmations, paid_units: t.value.toString(),
+                         paid_amount: formatUnits(t.value, this.cfg.decimals), settled_at: new Date().toISOString() };
+    // Atomic claim + settle: consume-once and "paid" land in a single locked write (no half-state).
+    const res = this.store.settle(inv.id, { txHash: t.txHash, logIndex: t.logIndex }, settlement);
+    if (!res.ok) return this.#mark(inv, inv.status, { tx_hash: t.txHash, reason: res.reason });
+    return res.invoice;
+  }
+  #mark(inv, status, detail) { return this.store.mark(inv.id, status, detail) ?? inv; }
   #present(inv) {
     return {
       invoice_id: inv.id, status: inv.status,

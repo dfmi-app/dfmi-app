@@ -104,15 +104,16 @@ if (!session) {
   paymentPayload = { x402Version: 1, scheme: 'exact', network: cfg.chain, payload: { signature, authorization } };
 } else {
   // ---- SessionKeyWallet: the session key signs a Pay intent; the wallet contract enforces cap / expiry / revocation on-chain
-  const sw = new Contract(wallet, ['function sessionNonce(address) view returns (uint256)'], provider);
-  const [nonce, bal] = await Promise.all([sw.sessionNonce(signer.address), erc20.balanceOf(wallet)]);
-  console.error(`wallet ${wallet} balance ${formatUnits(bal, cfg.decimals)} ${cfg.symbol} | session key ${signer.address} nonce ${nonce}`);
-  const authorization = { to: payTo, amount: units.toString(), nonce: nonce.toString(), deadline: String(now + 300) };
+  const sw = new Contract(wallet, ['function sessionNonce(address) view returns (uint256)', 'function sessionGeneration(address) view returns (uint256)'], provider);
+  const [nonce, generation, bal] = await Promise.all([sw.sessionNonce(signer.address), sw.sessionGeneration(signer.address), erc20.balanceOf(wallet)]);
+  console.error(`wallet ${wallet} balance ${formatUnits(bal, cfg.decimals)} ${cfg.symbol} | session key ${signer.address} nonce ${nonce} gen ${generation}`);
+  const authorization = { to: payTo, amount: units.toString(), nonce: nonce.toString(), generation: generation.toString(), deadline: String(now + 300) };
   const domain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: cfg.chainId, verifyingContract: wallet };
+  // Pay type must match the wallet contract exactly (generation included), or pay() reverts "bad session signature".
   const types = { Pay: [
-    { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+    { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
   ] };
-  const signature = await signer.signTypedData(domain, types, { to: payTo, amount: units, nonce, deadline: BigInt(authorization.deadline) });
+  const signature = await signer.signTypedData(domain, types, { to: payTo, amount: units, nonce, generation, deadline: BigInt(authorization.deadline) });
   paymentPayload = { x402Version: 1, scheme: 'dfmi-session', network: cfg.chain, payload: { wallet, sessionKey: signer.address, signature, authorization } };
 }
 

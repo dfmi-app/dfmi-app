@@ -45,12 +45,19 @@ if (!regAddr) {
 } else console.log(`ServiceRegistry reused: ${regAddr}`);
 
 // 2. register a category: the producer's payout address (splitter) → category 1 "market-data"
+// ServiceRegistry now requires msg.sender == payTo (proof of control): only the splitter can register itself.
+// The deployer can do it here only when it IS the splitter; otherwise register separately from the splitter's key.
 const reg = new Contract(regAddr, regArt.abi, owner);
 const cat = Number(await reg.categoryOf(cfg.splitter));
-if (cat === 0) {
+if (cat !== 0) {
+  console.log(`splitter already registered as category ${cat}`);
+} else if (owner.address.toLowerCase() === cfg.splitter.toLowerCase()) {
   await (await reg.register(cfg.splitter, 1, 'market-data', { ...tx0, gasLimit: 200_000 })).wait();
   console.log(`✓ Category registered: splitter ${cfg.splitter} → 1 (market-data)`);
-} else console.log(`splitter already registered as category ${cat}`);
+} else {
+  console.log(`⚠ splitter ${cfg.splitter} != deployer ${owner.address}; ServiceRegistry requires self-registration.`);
+  console.log(`  Register from the splitter's own key:  SELLER_ADDRESS=${cfg.splitter} REGISTRANT_KEY=0x<splitter key> node wangvc-seller/register.mjs`);
+}
 
 // 3. IntentSessionWallet
 const wf = new ContractFactory(walArt.abi, walArt.bytecode, owner);
@@ -79,7 +86,7 @@ writeFileSync(new URL('./intent-wallet.deployed.json', import.meta.url), JSON.st
   registry: regAddr, wallet: walletAddr, owner: owner.address,
   session: { address: session.address, privateKey: session.privateKey },
   cap: String(cap), expiry, intentMask: String(intentMask),
-}, null, 2));
+}, null, 2), { mode: 0o600 }); // contains a private key: owner-only, never world-readable
 console.log(`\nDone. Next, the three-line proof of the intent layer:`);
 console.log(`  node intent-pay.mjs ${cfg.splitter} 0.02        # → ✓ settled (market-data, within intent)`);
 console.log(`  node intent-pay.mjs ${cfg.centralBank} 0.02     # → ⛔ reverted "unregistered payee" (outside intent)`);

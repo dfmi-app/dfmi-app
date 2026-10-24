@@ -14,6 +14,7 @@ const WALLET_ABI = [
   'function token() view returns (address)',
   'function sessions(address) view returns (bool active, uint64 expiry, uint256 cap, uint256 spent)',
   'function sessionNonce(address) view returns (uint256)',
+  'function sessionGeneration(address) view returns (uint256)',
   'function remaining(address) view returns (uint256)',
   'function allowed(address sessionKey, address to) view returns (bool ok, uint8 category)',
 ];
@@ -34,14 +35,14 @@ export class ChainReader {
   /** The session's on-chain bounds, as the wallet contract sees them right now. */
   async session(walletAddr, sessionKey) {
     const w = this.wallet(walletAddr);
-    const [s, nonce, tok, bal] = await Promise.all([w.sessions(sessionKey), w.sessionNonce(sessionKey), w.token(), this.erc20.balanceOf(walletAddr)]);
+    const [s, nonce, generation, tok, bal] = await Promise.all([w.sessions(sessionKey), w.sessionNonce(sessionKey), w.sessionGeneration(sessionKey), w.token(), this.erc20.balanceOf(walletAddr)]);
     const now = Math.floor(Date.now() / 1000);
     const expiry = Number(s.expiry);
     const cap = BigInt(s.cap), spent = BigInt(s.spent);
     return {
       active: Boolean(s.active), expiry: expiry || null, expired: expiry !== 0 && now > expiry,
       cap, spent, remaining: s.active && cap > spent ? cap - spent : 0n,
-      nonce: BigInt(nonce), walletBalance: BigInt(bal), tokenMatches: getAddress(tok) === this.token,
+      nonce: BigInt(nonce), generation: BigInt(generation), walletBalance: BigInt(bal), tokenMatches: getAddress(tok) === this.token,
     };
   }
 

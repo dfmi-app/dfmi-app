@@ -20,6 +20,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } fr
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { quote, buy } from './x402.mjs';
+import { createBudget } from './budget.mjs';
+import { purchase } from './purchase.mjs';
 
 console.log = (...a) => console.error(...a); // stdout is the MCP channel
 
@@ -34,7 +36,7 @@ const WALLET_FILE = join(HOME, 'buyer-wallet.json');
 const LOG_FILE = join(HOME, 'purchases.jsonl');
 const BODY_LIMIT = 20_000;
 
-let spent = 0;
+const budget = createBudget(BUDGET);
 
 function loadWallet() {
   if (env.DFMI_BUYER_PRIVATE_KEY) return new Wallet(env.DFMI_BUYER_PRIVATE_KEY);
@@ -86,7 +88,7 @@ server.registerTool('dfmi_wallet', {
   annotations: { readOnlyHint: true, openWorldHint: true },
 }, tool(async () => {
   const w = loadWallet();
-  const limits = { maxPricePerCall: MAX_PRICE, sessionBudget: BUDGET, spentThisSession: +spent.toFixed(6), remaining: +(BUDGET - spent).toFixed(6), mainnetAllowed: ALLOW_MAINNET };
+  const limits = { maxPricePerCall: MAX_PRICE, sessionBudget: BUDGET, spentThisSession: +budget.spent.toFixed(6), remaining: +budget.remaining().toFixed(6), mainnetAllowed: ALLOW_MAINNET };
   if (!w) return { wallet: null, hint: 'Call dfmi_create_wallet, then dfmi_claim_faucet.', limits };
   const { json } = await getJson(`${FAUCET}/balance?address=${w.address}`);
   return { address: w.address, balance: json, limits };
@@ -129,22 +131,18 @@ server.registerTool('dfmi_buy', {
 }, tool(async ({ url, max_price, method }) => {
   const w = needWallet();
   const cap = Math.min(max_price ?? MAX_PRICE, MAX_PRICE);
-  let reserved = 0;
-  const reserve = price => {
-    if (spent + price > BUDGET + 1e-9) throw new Error(`Session budget exhausted: spent ${spent.toFixed(4)} of ${BUDGET}; this costs ${price}.`);
-    spent += price; reserved = price;
-  };
-  // If the paid request throws after signing, the reservation stays: the authorization may still settle.
-  const r = await buy(url, w, { method, maxPrice: cap, allowMainnet: ALLOW_MAINNET, reserve });
-  if (reserved && !r.paid) spent -= reserved; // seller answered without settling → nothing was spent
+  // purchase() reserves before signing and keeps the reservation committed unless the signature was never disclosed.
+  const r = await purchase({ url, wallet: w, budget, maxPrice: cap, allowMainnet: ALLOW_MAINNET, method, buyImpl: buy });
+  const pending = r.pending;
 
   const record = { time: new Date().toISOString(), resource: url, network: r.network, price: r.price, coin: r.coin, payTo: r.payTo, buyer: r.buyer,
-    status: r.status, paid: r.paid, delivered: r.delivered, tx: r.settlement?.transaction ?? null };
+    status: r.status, paid: r.paid, delivered: r.delivered, pending, tx: r.settlement?.transaction ?? null };
   try { mkdirSync(HOME, { recursive: true, mode: 0o700 }); appendFileSync(LOG_FILE, JSON.stringify(record) + '\n'); } catch {}
 
   const body = r.body ?? r.preview ?? '';
-  return { ...record, latencyMs: r.latencyMs, settlement: r.settlement ?? null, note: r.note,
-    spentThisSession: +spent.toFixed(6), remainingBudget: +(BUDGET - spent).toFixed(6),
+  return { ...record, latencyMs: r.latencyMs, settlement: r.settlement ?? null,
+    note: pending ? `${r.note ? r.note + ' ' : ''}authorization disclosed but no success receipt; amount held against the session budget until it is reconciled as expired/unused.` : r.note,
+    spentThisSession: +budget.spent.toFixed(6), remainingBudget: +budget.remaining().toFixed(6),
     goods: body.length > BODY_LIMIT ? body.slice(0, BODY_LIMIT) + `\n…[truncated, ${body.length} bytes total]` : body };
 }));
 
