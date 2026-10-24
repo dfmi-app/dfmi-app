@@ -8,34 +8,35 @@
  * status: "open" | "paid" | "partial" | "overdue" | "unknown"
  *
  * Safety (finding #4):
- *   - Single-writer across processes: every operation takes an exclusive lockfile (O_EXCL; reclaimed only when the
- *     owner process is dead or past a TTL backstop), reloads the file fresh, applies its change, and writes
- *     atomically (fsync tmp + rename). No cached `this.data`, so two processes never overwrite each other's state.
+ *   - Single-writer across processes: every operation takes an exclusive lockfile (O_EXCL), reloads the file
+ *     fresh, applies its change, and writes atomically (fsync tmp + rename). No cached `this.data`, so two
+ *     processes never overwrite each other's state. A lock is reclaimed ONLY when its owner process is
+ *     confirmed exited — there is no time-based steal — otherwise acquisition waits and then errors.
  *   - Consume-once + settlement are ONE write (settle()): there is no window where a transfer is claimed but the
  *     invoice is not yet marked paid, or vice versa.
  *   - A corrupt store is preserved and surfaced, never silently discarded as empty.
  */
-import { readFileSync, writeFileSync, existsSync, renameSync, statSync, copyFileSync, openSync, writeSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, openSync, writeSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-const LOCK_TTL_MS = 60_000; // backstop only: a lock whose owner PID is gone, or older than this, may be reclaimed
-const LOCK_WAIT_MS = 5_000; // give up acquiring after this
+const LOCK_WAIT_MS = 5_000; // wait this long for a lock, then throw — never silently steal a lock we did not create
 
 function sleep(ms) { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { const u = Date.now() + ms; while (Date.now() < u); } }
 
-function pidAlive(pid) { if (!(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
-
 /**
- * May a held lock be reclaimed? Only when its owner process is gone (liveness check via signal 0), or — as a
- * backstop against PID reuse — when it is older than the TTL. A live owner within the TTL is NEVER reclaimable,
- * so a process that pauses (GC, swap, SIGSTOP) while holding a valid lock keeps it. Exported for test.
+ * The state of a lock's owner, parsed from its "pid:token" content. Only a CONFIRMED-dead owner — the PID does
+ * not exist (ESRCH) — may have its lock reclaimed. A live owner, an owner we lack permission to probe (EPERM),
+ * a reused PID, or incomplete content are all treated as NOT reclaimable: we wait and then error rather than
+ * ever stealing a lock whose owner might still be writing. There is NO time-based reclaim, so a holder that
+ * pauses (GC, swap, SIGSTOP, debugger) for any duration keeps its lock. Exported for test.
  * Same-host only: process liveness is not meaningful across NFS, so this store must not be shared over NFS.
  */
-export function lockReclaimable(content, mtimeMs, now = Date.now(), ttl = LOCK_TTL_MS) {
-  if (!content || !String(content).trim()) return false; // created but owner not yet written: do not steal
+export function ownerState(content) {
+  if (!content || !String(content).trim()) return 'unknown';  // created but owner not yet written: do not steal
   const pid = Number(String(content).split(':')[0]);
-  if (!pidAlive(pid)) return true;        // owner process is gone -> safe to reclaim
-  return (now - mtimeMs) > ttl;           // live owner: only the PID-reuse backstop can reclaim
+  if (!(pid > 0)) return 'unknown';
+  try { process.kill(pid, 0); return 'live'; }                // signal 0: the process exists
+  catch (e) { return e.code === 'ESRCH' ? 'dead' : 'live'; }  // ESRCH = gone; EPERM/other = cannot confirm exit -> treat as live
 }
 
 export class InvoiceStore {
@@ -82,9 +83,11 @@ export class InvoiceStore {
   }
 
   // ---------------------------------------------------------------- cross-process lock
-  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). A held lock is reclaimed only when its
-  // owner process is gone (or past the TTL backstop) — never while the owner is alive. Release removes the
-  // lockfile only when its token is ours, so one process can never delete another's lock.
+  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). A held lock is reclaimed ONLY when its
+  // owner is confirmed exited (ESRCH) — never on a timeout, and never while the owner is alive or unprovable.
+  // Because a confirmed-dead owner cannot write, reclaiming its lock cannot cause a concurrent write; a possibly
+  // -live owner is never reclaimed, so there is nothing to fence. Release removes the lockfile only when its
+  // token is still ours, so one process can never delete a lock another process now holds.
   #acquire() {
     const mine = `${process.pid}:${randomBytes(8).toString('hex')}`;
     const deadline = Date.now() + LOCK_WAIT_MS;
@@ -92,13 +95,27 @@ export class InvoiceStore {
       try { const fd = openSync(this.lockFile, 'wx'); try { writeSync(fd, mine); fsyncSync(fd); } finally { closeSync(fd); } this._lockToken = mine; return; }
       catch (e) {
         if (e.code !== 'EEXIST') throw e;
-        let content, st;
-        try { content = readFileSync(this.lockFile, 'utf8'); st = statSync(this.lockFile); } catch { continue; } // vanished: re-race
-        if (lockReclaimable(content, st.mtimeMs)) { try { unlinkSync(this.lockFile); } catch { /* raced */ } continue; }
-        if (Date.now() > deadline) throw new Error(`timed out acquiring store lock ${this.lockFile} (held by pid ${String(content).split(':')[0]})`);
-        sleep(15);
+        let content;
+        try { content = readFileSync(this.lockFile, 'utf8'); } catch { continue; } // vanished between create-fail and read: re-race
+        if (ownerState(content) === 'dead') { this.#reclaimDead(content); continue; } // only a confirmed-dead owner
+        if (Date.now() > deadline)
+          throw new Error(`timed out acquiring store lock ${this.lockFile}; held by pid ${String(content).split(':')[0]} (not confirmed exited). If that process is gone, remove the lock file manually.`);
+        sleep(20);
       }
     }
+  }
+  // Reclaim a confirmed-dead owner's lock without ever deleting a lock whose content changed in the meantime
+  // (e.g. a new owner that appeared). Move it aside atomically — only one racer wins the rename — then re-check:
+  // if what we moved is actually live/unknown, put it back untouched; otherwise drop it so an O_EXCL create can win.
+  #reclaimDead(expected) {
+    const tomb = `${this.lockFile}.stale.${process.pid}.${randomBytes(4).toString('hex')}`;
+    try { renameSync(this.lockFile, tomb); } catch { return; } // ENOENT/raced: someone else handled it; retry the create
+    let moved = ''; try { moved = readFileSync(tomb, 'utf8'); } catch { /* empty */ }
+    if (moved !== expected && ownerState(moved) !== 'dead') {
+      try { renameSync(tomb, this.lockFile); } catch { try { unlinkSync(tomb); } catch { } } // replaced by a live owner: restore, do not steal
+      return;
+    }
+    try { unlinkSync(tomb); } catch { } // confirmed dead: drop it
   }
   #release() {
     try { if (readFileSync(this.lockFile, 'utf8') === this._lockToken) unlinkSync(this.lockFile); } catch { /* already gone */ }

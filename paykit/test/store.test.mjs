@@ -5,7 +5,8 @@ import { mkdtempSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
-import { InvoiceStore, lockReclaimable } from '../src/store.mjs';
+import { existsSync } from 'node:fs';
+import { InvoiceStore, ownerState } from '../src/store.mjs';
 
 const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
 const freshStore = () => join(mkdtempSync(join(tmpdir(), 'paykit4-')), 'invoices.json');
@@ -83,12 +84,42 @@ function settleWorker(p, id, tx) {
   });
 }
 
-test('#4 a live owner keeps its lock; only a dead owner (or the TTL backstop) is reclaimable', async () => {
-  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now()), false, 'a live owner with a fresh lock is never stolen');
-  assert.equal(lockReclaimable('', Date.now()), false, 'a just-created lock (owner not yet written) is not stolen');
-  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now() - 61_000), true, 'TTL backstop reclaims a very old lock (PID reuse)');
+test('#4 ownerState: a live owner is never reclaimable (no matter the age); only a confirmed-dead one is', async () => {
+  assert.equal(ownerState(`${process.pid}:tok`), 'live', 'this process is alive');
+  assert.equal(ownerState(''), 'unknown', 'incomplete content -> unknown (never stolen)');
+  assert.equal(ownerState('notapid:tok'), 'unknown');
   const deadPid = await new Promise(res => { const c = spawn(process.execPath, ['-e', '0']); c.on('exit', () => res(c.pid)); });
-  assert.equal(lockReclaimable(`${deadPid}:tok`, Date.now()), true, 'a dead owner is reclaimable immediately');
+  assert.equal(ownerState(`${deadPid}:tok`), 'dead', 'an exited process is confirmed dead');
+});
+
+// Hold the lock from another process that has paused for a long "age" (ancient mtime), then crash it.
+const holderCode =
+  `import { writeFileSync, utimesSync } from 'node:fs';` +
+  `const lf = process.env.LF; writeFileSync(lf, process.pid + ':held');` +
+  `const old = (Date.now() - 600000) / 1000; try { utimesSync(lf, old, old); } catch {}` + // mtime 10 min ago
+  `process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);`;
+
+test('#4 a paused holder (ancient mtime, still alive) is NOT stolen; recovery is safe after it exits', async () => {
+  const p = freshStore();
+  const lockFile = p + '.lock';
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', holderCode], { env: { ...process.env, LF: lockFile }, stdio: 'inherit' });
+  try {
+    // wait until the holder has written the lock
+    for (let i = 0; i < 200 && !existsSync(lockFile); i++) await new Promise(r => setTimeout(r, 25));
+    assert.ok(existsSync(lockFile), 'holder took the lock');
+    // competitor must NOT steal a live holder's lock, however old the mtime: it waits, then errors
+    assert.throws(() => new InvoiceStore(p).put({ id: 'inv_steal', payee: PAYEE, status: 'open', amount_units: '1' }),
+      /timed out acquiring store lock/, 'a live (paused) holder is never stolen from');
+    assert.ok(existsSync(lockFile), 'the holder still owns the lock after the failed attempt');
+  } finally {
+    holder.kill('SIGKILL'); // crash the holder WITHOUT releasing the lock
+    await new Promise(res => holder.on('exit', res));
+  }
+  // now the owner is confirmed gone: a fresh store reclaims the dead lock and proceeds — safe recovery
+  const s = new InvoiceStore(p);
+  s.put({ id: 'inv_after', payee: PAYEE, status: 'open', amount_units: '1' });
+  assert.equal(new InvoiceStore(p).get('inv_after').id, 'inv_after', 'recovered after the holder exited');
+  assert.equal(existsSync(lockFile), false, 'the lock was released, not left dangling');
 });
 
 test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {
