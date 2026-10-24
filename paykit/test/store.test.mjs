@@ -130,20 +130,32 @@ test('#4 [deterministic] a live holder is never displaced; a contender fails cle
   const p = freshStore();
   const lockFile = p + '.lock';
   const A = spawn(process.execPath, [LOCKWORKER], { env: { ...process.env, LWP: p }, stdio: ['pipe', 'pipe', 'inherit'] });
-  await new Promise((res) => { let s = ''; A.stdout.on('data', d => { s += d; if (s.includes('ACQUIRED')) res(); }); }); // barrier: A is in the CS (not a sleep)
-  const held = readFileSync(lockFile, 'utf8');
-  assert.match(held, /^\d+:[0-9a-f]+$/, 'A owns the lock');
-  // contender B, while A is in the critical section: fails with a bounded timeout and does NOT move/delete the lock
-  assert.throws(() => new InvoiceStore(p).put({ id: 'inv_B', payee: PAYEE, status: 'open', amount_units: '1' }), /timed out acquiring store lock/);
-  assert.equal(existsSync(lockFile), true, 'lock still present after B failed');
-  assert.equal(readFileSync(lockFile, 'utf8'), held, 'B did not move, rewrite, or delete A\'s lock');
-  A.stdin.write('x'); // barrier 2: release A
-  await new Promise(res => A.on('exit', res));
-  assert.equal(existsSync(lockFile), false, 'A released its own lock on exit');
-  // only after A left could a new writer enter -> at most one process was ever in the critical section
-  const s = new InvoiceStore(p); s.put({ id: 'inv_C', payee: PAYEE, status: 'open', amount_units: '1' });
-  assert.equal(new InvoiceStore(p).get('inv_B'), null, 'the contender never entered the critical section');
-  assert.equal(new InvoiceStore(p).get('inv_C').id, 'inv_C');
+  try {
+    // barrier: wait until A is IN the critical section. Reject (never hang) on a spawn error or an exit before ACQUIRED.
+    await new Promise((res, rej) => {
+      let s = '';
+      A.once('error', rej);
+      A.once('exit', (code, sig) => rej(new Error(`worker exited before ACQUIRED (code ${code}, signal ${sig})`)));
+      A.stdout.on('data', d => { s += String(d); if (s.includes('ACQUIRED')) res(); });
+    });
+    const held = readFileSync(lockFile, 'utf8');
+    assert.match(held, /^\d+:[0-9a-f]+$/, 'A owns the lock');
+    // contender B, while A is in the critical section: fails with a bounded timeout and does NOT move/delete the lock
+    assert.throws(() => new InvoiceStore(p).put({ id: 'inv_B', payee: PAYEE, status: 'open', amount_units: '1' }), /timed out acquiring store lock/);
+    assert.equal(existsSync(lockFile), true, 'lock still present after B failed');
+    assert.equal(readFileSync(lockFile, 'utf8'), held, 'B did not move, rewrite, or delete A\'s lock');
+    const exited = new Promise(res => A.once('exit', res));
+    A.stdin.write('x'); // barrier 2: release A
+    await exited;
+    assert.equal(existsSync(lockFile), false, 'A released its own lock on exit');
+    // only after A left could a new writer enter -> at most one process was ever in the critical section
+    const s = new InvoiceStore(p); s.put({ id: 'inv_C', payee: PAYEE, status: 'open', amount_units: '1' });
+    assert.equal(new InvoiceStore(p).get('inv_B'), null, 'the contender never entered the critical section');
+    assert.equal(new InvoiceStore(p).get('inv_C').id, 'inv_C');
+  } finally {
+    // guarantee the worker is never left blocked, even if an assertion above threw
+    if (A.exitCode === null && A.signalCode === null) { try { A.kill('SIGKILL'); } catch { } }
+  }
 });
 
 test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {

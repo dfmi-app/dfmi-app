@@ -644,44 +644,45 @@ index c525113..033e60c 100644
  server.registerTool('send_reminder', {
    title: 'Draft payment reminder',
 diff --git a/paykit/src/store.mjs b/paykit/src/store.mjs
-index 42d8a88..7c27bd3 100644
+index 42d8a88..d736155 100644
 --- a/paykit/src/store.mjs
 +++ b/paykit/src/store.mjs
-@@ -6,69 +6,165 @@
+@@ -6,69 +6,170 @@
   *     due_date, memo, created_at, created_block, status, settlement, reminders: [] }
   *
   * status: "open" | "paid" | "partial" | "overdue" | "unknown"
 + *
 + * Safety (finding #4):
-+ *   - Single-writer across processes: every operation takes an exclusive lockfile (O_EXCL; reclaimed only when the
-+ *     owner process is dead or past a TTL backstop), reloads the file fresh, applies its change, and writes
-+ *     atomically (fsync tmp + rename). No cached `this.data`, so two processes never overwrite each other's state.
++ *   - Single-writer across processes: every operation takes an exclusive lockfile (O_EXCL), reloads the file
++ *     fresh, applies its change, and writes atomically (fsync tmp + rename). No cached `this.data`, so two
++ *     processes never overwrite each other's state. A lock is reclaimed ONLY when its owner process is
++ *     confirmed exited — there is no time-based steal — otherwise acquisition waits and then errors.
 + *   - Consume-once + settlement are ONE write (settle()): there is no window where a transfer is claimed but the
 + *     invoice is not yet marked paid, or vice versa.
 + *   - A corrupt store is preserved and surfaced, never silently discarded as empty.
   */
 -import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
-+import { readFileSync, writeFileSync, existsSync, renameSync, statSync, copyFileSync, openSync, writeSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
++import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, openSync, writeSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
  import { randomBytes } from 'node:crypto';
  
-+const LOCK_TTL_MS = 60_000; // backstop only: a lock whose owner PID is gone, or older than this, may be reclaimed
-+const LOCK_WAIT_MS = 5_000; // give up acquiring after this
++const LOCK_WAIT_MS = 5_000; // wait this long for a lock, then throw — never silently steal a lock we did not create
 +
 +function sleep(ms) { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { const u = Date.now() + ms; while (Date.now() < u); } }
 +
-+function pidAlive(pid) { if (!(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
-+
 +/**
-+ * May a held lock be reclaimed? Only when its owner process is gone (liveness check via signal 0), or — as a
-+ * backstop against PID reuse — when it is older than the TTL. A live owner within the TTL is NEVER reclaimable,
-+ * so a process that pauses (GC, swap, SIGSTOP) while holding a valid lock keeps it. Exported for test.
-+ * Same-host only: process liveness is not meaningful across NFS, so this store must not be shared over NFS.
++ * The state of a lock's owner, parsed from its "pid:token" content: 'live', 'dead' (the PID returns ESRCH), or
++ * 'unknown' (incomplete / unparseable). DIAGNOSTIC ONLY — it is used to make the acquire-timeout message more
++ * helpful. It does NOT drive automatic reclamation: this store never deletes or moves a lock it did not create
++ * (see #acquire), because reclaiming another process's lock cannot be done race-free with plain files. A stale
++ * lock left by a crashed writer is cleared MANUALLY by an operator after confirming no writer is running.
++ * Exported for test. Same-host only: liveness is not meaningful across NFS, so do not share this store over NFS.
 + */
-+export function lockReclaimable(content, mtimeMs, now = Date.now(), ttl = LOCK_TTL_MS) {
-+  if (!content || !String(content).trim()) return false; // created but owner not yet written: do not steal
++export function ownerState(content) {
++  if (!content || !String(content).trim()) return 'unknown';  // created but owner not yet written: do not steal
 +  const pid = Number(String(content).split(':')[0]);
-+  if (!pidAlive(pid)) return true;        // owner process is gone -> safe to reclaim
-+  return (now - mtimeMs) > ttl;           // live owner: only the PID-reuse backstop can reclaim
++  if (!(pid > 0)) return 'unknown';
++  try { process.kill(pid, 0); return 'live'; }                // signal 0: the process exists
++  catch (e) { return e.code === 'ESRCH' ? 'dead' : 'live'; }  // ESRCH = gone; EPERM/other = cannot confirm exit -> treat as live
 +}
 +
  export class InvoiceStore {
@@ -702,7 +703,7 @@ index 42d8a88..7c27bd3 100644
 +    this._lockToken = null;
 +    // One-time backfill of the consumed index from invoices settled before this guard existed — under the lock,
 +    // so two processes starting at once do not both write.
-+    this.#withLock(() => {
++    this.withLock(() => {
 +      const d = this.#readOrThrow();
 +      let dirty = false;
 +      for (const inv of Object.values(d.invoices)) {
@@ -741,21 +742,24 @@ index 42d8a88..7c27bd3 100644
 +  }
 +
 +  // ---------------------------------------------------------------- cross-process lock
-+  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). A held lock is reclaimed only when its
-+  // owner process is gone (or past the TTL backstop) — never while the owner is alive. Release removes the
-+  // lockfile only when its token is ours, so one process can never delete another's lock.
++  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). This store NEVER deletes or moves a lock
++  // it did not create — reclaiming another process's lock cannot be done race-free with plain files — so a stale
++  // lock from a crashed writer is cleared MANUALLY by an operator after confirming no writer runs. Acquisition
++  // waits up to LOCK_WAIT_MS, checking the deadline on every retry, then throws (bounded; no auto-steal).
++  // Release removes the lockfile only when its token is still ours, so one process never deletes another's lock.
 +  #acquire() {
 +    const mine = `${process.pid}:${randomBytes(8).toString('hex')}`;
 +    const deadline = Date.now() + LOCK_WAIT_MS;
 +    for (;;) {
 +      try { const fd = openSync(this.lockFile, 'wx'); try { writeSync(fd, mine); fsyncSync(fd); } finally { closeSync(fd); } this._lockToken = mine; return; }
 +      catch (e) {
-+        if (e.code !== 'EEXIST') throw e;
-+        let content, st;
-+        try { content = readFileSync(this.lockFile, 'utf8'); st = statSync(this.lockFile); } catch { continue; } // vanished: re-race
-+        if (lockReclaimable(content, st.mtimeMs)) { try { unlinkSync(this.lockFile); } catch { /* raced */ } continue; }
-+        if (Date.now() > deadline) throw new Error(`timed out acquiring store lock ${this.lockFile} (held by pid ${String(content).split(':')[0]})`);
-+        sleep(15);
++        if (e.code !== 'EEXIST') throw e;   // a real error (not "already held"): fail now
++        if (Date.now() > deadline) {        // bounded wait elapsed — fail, never reclaim automatically
++          let who = '';
++          try { const c = readFileSync(this.lockFile, 'utf8'); who = ` held by pid ${String(c).split(':')[0]} (${ownerState(c)})`; } catch { /* vanished */ }
++          throw new Error(`timed out acquiring store lock ${this.lockFile}${who}. Stop all writers, verify none is running, then remove the lock file manually.`);
++        }
++        sleep(20);
 +      }
 +    }
    }
@@ -767,7 +771,8 @@ index 42d8a88..7c27bd3 100644
 +    try { if (readFileSync(this.lockFile, 'utf8') === this._lockToken) unlinkSync(this.lockFile); } catch { /* already gone */ }
 +    this._lockToken = null;
 +  }
-+  #withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
++  /** Run `fn` with the store exclusively locked. Public so callers (and deterministic tests) can batch or hold. */
++  withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
 +
 +  // ---------------------------------------------------------------- helpers over a snapshot
 +  #consumedBy(d, txHash) {
@@ -779,20 +784,20 @@ index 42d8a88..7c27bd3 100644
    newId() { return 'inv_' + randomBytes(6).toString('hex'); }
  
 +  // ---------------------------------------------------------------- reads (fresh each call)
-+  get(id) { return this.#withLock(() => this.#readOrThrow().invoices[id] ?? null); }
++  get(id) { return this.withLock(() => this.#readOrThrow().invoices[id] ?? null); }
 +  list(filter = {}) {
-+    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).filter(i =>
++    return this.withLock(() => Object.values(this.#readOrThrow().invoices).filter(i =>
 +      (!filter.status || i.status === filter.status) && (!filter.payee || i.payee.toLowerCase() === filter.payee.toLowerCase())));
 +  }
    /** exact_amount uniqueness is per payee: two open invoices to the same address must not share an amount. */
    hasOpenExactAmount(payee, amountUnits) {
 -    return Object.values(this.data.invoices).some(i =>
 -      i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits));
-+    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).some(i =>
++    return this.withLock(() => Object.values(this.#readOrThrow().invoices).some(i =>
 +      i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits)));
    }
 +  /** Which invoice (if any) has already settled from this transaction. */
-+  txConsumedBy(txHash) { return this.#withLock(() => this.#consumedBy(this.#readOrThrow(), txHash)); }
++  txConsumedBy(txHash) { return this.withLock(() => this.#consumedBy(this.#readOrThrow(), txHash)); }
  
 -  /** Which invoice (if any) has already settled from this transaction. One payment event settles one invoice. */
 -  txConsumedBy(txHash) {
@@ -804,7 +809,7 @@ index 42d8a88..7c27bd3 100644
 -    return null;
 -  }
 +  // ---------------------------------------------------------------- writes
-+  put(inv) { return this.#withLock(() => { const d = this.#readOrThrow(); d.invoices[inv.id] = inv; this.#write(d); return inv; }); }
++  put(inv) { return this.withLock(() => { const d = this.#readOrThrow(); d.invoices[inv.id] = inv; this.#write(d); return inv; }); }
  
 -  /** Atomically claim a payment event (txHash, optional logIndex) for an invoice. False if another invoice already owns this tx. */
 -  claimTransfer(invoiceId, txHash, logIndex = null) {
@@ -820,7 +825,7 @@ index 42d8a88..7c27bd3 100644
 +   * No half-state: either both the claim and the settlement are persisted, or neither is.
 +   */
 +  settle(invoiceId, { txHash, logIndex = null }, settlement) {
-+    return this.#withLock(() => {
++    return this.withLock(() => {
 +      const d = this.#readOrThrow();
 +      const inv = d.invoices[invoiceId];
 +      if (!inv) return { ok: false, reason: 'unknown invoice' };
@@ -845,7 +850,7 @@ index 42d8a88..7c27bd3 100644
 -      (!filter.payee || i.payee.toLowerCase() === filter.payee.toLowerCase()));
 +  /** Mark a non-settling status (open/partial/overdue/unknown) with a last_check detail. */
 +  mark(invoiceId, status, detail) {
-+    return this.#withLock(() => {
++    return this.withLock(() => {
 +      const d = this.#readOrThrow();
 +      const inv = d.invoices[invoiceId];
 +      if (!inv) return null;
@@ -856,6 +861,29 @@ index 42d8a88..7c27bd3 100644
 +    });
    }
  }
+diff --git a/paykit/test/lockworker.mjs b/paykit/test/lockworker.mjs
+new file mode 100644
+index 0000000..55ab9f9
+--- /dev/null
++++ b/paykit/test/lockworker.mjs
+@@ -0,0 +1,17 @@
++// test helper: hold the store lock inside the critical section across a stdin barrier, so a test can force a
++// deterministic interleaving (announce "ACQUIRED", block until the parent sends one byte, then release+exit).
++// Uses synchronous writeSync(1,…) so the barrier flushes BEFORE the blocking readSync (an async stdout write
++// would stay buffered while the thread blocks, deadlocking the parent).
++import { readSync, writeSync } from 'node:fs';
++import { InvoiceStore } from '../src/store.mjs';
++
++// Guard: this is a worker, not a test. `node --test` (no args) auto-discovers everything under test/, so do
++// nothing unless actually invoked as a worker (LWP set) — otherwise it would block and look like a failed test.
++if (process.env.LWP) {
++  const store = new InvoiceStore(process.env.LWP);
++  store.withLock(() => {
++    writeSync(1, 'ACQUIRED\n');                                 // barrier 1: we are IN the critical section
++    try { readSync(0, Buffer.alloc(1), 0, 1, null); } catch { } // block until the parent writes a byte (barrier 2)
++  });
++  writeSync(1, 'RELEASED\n');
++}
 diff --git a/paykit/test/paykit.test.mjs b/paykit/test/paykit.test.mjs
 index e9e0fbb..b0c40ae 100644
 --- a/paykit/test/paykit.test.mjs
@@ -911,10 +939,10 @@ index e9e0fbb..b0c40ae 100644
 +});
 diff --git a/paykit/test/store.test.mjs b/paykit/test/store.test.mjs
 new file mode 100644
-index 0000000..f620c1d
+index 0000000..8793fe0
 --- /dev/null
 +++ b/paykit/test/store.test.mjs
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,175 @@
 +// store.test.mjs — finding #4: atomic claim+settle, cross-process safety, no silent discard of history.
 +import { test } from 'node:test';
 +import assert from 'node:assert/strict';
@@ -922,7 +950,10 @@ index 0000000..f620c1d
 +import { tmpdir } from 'node:os';
 +import { join, dirname } from 'node:path';
 +import { spawn } from 'node:child_process';
-+import { InvoiceStore, lockReclaimable } from '../src/store.mjs';
++import { existsSync, unlinkSync } from 'node:fs';
++import { InvoiceStore, ownerState } from '../src/store.mjs';
++
++const LOCKWORKER = new URL('./lockworker.mjs', import.meta.url).pathname;
 +
 +const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
 +const freshStore = () => join(mkdtempSync(join(tmpdir(), 'paykit4-')), 'invoices.json');
@@ -1000,12 +1031,64 @@ index 0000000..f620c1d
 +  });
 +}
 +
-+test('#4 a live owner keeps its lock; only a dead owner (or the TTL backstop) is reclaimable', async () => {
-+  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now()), false, 'a live owner with a fresh lock is never stolen');
-+  assert.equal(lockReclaimable('', Date.now()), false, 'a just-created lock (owner not yet written) is not stolen');
-+  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now() - 61_000), true, 'TTL backstop reclaims a very old lock (PID reuse)');
++test('#4 ownerState: a live owner is never reclaimable (no matter the age); only a confirmed-dead one is', async () => {
++  assert.equal(ownerState(`${process.pid}:tok`), 'live', 'this process is alive');
++  assert.equal(ownerState(''), 'unknown', 'incomplete content -> unknown (never stolen)');
++  assert.equal(ownerState('notapid:tok'), 'unknown');
 +  const deadPid = await new Promise(res => { const c = spawn(process.execPath, ['-e', '0']); c.on('exit', () => res(c.pid)); });
-+  assert.equal(lockReclaimable(`${deadPid}:tok`, Date.now()), true, 'a dead owner is reclaimable immediately');
++  assert.equal(ownerState(`${deadPid}:tok`), 'dead', 'an exited process is confirmed dead');
++});
++
++// Hold the lock from another process that has paused for a long "age" (ancient mtime), then crash it.
++const holderCode =
++  `import { writeFileSync, utimesSync } from 'node:fs';` +
++  `const lf = process.env.LF; writeFileSync(lf, process.pid + ':held');` +
++  `const old = (Date.now() - 600000) / 1000; try { utimesSync(lf, old, old); } catch {}` + // mtime 10 min ago
++  `process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);`;
++
++test('#4 a paused holder (ancient mtime, still alive) is NOT stolen; a crashed holder needs manual cleanup', { timeout: 30_000 }, async () => {
++  const p = freshStore();
++  const lockFile = p + '.lock';
++  const holder = spawn(process.execPath, ['--input-type=module', '-e', holderCode], { env: { ...process.env, LF: lockFile }, stdio: 'inherit' });
++  try {
++    for (let i = 0; i < 200 && !existsSync(lockFile); i++) await new Promise(r => setTimeout(r, 25));
++    assert.ok(existsSync(lockFile), 'holder took the lock');
++    const before = readFileSync(lockFile, 'utf8');
++    // a contender must NOT steal a live holder's lock, however old the mtime: it waits, then errors
++    assert.throws(() => new InvoiceStore(p).put({ id: 'inv_steal', payee: PAYEE, status: 'open', amount_units: '1' }),
++      /timed out acquiring store lock/, 'a live (paused) holder is never stolen from');
++    assert.equal(readFileSync(lockFile, 'utf8'), before, 'the contender did not move or rewrite the holder\'s lock');
++  } finally {
++    holder.kill('SIGKILL'); // crash the holder WITHOUT releasing the lock
++    await new Promise(res => holder.on('exit', res));
++  }
++  // Interim policy: a crashed owner's lock is NOT auto-reclaimed. Acquisition fails and asks for manual cleanup.
++  assert.throws(() => new InvoiceStore(p).get('x'), /remove the lock file manually/, 'a stale lock requires manual cleanup — no auto-steal');
++  // operator stops all writers, verifies quiescence, removes the lock -> normal operation resumes
++  unlinkSync(lockFile);
++  const s = new InvoiceStore(p);
++  s.put({ id: 'inv_after', payee: PAYEE, status: 'open', amount_units: '1' });
++  assert.equal(new InvoiceStore(p).get('inv_after').id, 'inv_after', 'resumes after manual cleanup');
++});
++
++test('#4 [deterministic] a live holder is never displaced; a contender fails cleanly without touching the lock', { timeout: 30_000 }, async () => {
++  const p = freshStore();
++  const lockFile = p + '.lock';
++  const A = spawn(process.execPath, [LOCKWORKER], { env: { ...process.env, LWP: p }, stdio: ['pipe', 'pipe', 'inherit'] });
++  await new Promise((res) => { let s = ''; A.stdout.on('data', d => { s += d; if (s.includes('ACQUIRED')) res(); }); }); // barrier: A is in the CS (not a sleep)
++  const held = readFileSync(lockFile, 'utf8');
++  assert.match(held, /^\d+:[0-9a-f]+$/, 'A owns the lock');
++  // contender B, while A is in the critical section: fails with a bounded timeout and does NOT move/delete the lock
++  assert.throws(() => new InvoiceStore(p).put({ id: 'inv_B', payee: PAYEE, status: 'open', amount_units: '1' }), /timed out acquiring store lock/);
++  assert.equal(existsSync(lockFile), true, 'lock still present after B failed');
++  assert.equal(readFileSync(lockFile, 'utf8'), held, 'B did not move, rewrite, or delete A\'s lock');
++  A.stdin.write('x'); // barrier 2: release A
++  await new Promise(res => A.on('exit', res));
++  assert.equal(existsSync(lockFile), false, 'A released its own lock on exit');
++  // only after A left could a new writer enter -> at most one process was ever in the critical section
++  const s = new InvoiceStore(p); s.put({ id: 'inv_C', payee: PAYEE, status: 'open', amount_units: '1' });
++  assert.equal(new InvoiceStore(p).get('inv_B'), null, 'the contender never entered the critical section');
++  assert.equal(new InvoiceStore(p).get('inv_C').id, 'inv_C');
 +});
 +
 +test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {
@@ -1035,12 +1118,20 @@ index 0000000..f620c1d
 +  const paid = ['inv_x', 'inv_y'].filter(id => s2.get(id).status === 'paid');
 +  assert.equal(paid.length, 1, 'only the winning invoice is paid');
 +});
+diff --git a/paykit/undefined.lock b/paykit/undefined.lock
+new file mode 100644
+index 0000000..7db6f5d
+--- /dev/null
++++ b/paykit/undefined.lock
+@@ -0,0 +1 @@
++78065:373c25e4929d35e2
+\ No newline at end of file
 diff --git a/review/round2-full.patch b/review/round2-full.patch
 new file mode 100644
-index 0000000..004103b
+index 0000000..ede9c5d
 --- /dev/null
 +++ b/review/round2-full.patch
-@@ -0,0 +1,1081 @@
+@@ -0,0 +1,2168 @@
 +diff --git a/buykit/src/buykit.mjs b/buykit/src/buykit.mjs
 +index 3cb7f9c..9e9d868 100644
 +--- a/buykit/src/buykit.mjs
@@ -1687,7 +1778,7 @@ index 0000000..004103b
 + server.registerTool('send_reminder', {
 +   title: 'Draft payment reminder',
 +diff --git a/paykit/src/store.mjs b/paykit/src/store.mjs
-+index 42d8a88..c7f695f 100644
++index 42d8a88..7c27bd3 100644
 +--- a/paykit/src/store.mjs
 ++++ b/paykit/src/store.mjs
 +@@ -6,69 +6,165 @@
@@ -1696,9 +1787,9 @@ index 0000000..004103b
 +  * status: "open" | "paid" | "partial" | "overdue" | "unknown"
 ++ *
 ++ * Safety (finding #4):
-++ *   - Single-writer across processes: every operation takes an exclusive lock (atomic mkdir, with stale recovery),
-++ *     reloads the file fresh, applies its change, and writes atomically (tmp + rename). No cached `this.data`, so
-++ *     two processes sharing the file never overwrite each other with stale state.
+++ *   - Single-writer across processes: every operation takes an exclusive lockfile (O_EXCL; reclaimed only when the
+++ *     owner process is dead or past a TTL backstop), reloads the file fresh, applies its change, and writes
+++ *     atomically (fsync tmp + rename). No cached `this.data`, so two processes never overwrite each other's state.
 ++ *   - Consume-once + settlement are ONE write (settle()): there is no window where a transfer is claimed but the
 ++ *     invoice is not yet marked paid, or vice versa.
 ++ *   - A corrupt store is preserved and surfaced, never silently discarded as empty.
@@ -2078,6 +2169,1093 @@ index 0000000..004103b
 ++  const paid = ['inv_x', 'inv_y'].filter(id => s2.get(id).status === 'paid');
 ++  assert.equal(paid.length, 1, 'only the winning invoice is paid');
 ++});
++diff --git a/review/round2-full.patch b/review/round2-full.patch
++new file mode 100644
++index 0000000..004103b
++--- /dev/null
+++++ b/review/round2-full.patch
++@@ -0,0 +1,1081 @@
+++diff --git a/buykit/src/buykit.mjs b/buykit/src/buykit.mjs
+++index 3cb7f9c..9e9d868 100644
+++--- a/buykit/src/buykit.mjs
++++++ b/buykit/src/buykit.mjs
+++@@ -16,8 +16,10 @@ import { Wallet, getAddress } from 'ethers';
+++ import { ChainReader } from './chain.mjs';
+++ import { PurchaseStore } from './store.mjs';
+++ 
++++// Must match the wallet contract's PAY_TYPEHASH exactly, including field order.
++++// `generation` is bound so a signature made under one grant dies when the owner re-grants the same key.
+++ const PAY_TYPES = { Pay: [
+++-  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
++++  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+++ ] };
+++ 
+++ export class BuyKit {
+++@@ -94,9 +96,9 @@ export class BuyKit {
+++     const now = Math.floor(Date.now() / 1000);
+++     const deadline = now + 300;
+++     const domain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: this.cfg.chainId, verifyingContract: this.wallet };
+++-    const signature = await this.signer.signTypedData(domain, PAY_TYPES, { to: payTo, amount: units, nonce: s.nonce, deadline: BigInt(deadline) });
++++    const signature = await this.signer.signTypedData(domain, PAY_TYPES, { to: payTo, amount: units, nonce: s.nonce, generation: s.generation, deadline: BigInt(deadline) });
+++     const paymentPayload = { x402Version: 1, scheme: 'dfmi-session', network: this.cfg.chain,
+++-      payload: { wallet: this.wallet, sessionKey: this.sessionAddress, signature, authorization: { to: payTo, amount: units.toString(), nonce: s.nonce.toString(), deadline: String(deadline) } } };
++++      payload: { wallet: this.wallet, sessionKey: this.sessionAddress, signature, authorization: { to: payTo, amount: units.toString(), nonce: s.nonce.toString(), generation: s.generation.toString(), deadline: String(deadline) } } };
+++     const paymentRequirements = { scheme: 'dfmi-session', network: this.cfg.chain, asset: this.cfg.token, payTo, maxAmountRequired: units.toString(),
+++       resource: 'paykit://invoice', description: invoice_id ? `invoice ${invoice_id}` : 'buykit payment', maxTimeoutSeconds: 300 };
+++ 
+++diff --git a/buykit/src/chain.mjs b/buykit/src/chain.mjs
+++index f569c5a..dcc930e 100644
+++--- a/buykit/src/chain.mjs
++++++ b/buykit/src/chain.mjs
+++@@ -14,6 +14,7 @@ const WALLET_ABI = [
+++   'function token() view returns (address)',
+++   'function sessions(address) view returns (bool active, uint64 expiry, uint256 cap, uint256 spent)',
+++   'function sessionNonce(address) view returns (uint256)',
++++  'function sessionGeneration(address) view returns (uint256)',
+++   'function remaining(address) view returns (uint256)',
+++   'function allowed(address sessionKey, address to) view returns (bool ok, uint8 category)',
+++ ];
+++@@ -34,14 +35,14 @@ export class ChainReader {
+++   /** The session's on-chain bounds, as the wallet contract sees them right now. */
+++   async session(walletAddr, sessionKey) {
+++     const w = this.wallet(walletAddr);
+++-    const [s, nonce, tok, bal] = await Promise.all([w.sessions(sessionKey), w.sessionNonce(sessionKey), w.token(), this.erc20.balanceOf(walletAddr)]);
++++    const [s, nonce, generation, tok, bal] = await Promise.all([w.sessions(sessionKey), w.sessionNonce(sessionKey), w.sessionGeneration(sessionKey), w.token(), this.erc20.balanceOf(walletAddr)]);
+++     const now = Math.floor(Date.now() / 1000);
+++     const expiry = Number(s.expiry);
+++     const cap = BigInt(s.cap), spent = BigInt(s.spent);
+++     return {
+++       active: Boolean(s.active), expiry: expiry || null, expired: expiry !== 0 && now > expiry,
+++       cap, spent, remaining: s.active && cap > spent ? cap - spent : 0n,
+++-      nonce: BigInt(nonce), walletBalance: BigInt(bal), tokenMatches: getAddress(tok) === this.token,
++++      nonce: BigInt(nonce), generation: BigInt(generation), walletBalance: BigInt(bal), tokenMatches: getAddress(tok) === this.token,
+++     };
+++   }
+++ 
+++diff --git a/buykit/test/buykit.test.mjs b/buykit/test/buykit.test.mjs
+++index 4fa028c..0b2bb5b 100644
+++--- a/buykit/test/buykit.test.mjs
++++++ b/buykit/test/buykit.test.mjs
+++@@ -2,7 +2,7 @@
+++ import { test } from 'node:test';
+++ import assert from 'node:assert/strict';
+++ import { mkdtempSync } from 'node:fs'; import { tmpdir } from 'node:os'; import { join } from 'node:path';
+++-import { Interface, AbiCoder, Wallet, verifyTypedData, getAddress } from 'ethers';
++++import { Interface, AbiCoder, Wallet, verifyTypedData, getAddress, TypedDataEncoder } from 'ethers';
+++ import { BuyKit } from '../src/buykit.mjs';
+++ 
+++ const TOKEN = '0x03E25a5DC7aC15f32462652a4bF4986F378d5fcf';
+++@@ -15,7 +15,7 @@ const cfg = () => ({ chain: 'eip155:112172', chainId: 112172, rpc: 'http://unuse
+++ const ERC20 = new Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
+++ const WALLET_IFACE = new Interface([
+++   'function token() view returns (address)', 'function sessions(address) view returns (bool,uint64,uint256,uint256)',
+++-  'function sessionNonce(address) view returns (uint256)', 'function allowed(address,address) view returns (bool,uint8)']);
++++  'function sessionNonce(address) view returns (uint256)', 'function sessionGeneration(address) view returns (uint256)', 'function allowed(address,address) view returns (bool,uint8)']);
+++ const TOKEN_IFACE = new Interface(['function balanceOf(address) view returns (uint256)']);
+++ 
+++ /** a provider that answers eth_call for the wallet + token and eth_getLogs with `transfers` */
+++@@ -30,6 +30,7 @@ function fakeProvider(state) {
+++         if (fn.name === 'token') return enc.encode(['address'], [TOKEN]);
+++         if (fn.name === 'sessions') return enc.encode(['bool', 'uint64', 'uint256', 'uint256'], [state.active, state.expiry, state.cap, state.spent]);
+++         if (fn.name === 'sessionNonce') return enc.encode(['uint256'], [state.nonce]);
++++        if (fn.name === 'sessionGeneration') return enc.encode(['uint256'], [state.generation]);
+++         if (fn.name === 'allowed') { if (state.allowed == null) throw new Error('execution reverted'); return enc.encode(['bool', 'uint8'], [state.allowed, 1]); }
+++       }
+++       if (to === getAddress(TOKEN)) return enc.encode(['uint256'], [state.balance]);
+++@@ -43,7 +44,14 @@ function fakeProvider(state) {
+++     async getNetwork() { return { chainId: 112172n }; }, async resolveName(n) { return n; }, _isProvider: true, provider: null,
+++   };
+++ }
+++-const base = () => ({ active: true, expiry: 0, cap: 500_000n, spent: 100_000n, nonce: 3n, balance: 1_000_000n, allowed: null, transfers: [] });
++++const base = () => ({ active: true, expiry: 0, cap: 500_000n, spent: 100_000n, nonce: 3n, generation: 7n, balance: 1_000_000n, allowed: null, transfers: [] });
++++
++++// The wallet contract's exact EIP-712 Pay type (SessionKeyWallet.sol / IntentSessionWallet.sol), generation included.
++++const PAY_TYPES = { Pay: [
++++  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] };
++++const PAY_TYPES_OLD = { Pay: [
++++  { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] };
++++const payDomain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: 112172, verifyingContract: WALLET };
+++ const fakeFetch = (reply) => async (url, init) => { fakeFetch.last = { url, body: JSON.parse(init.body) }; return { status: 200, json: async () => reply }; };
+++ 
+++ test('check_budget reads cap / spent / remaining from the wallet', async () => {
+++@@ -61,9 +69,9 @@ test('pay_invoice signs a valid Pay intent and sends the dfmi-session payload to
+++   assert.equal(pp.scheme, 'dfmi-session'); assert.equal(rq.maxAmountRequired, '20287'); assert.equal(rq.payTo, PAYEE);
+++   const a = pp.payload.authorization;
+++   assert.equal(a.nonce, '3');
+++-  const signer = verifyTypedData({ name: 'dfmi SessionKeyWallet', version: '1', chainId: 112172, verifyingContract: WALLET },
+++-    { Pay: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }] },
+++-    { to: a.to, amount: BigInt(a.amount), nonce: BigInt(a.nonce), deadline: BigInt(a.deadline) }, pp.payload.signature);
++++  assert.equal(a.generation, '7', 'authorization carries the on-chain generation');
++++  const signer = verifyTypedData(payDomain, PAY_TYPES,
++++    { to: a.to, amount: BigInt(a.amount), nonce: BigInt(a.nonce), generation: BigInt(a.generation), deadline: BigInt(a.deadline) }, pp.payload.signature);
+++   assert.equal(signer, session.address);
+++   // second call with the same invoice id: local log, no second settle
+++   const before = fakeFetch.last; const r2 = await kit.payInvoice({ pay_to: PAYEE, exact_amount: '0.020287', invoice_id: 'inv_1' });
+++@@ -97,6 +105,33 @@ test('does not pay twice: an exact-amount transfer already on-chain is reported,
+++   assert.equal(r.already_paid, true); assert.equal(r.tx_hash, '0xprior'); assert.equal(fakeFetch.last, undefined);
+++ });
+++ 
++++// ---- finding #1: session-signature compatibility with the generation-bound contract ----
++++
++++test('#1 client Pay type matches the contract PAY_TYPEHASH string exactly', () => {
++++  assert.equal(TypedDataEncoder.from(PAY_TYPES).encodeType('Pay'),
++++    'Pay(address to,uint256 amount,uint256 nonce,uint256 generation,uint256 deadline)');
++++});
++++
++++test('#1 a signature over the OLD Pay type (no generation) fails the contract verification', async () => {
++++  const v = { to: PAYEE, amount: 20287n, nonce: 3n, deadline: 9999999999n };
++++  // an old client signs without generation; the contract recovers over the generation-bound type
++++  const oldSig = await session.signTypedData(payDomain, PAY_TYPES_OLD, v);
++++  const recovered = verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n }, oldSig);
++++  assert.notEqual(recovered, session.address, 'old-format signature must not verify against the new contract type');
++++});
++++
++++test('#1 a stale-generation signature dies after regrant; a fresh one verifies', async () => {
++++  const v = { to: PAYEE, amount: 20287n, nonce: 0n, deadline: 9999999999n };
++++  const sigGen7 = await session.signTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n });
++++  // same grant (generation 7): verifies
++++  assert.equal(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 7n }, sigGen7), session.address);
++++  // owner re-grants the same key -> contract generation becomes 8; the old signature no longer recovers to the key
++++  assert.notEqual(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n }, sigGen7), session.address);
++++  // a fresh signature for generation 8 verifies
++++  const sigGen8 = await session.signTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n });
++++  assert.equal(verifyTypedData(payDomain, PAY_TYPES, { ...v, generation: 8n }, sigGen8), session.address);
++++});
++++
+++ test('an unclear facilitator reply is resolved from the chain, not reported as failure', async () => {
+++   const state = { ...base(), transfers: [] };
+++   const f = async (url, init) => { state.transfers.push({ value: 20287n, tx: '0xlate' }); return { status: 502, json: async () => { throw new Error('html'); } }; };
+++diff --git a/deploy-intent.mjs b/deploy-intent.mjs
+++index 754f696..2b48280 100644
+++--- a/deploy-intent.mjs
++++++ b/deploy-intent.mjs
+++@@ -9,7 +9,7 @@
+++  *
+++  * Usage: node deploy-intent.mjs   (requires DEPLOYER_PRIVATE_KEY in .env; .env may live in this directory or its parent)
+++  */
+++-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
++++import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+++ import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits } from 'ethers';
+++ 
+++ const cfgUrl = new URL('./dfmi.json', import.meta.url);
+++@@ -45,12 +45,19 @@ if (!regAddr) {
+++ } else console.log(`ServiceRegistry reused: ${regAddr}`);
+++ 
+++ // 2. register a category: the producer's payout address (splitter) → category 1 "market-data"
++++// ServiceRegistry now requires msg.sender == payTo (proof of control): only the splitter can register itself.
++++// The deployer can do it here only when it IS the splitter; otherwise register separately from the splitter's key.
+++ const reg = new Contract(regAddr, regArt.abi, owner);
+++ const cat = Number(await reg.categoryOf(cfg.splitter));
+++-if (cat === 0) {
++++if (cat !== 0) {
++++  console.log(`splitter already registered as category ${cat}`);
++++} else if (owner.address.toLowerCase() === cfg.splitter.toLowerCase()) {
+++   await (await reg.register(cfg.splitter, 1, 'market-data', { ...tx0, gasLimit: 200_000 })).wait();
+++   console.log(`✓ Category registered: splitter ${cfg.splitter} → 1 (market-data)`);
+++-} else console.log(`splitter already registered as category ${cat}`);
++++} else {
++++  console.log(`⚠ splitter ${cfg.splitter} != deployer ${owner.address}; ServiceRegistry requires self-registration.`);
++++  console.log(`  Register from the splitter's own key:  SELLER_ADDRESS=${cfg.splitter} REGISTRANT_KEY=0x<splitter key> node wangvc-seller/register.mjs`);
++++}
+++ 
+++ // 3. IntentSessionWallet
+++ const wf = new ContractFactory(walArt.abi, walArt.bytecode, owner);
+++@@ -73,12 +80,14 @@ await (await w.grantSession(session.address, cap, expiry, intentMask, { ...tx0,
+++ console.log(`✓ Session granted ${session.address} | cap 0.50 | 7 days | intent = market-data only (mask ${intentMask})`);
+++ 
+++ // 5. record it (contains a private key — never commit)
+++-writeFileSync(new URL('./intent-wallet.deployed.json', import.meta.url), JSON.stringify({
++++const deployedPath = new URL('./intent-wallet.deployed.json', import.meta.url);
++++writeFileSync(deployedPath, JSON.stringify({
+++   chain: cfg.rpc, chainId: cfg.chainId, token: cfg.token,
+++   registry: regAddr, wallet: walletAddr, owner: owner.address,
+++   session: { address: session.address, privateKey: session.privateKey },
+++   cap: String(cap), expiry, intentMask: String(intentMask),
+++-}, null, 2));
++++}, null, 2), { mode: 0o600 });                 // mode on CREATE
++++try { chmodSync(deployedPath, 0o600); } catch {} // and tighten an already-existing file (create-mode alone won't)
+++ console.log(`\nDone. Next, the three-line proof of the intent layer:`);
+++ console.log(`  node intent-pay.mjs ${cfg.splitter} 0.02        # → ✓ settled (market-data, within intent)`);
+++ console.log(`  node intent-pay.mjs ${cfg.centralBank} 0.02     # → ⛔ reverted "unregistered payee" (outside intent)`);
+++diff --git a/market-mcp/src/budget.mjs b/market-mcp/src/budget.mjs
+++new file mode 100644
+++index 0000000..c309b86
+++--- /dev/null
++++++ b/market-mcp/src/budget.mjs
+++@@ -0,0 +1,42 @@
++++/**
++++ * budget.mjs — per-session spend accounting for the market MCP.
++++ *
++++ * The rule that matters for safety: once a payment authorization (an EIP-3009 signature) has been DISCLOSED
++++ * to a seller, the reserved amount stays committed. A seller's response — success, failure, silence, timeout —
++++ * is not proof the authorization was not (or will not be) settled; the signature is a bearer instrument valid
++++ * until its deadline. Releasing budget on an untrusted response is exactly how repeated calls can authorize
++++ * more than the session budget. We only release a reservation that was never disclosed (e.g. signing refused
++++ * before the request, or the endpoint was not even x402).
++++ *
++++ * Over-reserving is the safe direction: it can only block further spend, never permit over-spend. Freeing a
++++ * disclosed-but-unsettled amount requires trustworthy reconciliation (on-chain proof the nonce was never used,
++++ * after the authorization's deadline) — not done here.
++++ */
++++export function createBudget(limit) {
++++  const EPS = 1e-9;
++++  let committed = 0; // settled OR disclosed-pending — not releasable on a seller's say-so
++++
++++  return {
++++    get limit() { return limit; },
++++    get spent() { return committed; },
++++    remaining() { return Math.max(0, limit - committed); },
++++
++++    /** Reserve `price` before signing. Throws (refuses) if it would exceed the budget. Returns a handle. */
++++    reserve(price) {
++++      if (!(price >= 0)) throw new Error(`invalid price ${price}`);
++++      if (committed + price > limit + EPS)
++++        throw new Error(`Session budget exhausted: committed ${committed.toFixed(4)} of ${limit}; this costs ${price}.`);
++++      committed += price;
++++      return { price, resolved: false };
++++    },
++++
++++    /** Resolve a reservation after the attempt. Releases ONLY when the signature was never disclosed. */
++++    resolve(handle, { disclosed, paid } = {}) {
++++      if (!handle || handle.resolved) return;
++++      handle.resolved = true;
++++      if (paid) return;        // settled → stays committed
++++      if (disclosed) return;   // signature is out there → stays reserved (pending); may still settle
++++      committed -= handle.price; // never disclosed → safe to release
++++    },
++++  };
++++}
+++diff --git a/market-mcp/src/index.mjs b/market-mcp/src/index.mjs
+++index 2f3a8b5..72667be 100644
+++--- a/market-mcp/src/index.mjs
++++++ b/market-mcp/src/index.mjs
+++@@ -16,10 +16,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+++ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+++ import { z } from 'zod';
+++ import { Wallet } from 'ethers';
+++-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
++++import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync } from 'node:fs';
+++ import { homedir } from 'node:os';
+++ import { join } from 'node:path';
+++ import { quote, buy } from './x402.mjs';
++++import { createBudget } from './budget.mjs';
++++import { purchase } from './purchase.mjs';
+++ 
+++ console.log = (...a) => console.error(...a); // stdout is the MCP channel
+++ 
+++@@ -34,7 +36,7 @@ const WALLET_FILE = join(HOME, 'buyer-wallet.json');
+++ const LOG_FILE = join(HOME, 'purchases.jsonl');
+++ const BODY_LIMIT = 20_000;
+++ 
+++-let spent = 0;
++++const budget = createBudget(BUDGET);
+++ 
+++ function loadWallet() {
+++   if (env.DFMI_BUYER_PRIVATE_KEY) return new Wallet(env.DFMI_BUYER_PRIVATE_KEY);
+++@@ -86,7 +88,7 @@ server.registerTool('dfmi_wallet', {
+++   annotations: { readOnlyHint: true, openWorldHint: true },
+++ }, tool(async () => {
+++   const w = loadWallet();
+++-  const limits = { maxPricePerCall: MAX_PRICE, sessionBudget: BUDGET, spentThisSession: +spent.toFixed(6), remaining: +(BUDGET - spent).toFixed(6), mainnetAllowed: ALLOW_MAINNET };
++++  const limits = { maxPricePerCall: MAX_PRICE, sessionBudget: BUDGET, spentThisSession: +budget.spent.toFixed(6), remaining: +budget.remaining().toFixed(6), mainnetAllowed: ALLOW_MAINNET };
+++   if (!w) return { wallet: null, hint: 'Call dfmi_create_wallet, then dfmi_claim_faucet.', limits };
+++   const { json } = await getJson(`${FAUCET}/balance?address=${w.address}`);
+++   return { address: w.address, balance: json, limits };
+++@@ -103,6 +105,7 @@ server.registerTool('dfmi_create_wallet', {
+++   const w = Wallet.createRandom();
+++   mkdirSync(HOME, { recursive: true, mode: 0o700 });
+++   writeFileSync(WALLET_FILE, JSON.stringify({ address: w.address, privateKey: w.privateKey, createdAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
++++  try { chmodSync(WALLET_FILE, 0o600); } catch {} // tighten even if the file somehow pre-existed (create-mode alone won't)
+++   return { address: w.address, created: true, next: 'Call dfmi_claim_faucet to get 10 free dUSD.' };
+++ }));
+++ 
+++@@ -129,22 +132,18 @@ server.registerTool('dfmi_buy', {
+++ }, tool(async ({ url, max_price, method }) => {
+++   const w = needWallet();
+++   const cap = Math.min(max_price ?? MAX_PRICE, MAX_PRICE);
+++-  let reserved = 0;
+++-  const reserve = price => {
+++-    if (spent + price > BUDGET + 1e-9) throw new Error(`Session budget exhausted: spent ${spent.toFixed(4)} of ${BUDGET}; this costs ${price}.`);
+++-    spent += price; reserved = price;
+++-  };
+++-  // If the paid request throws after signing, the reservation stays: the authorization may still settle.
+++-  const r = await buy(url, w, { method, maxPrice: cap, allowMainnet: ALLOW_MAINNET, reserve });
+++-  if (reserved && !r.paid) spent -= reserved; // seller answered without settling → nothing was spent
++++  // purchase() reserves before signing and keeps the reservation committed unless the signature was never disclosed.
++++  const r = await purchase({ url, wallet: w, budget, maxPrice: cap, allowMainnet: ALLOW_MAINNET, method, buyImpl: buy });
++++  const pending = r.pending;
+++ 
+++   const record = { time: new Date().toISOString(), resource: url, network: r.network, price: r.price, coin: r.coin, payTo: r.payTo, buyer: r.buyer,
+++-    status: r.status, paid: r.paid, delivered: r.delivered, tx: r.settlement?.transaction ?? null };
++++    status: r.status, paid: r.paid, delivered: r.delivered, pending, tx: r.settlement?.transaction ?? null };
+++   try { mkdirSync(HOME, { recursive: true, mode: 0o700 }); appendFileSync(LOG_FILE, JSON.stringify(record) + '\n'); } catch {}
+++ 
+++   const body = r.body ?? r.preview ?? '';
+++-  return { ...record, latencyMs: r.latencyMs, settlement: r.settlement ?? null, note: r.note,
+++-    spentThisSession: +spent.toFixed(6), remainingBudget: +(BUDGET - spent).toFixed(6),
++++  return { ...record, latencyMs: r.latencyMs, settlement: r.settlement ?? null,
++++    note: pending ? `${r.note ? r.note + ' ' : ''}authorization disclosed but no success receipt; amount held against the session budget until it is reconciled as expired/unused.` : r.note,
++++    spentThisSession: +budget.spent.toFixed(6), remainingBudget: +budget.remaining().toFixed(6),
+++     goods: body.length > BODY_LIMIT ? body.slice(0, BODY_LIMIT) + `\n…[truncated, ${body.length} bytes total]` : body };
+++ }));
+++ 
+++diff --git a/market-mcp/src/purchase.mjs b/market-mcp/src/purchase.mjs
+++new file mode 100644
+++index 0000000..7abac10
+++--- /dev/null
++++++ b/market-mcp/src/purchase.mjs
+++@@ -0,0 +1,14 @@
++++/**
++++ * purchase.mjs — one buy attempt against the session budget (the glue between buy() and the budget).
++++ *
++++ * Reserve before signing; release only if the signature was never disclosed. If buyImpl throws at or after
++++ * signing, the throw propagates and the reservation is deliberately NOT resolved, so it stays committed —
++++ * the disclosed authorization may still settle.
++++ */
++++export async function purchase({ url, wallet, budget, maxPrice, allowMainnet = false, method, buyImpl }) {
++++  let reservation = null;
++++  const reserve = price => { reservation = budget.reserve(price); };
++++  const r = await buyImpl(url, wallet, { method, maxPrice, allowMainnet, reserve });
++++  budget.resolve(reservation, { disclosed: r.disclosed, paid: r.paid });
++++  return { ...r, pending: !!(r.disclosed && !r.paid) };
++++}
+++diff --git a/market-mcp/src/x402.mjs b/market-mcp/src/x402.mjs
+++index c1b7769..f389983 100644
+++--- a/market-mcp/src/x402.mjs
++++++ b/market-mcp/src/x402.mjs
+++@@ -66,8 +66,8 @@ export function pickable(accepts, { allowMainnet = false } = {}) {
+++     .sort((a, b) => (CHAINS[a.n.network].mainnet - CHAINS[b.n.network].mainnet) || (a.price - b.price));
+++ }
+++ 
+++-async function first402(url, method) {
+++-  const res = await fetch(url, { method, headers: { accept: 'application/json', 'user-agent': UA }, signal: AbortSignal.timeout(15_000) });
++++async function first402(url, method, doFetch = globalThis.fetch) {
++++  const res = await doFetch(url, { method, headers: { accept: 'application/json', 'user-agent': UA }, signal: AbortSignal.timeout(15_000) });
+++   const text = await res.text();
+++   if (res.status !== 402) return { status: res.status, preview: text.slice(0, 300) };
+++   return { status: 402, ...extractRequirements(res.headers, text) };
+++@@ -91,9 +91,11 @@ export async function quote(url, { method = 'GET', allowMainnet = false } = {})
+++  * Pay for and fetch `url`. `limits.maxPrice` caps this call; `limits.reserve(price)` is called right before signing
+++  * and must throw to refuse (used for the session budget). Nothing is signed unless both pass.
+++  */
+++-export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowMainnet = false, timeoutSec = 120, reserve = () => {} } = {}) {
+++-  const q = await first402(url, method);
+++-  if (q.status !== 402) return { paid: false, status: q.status, note: 'Not an x402 endpoint (did not answer 402); nothing paid.', preview: q.preview };
++++export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowMainnet = false, timeoutSec = 120, reserve = () => {}, fetchImpl } = {}) {
++++  const doFetch = fetchImpl ?? globalThis.fetch;
++++  let disclosed = false; // becomes true once the signed authorization has left this process
++++  const q = await first402(url, method, doFetch);
++++  if (q.status !== 402) return { paid: false, disclosed, status: q.status, note: 'Not an x402 endpoint (did not answer 402); nothing paid.', preview: q.preview };
+++   const usable = pickable(q.accepts, { allowMainnet });
+++   if (!usable.length) throw new Error(`No supported payment option. Offered: ${JSON.stringify(q.accepts.map(a => a.network))}${allowMainnet ? '' : ' (mainnet disabled)'}`);
+++   const chosen = usable[0];
+++@@ -117,7 +119,10 @@ export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowM
+++   const header = b64(payment);
+++ 
+++   const t0 = Date.now();
+++-  const res = await fetch(url, {
++++  // The signed authorization now leaves this process. Mark it disclosed BEFORE the request, so a timeout or
++++  // exception cannot let the caller release budget for an authorization the seller may still settle.
++++  disclosed = true;
++++  const res = await doFetch(url, {
+++     method,
+++     headers: { accept: 'application/json', 'user-agent': UA, 'X-PAYMENT': header, 'PAYMENT-SIGNATURE': header },
+++     signal: AbortSignal.timeout(timeoutSec * 1000),
+++@@ -126,6 +131,7 @@ export async function buy(url, wallet, { method = 'GET', maxPrice = 0.10, allowM
+++   const settlement = unb64(res.headers.get('x-payment-response') ?? res.headers.get('payment-response') ?? '');
+++   return {
+++     paid: !!settlement?.success,
++++    disclosed,
+++     delivered: res.status === 200 && body.length > 0,
+++     status: res.status, latencyMs: Date.now() - t0,
+++     price: chosen.price, coin: chosen.coin, network: n.network, payTo: n.payTo, buyer: wallet.address,
+++diff --git a/market-mcp/test/budget.test.mjs b/market-mcp/test/budget.test.mjs
+++new file mode 100644
+++index 0000000..0102d70
+++--- /dev/null
++++++ b/market-mcp/test/budget.test.mjs
+++@@ -0,0 +1,91 @@
++++// budget.test.mjs — finding #2: a disclosed authorization must not be released on an untrusted seller response.
++++import { test } from 'node:test';
++++import assert from 'node:assert/strict';
++++import { Wallet } from 'ethers';
++++import { createBudget } from '../src/budget.mjs';
++++import { purchase } from '../src/purchase.mjs';
++++import { buy } from '../src/x402.mjs';
++++
++++const TOKEN = '0x03E25a5DC7aC15f32462652a4bF4986F378d5fcf';
++++const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
++++
++++// ---- createBudget unit rules ----
++++test('#2 budget: paid and disclosed both stay committed; only an undisclosed reservation is released', () => {
++++  const b = createBudget(1.0);
++++  const r1 = b.reserve(0.3); b.resolve(r1, { disclosed: true, paid: true });   // settled
++++  const r2 = b.reserve(0.3); b.resolve(r2, { disclosed: true, paid: false });  // disclosed, no receipt -> pending
++++  const r3 = b.reserve(0.3); b.resolve(r3, { disclosed: false, paid: false }); // never disclosed -> released
++++  assert.equal(+b.spent.toFixed(4), 0.6);
++++  assert.equal(+b.remaining().toFixed(4), 0.4);
++++});
++++
++++test('#2 budget: reserve refuses once the committed total would exceed the limit', () => {
++++  const b = createBudget(1.0);
++++  b.reserve(0.6);
++++  assert.throws(() => b.reserve(0.5), /budget exhausted/i);
++++  assert.equal(+b.spent.toFixed(4), 0.6);
++++});
++++
++++// ---- purchase() orchestration with a seller that takes the signature but returns no receipt ----
++++const noReceiptBuy = (price) => async (url, wallet, { reserve }) => { reserve(price); return { disclosed: true, paid: false, price, network: 'eip155:112172' }; };
++++
++++test('#2 repeated no-receipt purchases cannot authorize more than the session budget', async () => {
++++  const b = createBudget(1.0);
++++  const w = Wallet.createRandom();
++++  const once = () => purchase({ url: 'http://seller', wallet: w, budget: b, maxPrice: 0.4, buyImpl: noReceiptBuy(0.4) });
++++  const a = await once(); assert.equal(a.pending, true);
++++  const c = await once(); assert.equal(c.pending, true);
++++  // two 0.4 authorizations are already out there (0.8); a third would exceed 1.0 and must be refused
++++  await assert.rejects(once(), /budget exhausted/i);
++++  assert.equal(+b.spent.toFixed(4), 0.8, 'disclosed amounts stay committed; nothing was released on the missing receipt');
++++});
++++
++++test('#2 an exception after signature disclosure keeps the amount reserved', async () => {
++++  const b = createBudget(1.0);
++++  const w = Wallet.createRandom();
++++  const throwAfterDisclose = async (url, wallet, { reserve }) => { reserve(0.3); throw new Error('network blip after X-PAYMENT'); };
++++  await assert.rejects(purchase({ url: 'http://seller', wallet: w, budget: b, maxPrice: 0.4, buyImpl: throwAfterDisclose }), /network blip/);
++++  assert.equal(+b.spent.toFixed(4), 0.3, 'reservation stays committed when the call throws at/after disclosure');
++++});
++++
++++test('#2 a reservation that was never disclosed is released', async () => {
++++  const b = createBudget(1.0);
++++  const w = Wallet.createRandom();
++++  const undisclosed = async (url, wallet, { reserve }) => { reserve(0.3); return { disclosed: false, paid: false, price: 0.3 }; };
++++  const r = await purchase({ url: 'http://seller', wallet: w, budget: b, maxPrice: 0.4, buyImpl: undisclosed });
++++  assert.equal(r.pending, false);
++++  assert.equal(+b.spent.toFixed(4), 0);
++++});
++++
++++// ---- x402.buy() reports disclosure accurately ----
++++const resp = (status, text, headers = {}) => {
++++  const h = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
++++  return { status, async text() { return text; }, headers: { get: (k) => h.get(k.toLowerCase()) ?? null } };
++++};
++++const quote402 = JSON.stringify({ x402Version: 1, accepts: [{ scheme: 'exact', network: 'eip155:112172', maxAmountRequired: '20000', payTo: PAYEE, asset: TOKEN, maxTimeoutSeconds: 300, extra: { name: 'DFMI Dollar', version: '1' } }] });
++++const hasPayment = (init) => !!(init?.headers && (init.headers['X-PAYMENT'] || init.headers['x-payment']));
++++
++++test('#2 buy() marks the signature disclosed even when the seller returns no success receipt', async () => {
++++  const w = Wallet.createRandom();
++++  const fetchImpl = async (url, init) => hasPayment(init) ? resp(200, 'the goods') : resp(402, quote402);
++++  const r = await buy('http://seller', w, { fetchImpl, reserve: () => {} });
++++  assert.equal(r.disclosed, true, 'signature was sent to the seller');
++++  assert.equal(r.paid, false, 'no settlement receipt');
++++});
++++
++++test('#2 buy() does not mark disclosed when the endpoint never returns 402 (nothing signed)', async () => {
++++  const w = Wallet.createRandom();
++++  let reserved = false;
++++  const fetchImpl = async () => resp(200, 'not an x402 endpoint');
++++  const r = await buy('http://seller', w, { fetchImpl, reserve: () => { reserved = true; } });
++++  assert.equal(r.disclosed, false);
++++  assert.equal(reserved, false, 'nothing reserved because nothing was signed');
++++});
++++
++++test('#2 buy() throwing after disclosure still leaves the reservation committed via purchase()', async () => {
++++  const b = createBudget(1.0);
++++  const w = Wallet.createRandom();
++++  const fetchImpl = async (url, init) => { if (hasPayment(init)) throw new Error('timeout after X-PAYMENT'); return resp(402, quote402); };
++++  await assert.rejects(purchase({ url: 'http://seller', wallet: w, budget: b, maxPrice: 0.4, buyImpl: (u, wl, o) => buy(u, wl, { ...o, fetchImpl }) }), /timeout after X-PAYMENT/);
++++  assert.equal(+b.spent.toFixed(4), 0.02, 'the 0.02 authorization stays reserved after a post-disclosure timeout');
++++});
+++diff --git a/paykit/src/cli.mjs b/paykit/src/cli.mjs
+++index 1c60910..777008f 100644
+++--- a/paykit/src/cli.mjs
++++++ b/paykit/src/cli.mjs
+++@@ -3,7 +3,7 @@
+++  * cli.mjs — the same three operations from a shell, for testing without an MCP client.
+++  *
+++  *   node src/cli.mjs create <payee> <amount> [--due 2026-09-30] [--memo "..."] [--payer 0x...]
+++- *   node src/cli.mjs check  <invoice_id> [--tx 0x...]
++++ *   node src/cli.mjs check  <invoice_id> [--tx 0x...] [--reconcile]   (--reconcile: operator-only; accept a settlement whose creation-boundary is unknown — never exposed to remote callers)
+++  *   node src/cli.mjs remind <invoice_id> [--tone polite|firm|final] [--chat]
+++  *   node src/cli.mjs list   [--status open|paid|partial|overdue|unknown]
+++  */
+++@@ -19,7 +19,7 @@ const kit = new PayKit(loadConfig(process.env.PAYKIT_CONFIG));
+++ 
+++ try {
+++   if (cmd === 'create') out(await kit.createInvoice({ payee_address: rest[0], amount: rest[1], due_date: flag('--due'), memo: flag('--memo') ?? '', payer_hint: flag('--payer') }));
+++-  else if (cmd === 'check') out(await kit.checkPayment({ invoice_id: rest[0], tx_hash: flag('--tx') }));
++++  else if (cmd === 'check') out(await kit.checkPayment({ invoice_id: rest[0], tx_hash: flag('--tx'), reconcile: has('--reconcile') }));
+++   else if (cmd === 'remind') out(kit.draftReminder({ invoice_id: rest[0], tone: flag('--tone') ?? 'polite', channel_hint: has('--chat') ? 'chat' : 'email' }));
+++   else if (cmd === 'list') out(kit.store.list({ status: flag('--status') }));
+++   else { console.error('usage: cli.mjs create|check|remind|list ...'); process.exit(2); }
+++diff --git a/paykit/src/pay.mjs b/paykit/src/pay.mjs
+++index 6ee005b..2269e31 100644
+++--- a/paykit/src/pay.mjs
++++++ b/paykit/src/pay.mjs
+++@@ -104,15 +104,16 @@ if (!session) {
+++   paymentPayload = { x402Version: 1, scheme: 'exact', network: cfg.chain, payload: { signature, authorization } };
+++ } else {
+++   // ---- SessionKeyWallet: the session key signs a Pay intent; the wallet contract enforces cap / expiry / revocation on-chain
+++-  const sw = new Contract(wallet, ['function sessionNonce(address) view returns (uint256)'], provider);
+++-  const [nonce, bal] = await Promise.all([sw.sessionNonce(signer.address), erc20.balanceOf(wallet)]);
+++-  console.error(`wallet ${wallet} balance ${formatUnits(bal, cfg.decimals)} ${cfg.symbol} | session key ${signer.address} nonce ${nonce}`);
+++-  const authorization = { to: payTo, amount: units.toString(), nonce: nonce.toString(), deadline: String(now + 300) };
++++  const sw = new Contract(wallet, ['function sessionNonce(address) view returns (uint256)', 'function sessionGeneration(address) view returns (uint256)'], provider);
++++  const [nonce, generation, bal] = await Promise.all([sw.sessionNonce(signer.address), sw.sessionGeneration(signer.address), erc20.balanceOf(wallet)]);
++++  console.error(`wallet ${wallet} balance ${formatUnits(bal, cfg.decimals)} ${cfg.symbol} | session key ${signer.address} nonce ${nonce} gen ${generation}`);
++++  const authorization = { to: payTo, amount: units.toString(), nonce: nonce.toString(), generation: generation.toString(), deadline: String(now + 300) };
+++   const domain = { name: 'dfmi SessionKeyWallet', version: '1', chainId: cfg.chainId, verifyingContract: wallet };
++++  // Pay type must match the wallet contract exactly (generation included), or pay() reverts "bad session signature".
+++   const types = { Pay: [
+++-    { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
++++    { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'generation', type: 'uint256' }, { name: 'deadline', type: 'uint256' },
+++   ] };
+++-  const signature = await signer.signTypedData(domain, types, { to: payTo, amount: units, nonce, deadline: BigInt(authorization.deadline) });
++++  const signature = await signer.signTypedData(domain, types, { to: payTo, amount: units, nonce, generation, deadline: BigInt(authorization.deadline) });
+++   paymentPayload = { x402Version: 1, scheme: 'dfmi-session', network: cfg.chain, payload: { wallet, sessionKey: signer.address, signature, authorization } };
+++ }
+++ 
+++diff --git a/paykit/src/paykit.mjs b/paykit/src/paykit.mjs
+++index 845b891..5778980 100644
+++--- a/paykit/src/paykit.mjs
++++++ b/paykit/src/paykit.mjs
+++@@ -50,7 +50,7 @@ export class PayKit {
+++   }
+++ 
+++   // ---------------------------------------------------------------- check_payment
+++-  async checkPayment({ invoice_id, tx_hash = null }) {
++++  async checkPayment({ invoice_id, tx_hash = null, reconcile = false }) {
+++     const inv = this.store.get(invoice_id);
+++     if (!inv) throw new Error(`unknown invoice ${invoice_id}`);
+++     if (inv.status === 'paid') return this.#present(inv);
+++@@ -60,32 +60,33 @@ export class PayKit {
+++       if (tx_hash) {
+++         const v = await this.chain.verifyTx(tx_hash, inv.payee, inv.amount_units);
+++         if (v.found && v.success && v.confirmations >= this.cfg.confirmations) {
+++-          // A settlement must not predate the invoice, and each payment event settles at most one invoice.
+++-          if (inv.created_block != null && v.block < inv.created_block)
+++-            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction predates the invoice' }));
+++-          if (!this.store.claimTransfer(inv.id, tx_hash))
+++-            return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: 'transaction already settled another invoice' }));
++++          // Same creation-boundary rule as the scan path: a settlement must be at or after the invoice's
++++          // creation block; when that boundary is unknown, fail closed unless the caller explicitly reconciles.
++++          const att = this.#attributable(inv, v.block, reconcile);
++++          if (!att.ok) return this.#present(this.#mark(inv, inv.status, { tx_hash, reason: att.reason }));
++++          // #settle claims the tx and marks paid atomically; a conflict (already consumed) is reported by #settle.
+++           return this.#present(this.#settle(inv, { txHash: tx_hash, from: v.from, block: v.block, value: BigInt(v.paid_units) }, v.confirmations));
+++         }
+++         if (v.found && !v.success) return this.#present(this.#mark(inv, 'partial', { tx_hash, paid: v.paid_units, reason: v.reason ?? 'insufficient amount' }));
+++       }
+++ 
+++       // Path B: scan transfers into the payee since the invoice was created and match the exact amount.
++++      // When the creation block is unknown we cannot attribute a scanned transfer to this invoice: fail closed
++++      // (a caller may pass reconcile to scan from genesis and accept the attribution explicitly).
++++      if (inv.created_block == null && !reconcile)
++++        return this.#present(this.#mark(inv, inv.status, { reason: 'invoice creation block unknown; manual reconciliation required (reconcile)' }));
+++       const head = await this.chain.blockNumber();
+++-      const from = inv.created_block ?? 0;
+++-      const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, from - 5), head);
++++      const floor = inv.created_block ?? 0;
++++      const transfers = await this.chain.transfersTo(inv.payee, Math.max(0, floor), head);
+++       const want = BigInt(inv.amount_units);
+++       // The exact amount is the matching key; payer_hint only breaks ties (it is a hint, not a filter).
+++-      // Skip any transfer already consumed by another invoice so one payment can never settle two invoices.
+++-      const exact = transfers.filter(t => t.value === want && !this.store.txConsumedBy(t.txHash));
++++      // A settling transfer must be at or after the invoice's creation block (no pre-invoice payment counts)
++++      // and must not already be consumed by another invoice (one payment settles at most one invoice).
++++      const exact = transfers.filter(t => t.value === want && t.block >= floor && !this.store.txConsumedBy(t.txHash));
+++       const hit = (inv.payer_hint && exact.find(t => t.from.toLowerCase() === inv.payer_hint.toLowerCase())) || exact[0];
+++       if (hit) {
+++         const conf = head - hit.block + 1;
+++-        if (conf >= this.cfg.confirmations) {
+++-          if (!this.store.claimTransfer(inv.id, hit.txHash, hit.logIndex))
+++-            return this.#present(this.#mark(inv, inv.status, { pending_tx: hit.txHash, reason: 'matching transfer already settled another invoice' }));
+++-          return this.#present(this.#settle(inv, hit, conf));
+++-        }
++++        if (conf >= this.cfg.confirmations) return this.#present(this.#settle(inv, hit, conf));
+++         return this.#present(this.#mark(inv, 'open', { pending_tx: hit.txHash, confirmations: conf, needs: this.cfg.confirmations }));
+++       }
+++       // A smaller transfer from the hinted payer counts as partial (informational; the invoice stays unsettled).
+++@@ -148,14 +149,22 @@ export class PayKit {
+++   }
+++ 
+++   // ---------------------------------------------------------------- helpers
++++  // A settling transfer at `block` is attributable to this invoice only if it is at or after the invoice's
++++  // creation block. When created_block is unknown, fail closed unless the caller explicitly reconciles.
++++  #attributable(inv, block, reconcile) {
++++    if (inv.created_block == null) return reconcile ? { ok: true } : { ok: false, reason: 'invoice creation block unknown; manual reconciliation required (reconcile)' };
++++    if (block < inv.created_block) return { ok: false, reason: 'transaction predates the invoice' };
++++    return { ok: true };
++++  }
+++   #settle(inv, t, confirmations) {
+++-    inv.status = 'paid';
+++-    inv.settlement = { tx_hash: t.txHash, payer_address: t.from, block: t.block, confirmations, paid_units: t.value.toString(),
+++-                       paid_amount: formatUnits(t.value, this.cfg.decimals), settled_at: new Date().toISOString() };
+++-    inv.last_check = null;
+++-    return this.store.put(inv);
++++    const settlement = { tx_hash: t.txHash, payer_address: t.from, block: t.block, confirmations, paid_units: t.value.toString(),
++++                         paid_amount: formatUnits(t.value, this.cfg.decimals), settled_at: new Date().toISOString() };
++++    // Atomic claim + settle: consume-once and "paid" land in a single locked write (no half-state).
++++    const res = this.store.settle(inv.id, { txHash: t.txHash, logIndex: t.logIndex }, settlement);
++++    if (!res.ok) return this.#mark(inv, inv.status, { tx_hash: t.txHash, reason: res.reason });
++++    return res.invoice;
+++   }
+++-  #mark(inv, status, detail) { inv.status = status; inv.last_check = { at: new Date().toISOString(), ...detail }; return this.store.put(inv); }
++++  #mark(inv, status, detail) { return this.store.mark(inv.id, status, detail) ?? inv; }
+++   #present(inv) {
+++     return {
+++       invoice_id: inv.id, status: inv.status,
+++diff --git a/paykit/src/server.mjs b/paykit/src/server.mjs
+++index c525113..033e60c 100644
+++--- a/paykit/src/server.mjs
++++++ b/paykit/src/server.mjs
+++@@ -44,7 +44,9 @@ server.registerTool('check_payment', {
+++     invoice_id: z.string().describe('Invoice id from create_invoice'),
+++     tx_hash: z.string().optional().describe('Optional settlement transaction hash (e.g. from an x402 PAYMENT-RESPONSE receipt) to verify directly'),
+++   },
+++-}, async (a) => { try { return json(await kit.checkPayment(a)); } catch (e) { return fail(e); } });
++++  // Only invoice_id and tx_hash are forwarded: `reconcile` is an operator-only escape hatch (local CLI) and must
++++  // never be settable by a remote MCP caller, or it would bypass the invoice creation-boundary check.
++++}, async (a) => { try { return json(await kit.checkPayment({ invoice_id: a.invoice_id, tx_hash: a.tx_hash })); } catch (e) { return fail(e); } });
+++ 
+++ server.registerTool('send_reminder', {
+++   title: 'Draft payment reminder',
+++diff --git a/paykit/src/store.mjs b/paykit/src/store.mjs
+++index 42d8a88..c7f695f 100644
+++--- a/paykit/src/store.mjs
++++++ b/paykit/src/store.mjs
+++@@ -6,69 +6,165 @@
+++  *     due_date, memo, created_at, created_block, status, settlement, reminders: [] }
+++  *
+++  * status: "open" | "paid" | "partial" | "overdue" | "unknown"
++++ *
++++ * Safety (finding #4):
++++ *   - Single-writer across processes: every operation takes an exclusive lock (atomic mkdir, with stale recovery),
++++ *     reloads the file fresh, applies its change, and writes atomically (tmp + rename). No cached `this.data`, so
++++ *     two processes sharing the file never overwrite each other with stale state.
++++ *   - Consume-once + settlement are ONE write (settle()): there is no window where a transfer is claimed but the
++++ *     invoice is not yet marked paid, or vice versa.
++++ *   - A corrupt store is preserved and surfaced, never silently discarded as empty.
+++  */
+++-import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
++++import { readFileSync, writeFileSync, existsSync, renameSync, statSync, copyFileSync, openSync, writeSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
+++ import { randomBytes } from 'node:crypto';
+++ 
++++const LOCK_TTL_MS = 60_000; // backstop only: a lock whose owner PID is gone, or older than this, may be reclaimed
++++const LOCK_WAIT_MS = 5_000; // give up acquiring after this
++++
++++function sleep(ms) { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { const u = Date.now() + ms; while (Date.now() < u); } }
++++
++++function pidAlive(pid) { if (!(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
++++
++++/**
++++ * May a held lock be reclaimed? Only when its owner process is gone (liveness check via signal 0), or — as a
++++ * backstop against PID reuse — when it is older than the TTL. A live owner within the TTL is NEVER reclaimable,
++++ * so a process that pauses (GC, swap, SIGSTOP) while holding a valid lock keeps it. Exported for test.
++++ * Same-host only: process liveness is not meaningful across NFS, so this store must not be shared over NFS.
++++ */
++++export function lockReclaimable(content, mtimeMs, now = Date.now(), ttl = LOCK_TTL_MS) {
++++  if (!content || !String(content).trim()) return false; // created but owner not yet written: do not steal
++++  const pid = Number(String(content).split(':')[0]);
++++  if (!pidAlive(pid)) return true;        // owner process is gone -> safe to reclaim
++++  return (now - mtimeMs) > ttl;           // live owner: only the PID-reuse backstop can reclaim
++++}
++++
+++ export class InvoiceStore {
+++   constructor(path) {
+++     this.path = path;
+++-    this.data = this.#read();
+++-    this.data.invoices ??= {};
+++-    this.data.consumed ??= {}; // transferKey -> invoice_id: a payment event can settle at most one invoice
+++-    // Backfill the consumed index from invoices already settled before this guard existed,
+++-    // so an old payment cannot be replayed onto a new invoice right after upgrade.
+++-    let dirty = false;
+++-    for (const inv of Object.values(this.data.invoices)) {
+++-      const h = inv.settlement?.tx_hash;
+++-      if (inv.status === 'paid' && h && !this.txConsumedBy(h)) { this.data.consumed[String(h).toLowerCase()] = inv.id; dirty = true; }
+++-    }
+++-    if (dirty) this.#write();
++++    this.lockFile = path + '.lock';
++++    this._lockToken = null;
++++    // One-time backfill of the consumed index from invoices settled before this guard existed — under the lock,
++++    // so two processes starting at once do not both write.
++++    this.#withLock(() => {
++++      const d = this.#readOrThrow();
++++      let dirty = false;
++++      for (const inv of Object.values(d.invoices)) {
++++        const h = inv.settlement?.tx_hash;
++++        if (inv.status === 'paid' && h && !this.#consumedBy(d, h)) { d.consumed[String(h).toLowerCase()] = inv.id; dirty = true; }
++++      }
++++      if (dirty) this.#write(d);
++++    });
+++   }
+++ 
+++-  #read() {
++++  // ---------------------------------------------------------------- disk I/O
++++  #readOrThrow() {
+++     if (!existsSync(this.path)) return { invoices: {}, consumed: {} };
+++-    try { return JSON.parse(readFileSync(this.path, 'utf8')); } catch { return { invoices: {}, consumed: {} }; }
++++    let raw;
++++    try { raw = readFileSync(this.path, 'utf8'); } catch (e) { throw new Error(`cannot read store ${this.path}: ${e.message}`); }
++++    if (raw.trim() === '') return { invoices: {}, consumed: {} };
++++    let d;
++++    try { d = JSON.parse(raw); }
++++    catch (e) {
++++      // Never silently discard payment history: preserve the corrupt file and refuse rather than start empty.
++++      const bak = `${this.path}.corrupt-${Date.now()}`;
++++      try { copyFileSync(this.path, bak); } catch { /* best effort */ }
++++      throw new Error(`store ${this.path} is corrupt (backed up to ${bak}); refusing to start empty: ${e.message}`);
++++    }
++++    d.invoices ??= {};
++++    d.consumed ??= {};
++++    return d;
++++  }
++++  #write(d) {
++++    const tmp = `${this.path}.tmp.${process.pid}`;
++++    const fd = openSync(tmp, 'w');
++++    try { writeSync(fd, JSON.stringify(d, null, 2)); fsyncSync(fd); } finally { closeSync(fd); } // flush before rename
++++    renameSync(tmp, this.path); // atomic replace of the visible file on the same filesystem
++++  }
++++
++++  // ---------------------------------------------------------------- cross-process lock
++++  // Exclusive lockfile holding "pid:token". Acquire is atomic (O_EXCL). A held lock is reclaimed only when its
++++  // owner process is gone (or past the TTL backstop) — never while the owner is alive. Release removes the
++++  // lockfile only when its token is ours, so one process can never delete another's lock.
++++  #acquire() {
++++    const mine = `${process.pid}:${randomBytes(8).toString('hex')}`;
++++    const deadline = Date.now() + LOCK_WAIT_MS;
++++    for (;;) {
++++      try { const fd = openSync(this.lockFile, 'wx'); try { writeSync(fd, mine); fsyncSync(fd); } finally { closeSync(fd); } this._lockToken = mine; return; }
++++      catch (e) {
++++        if (e.code !== 'EEXIST') throw e;
++++        let content, st;
++++        try { content = readFileSync(this.lockFile, 'utf8'); st = statSync(this.lockFile); } catch { continue; } // vanished: re-race
++++        if (lockReclaimable(content, st.mtimeMs)) { try { unlinkSync(this.lockFile); } catch { /* raced */ } continue; }
++++        if (Date.now() > deadline) throw new Error(`timed out acquiring store lock ${this.lockFile} (held by pid ${String(content).split(':')[0]})`);
++++        sleep(15);
++++      }
++++    }
+++   }
+++-  #write() {
+++-    const tmp = this.path + '.tmp';
+++-    writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+++-    renameSync(tmp, this.path);
++++  #release() {
++++    try { if (readFileSync(this.lockFile, 'utf8') === this._lockToken) unlinkSync(this.lockFile); } catch { /* already gone */ }
++++    this._lockToken = null;
++++  }
++++  #withLock(fn) { this.#acquire(); try { return fn(); } finally { this.#release(); } }
++++
++++  // ---------------------------------------------------------------- helpers over a snapshot
++++  #consumedBy(d, txHash) {
++++    const h = String(txHash).toLowerCase();
++++    for (const [key, invId] of Object.entries(d.consumed)) if (key === h || key.startsWith(h + ':')) return invId;
++++    return null;
+++   }
+++ 
+++   newId() { return 'inv_' + randomBytes(6).toString('hex'); }
+++ 
++++  // ---------------------------------------------------------------- reads (fresh each call)
++++  get(id) { return this.#withLock(() => this.#readOrThrow().invoices[id] ?? null); }
++++  list(filter = {}) {
++++    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).filter(i =>
++++      (!filter.status || i.status === filter.status) && (!filter.payee || i.payee.toLowerCase() === filter.payee.toLowerCase())));
++++  }
+++   /** exact_amount uniqueness is per payee: two open invoices to the same address must not share an amount. */
+++   hasOpenExactAmount(payee, amountUnits) {
+++-    return Object.values(this.data.invoices).some(i =>
+++-      i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits));
++++    return this.#withLock(() => Object.values(this.#readOrThrow().invoices).some(i =>
++++      i.payee.toLowerCase() === payee.toLowerCase() && i.status !== 'paid' && i.amount_units === String(amountUnits)));
+++   }
++++  /** Which invoice (if any) has already settled from this transaction. */
++++  txConsumedBy(txHash) { return this.#withLock(() => this.#consumedBy(this.#readOrThrow(), txHash)); }
+++ 
+++-  /** Which invoice (if any) has already settled from this transaction. One payment event settles one invoice. */
+++-  txConsumedBy(txHash) {
+++-    const h = String(txHash).toLowerCase();
+++-    const c = this.data.consumed ?? {};
+++-    for (const [key, invId] of Object.entries(c)) {
+++-      if (key === h || key.startsWith(h + ':')) return invId;
+++-    }
+++-    return null;
+++-  }
++++  // ---------------------------------------------------------------- writes
++++  put(inv) { return this.#withLock(() => { const d = this.#readOrThrow(); d.invoices[inv.id] = inv; this.#write(d); return inv; }); }
+++ 
+++-  /** Atomically claim a payment event (txHash, optional logIndex) for an invoice. False if another invoice already owns this tx. */
+++-  claimTransfer(invoiceId, txHash, logIndex = null) {
+++-    const h = String(txHash).toLowerCase();
+++-    const owner = this.txConsumedBy(h);
+++-    if (owner && owner !== invoiceId) return false;
+++-    (this.data.consumed ??= {})[logIndex == null ? h : `${h}:${logIndex}`] = invoiceId;
+++-    this.#write();
+++-    return true;
++++  /**
++++   * Atomically settle an invoice from one payment event: claim the transfer (consume-once) AND mark the invoice
++++   * paid in a single locked read-modify-write. Returns { ok, invoice, reason, already }.
++++   * No half-state: either both the claim and the settlement are persisted, or neither is.
++++   */
++++  settle(invoiceId, { txHash, logIndex = null }, settlement) {
++++    return this.#withLock(() => {
++++      const d = this.#readOrThrow();
++++      const inv = d.invoices[invoiceId];
++++      if (!inv) return { ok: false, reason: 'unknown invoice' };
++++      if (inv.status === 'paid') return { ok: true, invoice: inv, already: true };
++++      const owner = this.#consumedBy(d, txHash);
++++      if (owner && owner !== invoiceId) return { ok: false, reason: 'transaction already settled another invoice' };
++++      const key = logIndex == null ? String(txHash).toLowerCase() : `${String(txHash).toLowerCase()}:${logIndex}`;
++++      d.consumed[key] = invoiceId;
++++      inv.status = 'paid';
++++      inv.settlement = settlement;
++++      inv.last_check = null;
++++      this.#write(d); // single write: claim + settlement land together
++++      return { ok: true, invoice: inv };
++++    });
+++   }
+++ 
+++-  put(inv) { this.data.invoices[inv.id] = inv; this.#write(); return inv; }
+++-  get(id) { return this.data.invoices[id] ?? null; }
+++-  list(filter = {}) {
+++-    return Object.values(this.data.invoices).filter(i =>
+++-      (!filter.status || i.status === filter.status) &&
+++-      (!filter.payee || i.payee.toLowerCase() === filter.payee.toLowerCase()));
++++  /** Mark a non-settling status (open/partial/overdue/unknown) with a last_check detail. */
++++  mark(invoiceId, status, detail) {
++++    return this.#withLock(() => {
++++      const d = this.#readOrThrow();
++++      const inv = d.invoices[invoiceId];
++++      if (!inv) return null;
++++      inv.status = status;
++++      inv.last_check = { at: new Date().toISOString(), ...detail };
++++      this.#write(d);
++++      return inv;
++++    });
+++   }
+++ }
+++diff --git a/paykit/test/paykit.test.mjs b/paykit/test/paykit.test.mjs
+++index e9e0fbb..b0c40ae 100644
+++--- a/paykit/test/paykit.test.mjs
++++++ b/paykit/test/paykit.test.mjs
+++@@ -116,3 +116,48 @@ test('check_payment: one payment cannot settle two invoices (consume-once)', asy
+++   assert.notEqual(rb.status, 'paid');
+++   assert.match(rb.last_check.reason, /already settled/);
+++ });
++++
++++// ---- finding #3: invoice attribution / creation boundary ----
++++
++++test('#3 a transfer before the invoice was created is not attributed (scan path)', async () => {
++++  const prov = fakeProvider([]);                                  // head 100 at creation
++++  const kit = new PayKit(cfg, { provider: prov });
++++  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
++++  // a matching-amount transfer that happened at block 99, i.e. before this invoice existed
++++  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 99 }], 105));
++++  const r = await kit.checkPayment({ invoice_id: inv.invoice_id });
++++  assert.notEqual(r.status, 'paid', 'a pre-invoice payment must not settle it');
++++});
++++
++++test('#3 a transfer in the invoice creation block settles (same-block allowed)', async () => {
++++  const prov = fakeProvider([]);
++++  const kit = new PayKit(cfg, { provider: prov });
++++  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
++++  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 100 }], 105));
++++  const r = await kit.checkPayment({ invoice_id: inv.invoice_id });
++++  assert.equal(r.status, 'paid');
++++});
++++
++++test('#3 a direct tx_hash that predates the invoice is rejected (Path A)', async () => {
++++  const prov = fakeProvider([]);
++++  const kit = new PayKit(cfg, { provider: prov });
++++  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' }); // created_block = 100
++++  const tx = '0x' + '3c'.repeat(32);
++++  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 90, tx }], 105));
++++  const r = await kit.checkPayment({ invoice_id: inv.invoice_id, tx_hash: tx });
++++  assert.notEqual(r.status, 'paid');
++++  assert.match(r.last_check.reason, /predates/);
++++});
++++
++++test('#3 unknown creation block fails closed; reconcile settles explicitly', async () => {
++++  const prov = fakeProvider([]);
++++  const kit = new PayKit(cfg, { provider: prov });
++++  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00' });
++++  const stored = kit.store.get(inv.invoice_id); stored.created_block = null; kit.store.put(stored); // chain was unreachable at creation
++++  Object.assign(prov, fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 50 }], 105));
++++  const closed = await kit.checkPayment({ invoice_id: inv.invoice_id });
++++  assert.notEqual(closed.status, 'paid');
++++  assert.match(closed.last_check.reason, /reconciliation/);
++++  const open = await kit.checkPayment({ invoice_id: inv.invoice_id, reconcile: true });
++++  assert.equal(open.status, 'paid');
++++});
+++diff --git a/paykit/test/store.test.mjs b/paykit/test/store.test.mjs
+++new file mode 100644
+++index 0000000..f620c1d
+++--- /dev/null
++++++ b/paykit/test/store.test.mjs
+++@@ -0,0 +1,120 @@
++++// store.test.mjs — finding #4: atomic claim+settle, cross-process safety, no silent discard of history.
++++import { test } from 'node:test';
++++import assert from 'node:assert/strict';
++++import { mkdtempSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
++++import { tmpdir } from 'node:os';
++++import { join, dirname } from 'node:path';
++++import { spawn } from 'node:child_process';
++++import { InvoiceStore, lockReclaimable } from '../src/store.mjs';
++++
++++const PAYEE = '0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c';
++++const freshStore = () => join(mkdtempSync(join(tmpdir(), 'paykit4-')), 'invoices.json');
++++const STORE_MJS = new URL('../src/store.mjs', import.meta.url).pathname;
++++
++++test('#4 a corrupt store is preserved and surfaced, never silently discarded', () => {
++++  const p = freshStore();
++++  writeFileSync(p, '{ this is not valid json');
++++  assert.throws(() => new InvoiceStore(p), /corrupt/, 'must refuse rather than start empty');
++++  const backups = readdirSync(dirname(p)).filter(f => f.includes('.corrupt-'));
++++  assert.equal(backups.length, 1, 'the corrupt file is backed up');
++++  assert.equal(readFileSync(p, 'utf8'), '{ this is not valid json', 'the original is left intact, not overwritten');
++++});
++++
++++test('#4 settle claims the tx and marks paid in one write; survives restart; rejects a second invoice', () => {
++++  const p = freshStore();
++++  const s = new InvoiceStore(p);
++++  s.put({ id: 'inv_a', payee: PAYEE, status: 'open', amount_units: '100' });
++++  s.put({ id: 'inv_b', payee: PAYEE, status: 'open', amount_units: '100' });
++++
++++  const r1 = s.settle('inv_a', { txHash: '0xTX' }, { tx_hash: '0xTX', block: 10 });
++++  assert.equal(r1.ok, true);
++++
++++  // one write: the persisted file has BOTH the consume record and the paid status (no half-state)
++++  const raw = JSON.parse(readFileSync(p, 'utf8'));
++++  assert.equal(raw.consumed['0xtx'], 'inv_a');
++++  assert.equal(raw.invoices.inv_a.status, 'paid');
++++
++++  // restart: a fresh store instance reads the committed settlement and claim
++++  const s2 = new InvoiceStore(p);
++++  assert.equal(s2.get('inv_a').status, 'paid');
++++  assert.equal(s2.txConsumedBy('0xTX'), 'inv_a');
++++
++++  // the same tx cannot settle a different invoice
++++  const r2 = s2.settle('inv_b', { txHash: '0xTX' }, { tx_hash: '0xTX', block: 11 });
++++  assert.equal(r2.ok, false);
++++  assert.match(r2.reason, /already settled/);
++++  assert.equal(s2.get('inv_b').status, 'open', 'the loser is untouched');
++++
++++  // re-settling the same invoice from the same tx is idempotent
++++  const r3 = s2.settle('inv_a', { txHash: '0xTX' }, { tx_hash: '0xTX', block: 10 });
++++  assert.equal(r3.ok, true);
++++  assert.equal(r3.already, true);
++++});
++++
++++// a worker process that writes one invoice through the locked store
++++function putWorker(p, id) {
++++  const code = `import { InvoiceStore } from ${JSON.stringify(STORE_MJS)};` +
++++    `new InvoiceStore(process.env.WP).put({ id: process.env.WID, payee: ${JSON.stringify(PAYEE)}, status: 'open', amount_units: '1' });`;
++++  return new Promise((res, rej) => {
++++    const c = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, WP: p, WID: id }, stdio: 'inherit' });
++++    c.on('exit', (code) => code === 0 ? res() : rej(new Error(`worker ${id} exited ${code}`)));
++++    c.on('error', rej);
++++  });
++++}
++++
++++test('#4 concurrent writers in separate processes do not lose updates', async () => {
++++  const p = freshStore();
++++  const N = 8;
++++  await Promise.all(Array.from({ length: N }, (_, i) => putWorker(p, `inv_w${i}`)));
++++  const ids = new InvoiceStore(p).list().map(i => i.id).sort();
++++  assert.equal(ids.length, N, 'every concurrent write survived (no last-writer-wins clobber)');
++++  for (let i = 0; i < N; i++) assert.ok(ids.includes(`inv_w${i}`), `inv_w${i} present`);
++++});
++++
++++// two worker processes race to settle their own invoice from the SAME transaction
++++function settleWorker(p, id, tx) {
++++  const code = `import { InvoiceStore } from ${JSON.stringify(STORE_MJS)};` +
++++    `const s = new InvoiceStore(process.env.WP);` +
++++    `const r = s.settle(process.env.WID, { txHash: process.env.WTX }, { tx_hash: process.env.WTX, block: 1 });` +
++++    `process.exit(r.ok && !r.already ? 0 : 3);`; // 0 = this process won the claim
++++  return new Promise((res) => {
++++    const c = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, WP: p, WID: id, WTX: tx }, stdio: 'inherit' });
++++    c.on('exit', (code) => res(code === 0));
++++  });
++++}
++++
++++test('#4 a live owner keeps its lock; only a dead owner (or the TTL backstop) is reclaimable', async () => {
++++  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now()), false, 'a live owner with a fresh lock is never stolen');
++++  assert.equal(lockReclaimable('', Date.now()), false, 'a just-created lock (owner not yet written) is not stolen');
++++  assert.equal(lockReclaimable(`${process.pid}:tok`, Date.now() - 61_000), true, 'TTL backstop reclaims a very old lock (PID reuse)');
++++  const deadPid = await new Promise(res => { const c = spawn(process.execPath, ['-e', '0']); c.on('exit', () => res(c.pid)); });
++++  assert.equal(lockReclaimable(`${deadPid}:tok`, Date.now()), true, 'a dead owner is reclaimable immediately');
++++});
++++
++++test('#4 recovers from a claim-without-settlement orphan: the invoice completes, others stay blocked', () => {
++++  const p = freshStore();
++++  // simulate a pre-atomic crash state: tx claimed for inv_a, but inv_a was never marked paid
++++  writeFileSync(p, JSON.stringify({
++++    invoices: { inv_a: { id: 'inv_a', payee: PAYEE, status: 'open', amount_units: '100' }, inv_b: { id: 'inv_b', payee: PAYEE, status: 'open', amount_units: '100' } },
++++    consumed: { '0xorphan': 'inv_a' },
++++  }));
++++  const s = new InvoiceStore(p);
++++  const bad = s.settle('inv_b', { txHash: '0xorphan' }, { tx_hash: '0xorphan', block: 5 });
++++  assert.equal(bad.ok, false, 'another invoice cannot take the orphaned tx');
++++  const good = s.settle('inv_a', { txHash: '0xorphan' }, { tx_hash: '0xorphan', block: 5 });
++++  assert.equal(good.ok, true, 'the rightful invoice completes its settlement');
++++  assert.equal(new InvoiceStore(p).get('inv_a').status, 'paid');
++++});
++++
++++test('#4 concurrent claims of one tx from two processes: exactly one wins', async () => {
++++  const p = freshStore();
++++  const s = new InvoiceStore(p);
++++  s.put({ id: 'inv_x', payee: PAYEE, status: 'open', amount_units: '100' });
++++  s.put({ id: 'inv_y', payee: PAYEE, status: 'open', amount_units: '100' });
++++  const wins = await Promise.all([settleWorker(p, 'inv_x', '0xRACE'), settleWorker(p, 'inv_y', '0xRACE')]);
++++  assert.equal(wins.filter(Boolean).length, 1, 'exactly one process claimed the tx');
++++  const s2 = new InvoiceStore(p);
++++  assert.equal(s2.txConsumedBy('0xRACE') !== null, true, 'the tx is consumed by the winner');
++++  const paid = ['inv_x', 'inv_y'].filter(id => s2.get(id).status === 'paid');
++++  assert.equal(paid.length, 1, 'only the winning invoice is paid');
++++});
+++diff --git a/wangvc-seller/register.mjs b/wangvc-seller/register.mjs
+++index 5794188..e67f754 100644
+++--- a/wangvc-seller/register.mjs
++++++ b/wangvc-seller/register.mjs
+++@@ -2,12 +2,12 @@
+++ /**
+++  * register.mjs — list the seller on dfmi by giving its payout address a public category.
+++  *
+++- * Calls ServiceRegistry.register(payTo, category, label). First-come and immutable:
+++- * if the address already has a category, this prints it and exits (nothing to undo).
+++- * Registration is permissionless — any funded key may register any address; gas is ~free
+++- * on this chain — so REGISTRANT_KEY just needs a little native coin, not special rights.
++++ * Calls ServiceRegistry.register(payTo, category, label). ServiceRegistry now requires proof of control
++++ * (msg.sender == payTo), so REGISTRANT_KEY MUST be the seller address's own key — you can only categorize
++++ * your own payout address, not someone else's. A controller may re-run this to correct its category (no
++++ * longer first-come-immutable). REGISTRANT_KEY needs a little native coin for gas.
+++  *
+++- *   SELLER_ADDRESS=0x… REGISTRANT_KEY=0x… node register.mjs
++++ *   SELLER_ADDRESS=0x… REGISTRANT_KEY=0x<key for SELLER_ADDRESS> node register.mjs
+++  *   Optional: SERVICE_CATEGORY (default 1 = market-data), SERVICE_LABEL (default wangvc-signals),
+++  *             SERVICE_REGISTRY, RPC, INSECURE_TLS=1
+++  *
+++@@ -32,14 +32,19 @@ const reg = new Contract(REGISTRY, ABI, provider);
+++ 
+++ const cur = Number(await reg.categoryOf(SELLER));
+++ if (cur !== 0) {
+++-  console.log(`✓ already registered: ${SELLER} → category ${cur} (first-come, immutable). Nothing to do.`);
++++  console.log(`✓ already registered: ${SELLER} → category ${cur}. Re-run with REGISTRANT_KEY = this address's key to change it.`);
+++   process.exit(0);
+++ }
+++ if (!KEY) {
+++-  console.error('Not registered yet. Set REGISTRANT_KEY (any key with a little native coin; register is permissionless).');
++++  console.error('Not registered yet. Set REGISTRANT_KEY = the private key of SELLER_ADDRESS (the registry requires msg.sender == payTo).');
+++   process.exit(1);
+++ }
+++ const wallet = new Wallet(KEY, provider);
++++// Proof of control: the registry will revert unless the sender is the address being categorized. Fail early with a clear message.
++++if (wallet.address.toLowerCase() !== SELLER.toLowerCase()) {
++++  console.error(`REGISTRANT_KEY (${wallet.address}) must be the key for SELLER_ADDRESS (${SELLER}); the registry only lets an address categorize itself.`);
++++  process.exit(1);
++++}
+++ console.log(`registering ${SELLER} → category ${CATEGORY} "${LABEL}" via ${wallet.address} …`);
+++ const tx = await reg.connect(wallet).register(SELLER, CATEGORY, LABEL, { type: 0, gasPrice: 1_000_000_000n, gasLimit: 120_000 });
+++ const r = await tx.wait();
 +diff --git a/wangvc-seller/register.mjs b/wangvc-seller/register.mjs
 +index 5794188..e67f754 100644
 +--- a/wangvc-seller/register.mjs
