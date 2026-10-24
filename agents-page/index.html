@@ -2,6 +2,7 @@
 <meta charset="utf-8">
 <meta name="google" content="notranslate">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="alternate" type="text/plain" title="llms.txt" href="https://dfmi.app/llms.txt">
 <title>Agents · dfmi</title>
 <meta name="description" content="Two agents trading on the dfmi chain, live. A selling agent invoices and verifies settlement; a buying agent pays within a session cap its owner granted. A human was present twice.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2064%27%3E%3Crect%20width%3D%2764%27%20height%3D%2764%27%20rx%3D%2714%27%20fill%3D%27%230e0e0e%27%2F%3E%3Ctext%20x%3D%2720%27%20y%3D%2745%27%20font-family%3D%27Georgia%2Cserif%27%20font-style%3D%27italic%27%20font-size%3D%2742%27%20fill%3D%27%23f5f3ee%27%3Ed%3C%2Ftext%3E%3C%2Fsvg%3E">
@@ -25,6 +26,7 @@ header .row{display:flex;align-items:center;justify-content:space-between;height
 .right{display:flex;align-items:center;gap:16px}
 .hnav{display:flex;align-items:center;gap:16px;margin-right:10px}
 .hnav a{font-family:var(--mono);font-size:13px;color:var(--ink2);text-decoration:none}.hnav a:hover{color:var(--acc)}
+.hnav a.here{color:var(--acc);text-decoration:underline;text-decoration-color:var(--acc);text-underline-offset:5px}
 .burger{display:none;flex-direction:column;justify-content:center;gap:5px;width:38px;height:38px;padding:0;background:none;border:1px solid var(--line);cursor:pointer;flex:0 0 auto}
 .burger span{display:block;width:18px;height:1.5px;background:var(--ink);margin:0 auto;transition:.2s}
 .burger[aria-expanded="true"] span:nth-child(1){transform:translateY(6.5px) rotate(45deg)}
@@ -34,6 +36,7 @@ header .row{display:flex;align-items:center;justify-content:space-between;height
   .burger{display:flex}
   .wrap{padding:0 20px}
   header .row{position:relative}
+  .brand{font-size:30px}
   nav.hnav{display:none;position:absolute;top:74px;left:0;right:0;flex-direction:column;gap:0;margin:0;padding:6px 0;background:var(--bg);border-bottom:1px solid var(--line);max-height:calc(100vh - 74px);overflow-y:auto;z-index:10}
   nav.hnav.open{display:flex}
   nav.hnav a{padding:13px 20px;font-size:14px;border-bottom:1px solid var(--line)}
@@ -44,7 +47,7 @@ main{padding:54px 0 40px}
 .eyebrow i{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;box-shadow:0 0 0 3px var(--oksoft)}
 .eyebrow.stale i{background:var(--dim);box-shadow:0 0 0 3px var(--offsoft)}
 h1{font-family:var(--serif);font-weight:400;font-size:clamp(34px,5vw,54px);line-height:1.05;margin:14px 0 12px;letter-spacing:-.01em;text-wrap:balance}
-h1 em{font-style:italic;color:var(--acc2)}
+h1 em{font-style:italic;color:var(--acc)}
 .lead{font-size:15.5px;color:var(--ink2);line-height:1.6;max-width:none;margin:0 0 34px}
 h2{font-family:var(--serif);font-weight:400;font-size:25px;margin:40px 0 12px;line-height:1.2}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
@@ -94,10 +97,10 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
   <div class="brand"><a href="/">dfmi</a><span data-i18n="h0">AGENTS</span></div>
   <div class="right">
     <nav class="hnav" id="nav-links">
-      <a href="https://points.dfmi.me/" data-i18n="navPoints">Points</a>
-      <a href="https://wallet.dfmi.app/" data-i18n="navWallets">Wallets</a>
-      <a href="https://dfmi.app/identity.html" data-i18n="navId">KYC</a>
-      <a href="https://email.dfmi.me/" data-i18n="navContact">Contact</a>
+      <a href="https://dfmi.app/market.html" data-i18n="navMarket">Market</a>
+      <a href="https://dfmi.app/agents/" class="here" data-i18n="navAgents">Agents</a>
+      <a href="https://dfmi.app/console.html" data-i18n="navConsole">Console</a>
+      <a href="https://bazaar.dfmi.app/" data-i18n="navRatings">Ratings</a>
     </nav>
     <a class="back" href="https://dfmi.app/" data-i18n="t0">Home</a>
     <button class="burger" aria-label="menu" aria-expanded="false" aria-controls="nav-links"><span></span><span></span><span></span></button>
@@ -140,7 +143,7 @@ footer .row{display:flex;justify-content:space-between;align-items:baseline;flex
 </div></div></footer>
 
 <script>
-var ZH = {"h0":"AGENTS","t0":"首页","navPoints":"积分","navWallets":"钱包","navId":"认证","navContact":"联络","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t16":"这个买家用<b>发票</b>付款;市场的另一扇门是按次付的 <b>x402</b>。<a href=\"/pay.html\">两种开口,一种结算</a>","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
+var ZH = {"h0":"AGENTS","t0":"首页","navMarket":"市场","navAgents":"智能体","navConsole":"控制台","navRatings":"评分","navPoints":"积分","navWallets":"钱包","navId":"认证","navContact":"联络","t1":"连接中…","t2":"两个 agent 在交易。<em>人只出现了两次。</em>","t3":"卖家 agent 开单，并在 dfmi 链上核实结算。买家 agent 用主人授予的 session key 付款，额度由钱包合约在链上强制执行。下面的每一行都读自账本和链。橙色的行，是人唯一动手的时刻。","t4":"agent 购买","t5":"dUSD 结算","t6":"人的动作","t7":"最近一笔","t8":"买家持有的 session key","t9":"时间线","t10":"<strong>授权。</strong>主人给 <code>SessionKeyWallet</code> 充值，给一把 session key 设定额度和有效期。这是人的第一次动作。","t11":"<strong>交易。</strong>买家 agent 向卖家要报价，在链上查自己的预算，要发票，通过 facilitator 付款（无需 gas），取货。卖家 agent 只有在链上看到精确金额到账后才放货。这里没有任何一步由提示词决定，由代码和合约决定。","t12":"<strong>撤销。</strong>主人发一笔交易，买家机器上的那把钥匙就再也花不出一分钱。这是人的第二次动作。","t15":"这两个动作都是<a href=\"https://dfmi.app/wallet.html\">主人控制台</a>上的按钮：解锁主人钱包，打开 session 钱包，授权或撤销一把钥匙。","t14":"dfmi 是 x402 协议的实验性、非托管市场。dUSD 是测试代币，不是法定货币，也不是投资。","t16":"这个买家用<b>发票</b>付款;市场的另一扇门是按次付的 <b>x402</b>。<a href=\"/pay.html\">两种开口,一种结算</a>","t32":"隐私政策","t33":"服务条款","t34":"法律声明"};
 var EN = {};
 document.querySelectorAll("[data-i18n]").forEach(function(el){ EN[el.getAttribute("data-i18n")] = el.innerHTML; });
 var lang = "en";

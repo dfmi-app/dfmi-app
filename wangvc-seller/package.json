@@ -1,0 +1,15 @@
+{
+  "name": "wangvc-seller",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "A dfmi seller agent that sells wangvc signal data per request or per ask.",
+  "scripts": {
+    "serve": "node serve.mjs",
+    "register": "node register.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
