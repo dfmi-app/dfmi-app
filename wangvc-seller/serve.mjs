@@ -36,7 +36,7 @@ const DUE_DAYS = 7;
 const SEP = '¶'; // memo separator: "<product>¶<question>"
 const pending = new Map(); // invoice_id -> { product, question }
 
-const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(obj, null, 2)); };
+const json = (res, code, obj, h = {}) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', ...h }); res.end(JSON.stringify(obj, null, 2)); };
 const body = (req) => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) no(new Error('body too large')); }); req.on('end', () => { try { ok(b ? JSON.parse(b) : {}); } catch (e) { no(e); } }); });
 const log = (...a) => console.error(`[wangvc-seller:${PORT}]`, ...a);
 
@@ -74,10 +74,11 @@ async function x402(req, res, { product, price, path, desc, goodsArgs, inputs })
   } catch (e) { log('x402 error', e.message); return send(500, { error: e.message }); }
 }
 
-// the delivery gate — enforced here in code, re-checks the chain every time
-async function deliverGoods({ invoice_id }) {
-  const st = await kit.checkPayment({ invoice_id });
-  if (st.status !== 'paid') throw new Error(`Refused: invoice ${invoice_id} is "${st.status}", not "paid". Nothing delivered.`);
+// the delivery gate — enforced in the /deliver route, which re-checks the chain every time and only
+// calls this with an invoice whose status is "paid".
+// Invoice ids come from paykit store.newId(): 'inv_' + 6 random bytes in hex.
+const INVOICE_ID = /^inv_[0-9a-f]{12}$/;
+async function deliverGoods(invoice_id, st) {
   let { product, question } = pending.get(invoice_id) || {};
   if (!product) { const memo = st.memo || st.settlement?.memo || ''; const [p, q] = String(memo).split(SEP); product = p || 'wangvc-brief'; question = q; }
   if (!CATALOG[product]) throw new Error(`Unknown product "${product}"`);
@@ -113,14 +114,33 @@ createServer(async (req, res) => {
       return json(res, 201, { invoice_id: inv.invoice_id, product, exact_amount: inv.exact_amount, pay_to: inv.pay_to, chain: inv.chain, symbol: inv.symbol, due_date: inv.due_date });
     }
     if (req.method === 'GET' && u.pathname.startsWith('/invoice/')) {
-      const st = await kit.checkPayment({ invoice_id: u.pathname.slice(9) });
+      const invoice_id = u.pathname.slice(9);
+      if (!kit.store.get(invoice_id)) return json(res, 404, { error: 'unknown invoice', invoice_id });
+      const st = await kit.checkPayment({ invoice_id });
       return json(res, 200, { invoice_id: st.invoice_id, status: st.status, exact_amount: st.exact_amount, pay_to: st.pay_to, chain: st.chain, settlement: st.settlement ?? null });
     }
     if (req.method === 'POST' && u.pathname === '/deliver') {
       const { invoice_id } = await body(req);
       if (!invoice_id) return json(res, 400, { error: 'invoice_id required' });
-      try { const g = await deliverGoods({ invoice_id }); log(`delivered ${invoice_id} (${g.product}, tx ${g.tx_hash})`); return json(res, 200, g); }
-      catch (e) { log(`refused ${invoice_id}: ${e.message}`); return json(res, 402, { delivered: false, error: e.message }); }
+      // Unknown is terminal (404): the buyer should place a new order, not pay. 402 is reserved for an invoice that exists and is unpaid.
+      if (typeof invoice_id !== 'string' || !INVOICE_ID.test(invoice_id) || !kit.store.get(invoice_id)) {
+        console.log(`[wangvc-seller:${PORT}] deliver: unknown invoice ${String(invoice_id).slice(0, 40)}`);
+        return json(res, 404, { delivered: false, error: 'unknown invoice', invoice_id });
+      }
+      const st = await kit.checkPayment({ invoice_id });
+      // paykit reports an unreadable chain as status "unknown" (not "unpaid"): retryable, so 503 rather than 402.
+      if (st.status === 'unknown') {
+        log(`deliver ${invoice_id}: chain unavailable`);
+        return json(res, 503, { delivered: false, error: 'chain unavailable, retry later', invoice_id }, { 'retry-after': '30' });
+      }
+      if (st.status !== 'paid') {
+        log(`refused ${invoice_id}: ${st.status}`);
+        return json(res, 402, { delivered: false, error: `invoice ${invoice_id} is "${st.status}", not "paid". Nothing delivered.`,
+          invoice_id, status: st.status, exact_amount: st.exact_amount, pay_to: st.pay_to, chain: st.chain, symbol: st.symbol, payment_uri: st.payment_uri });
+      }
+      try { const g = await deliverGoods(invoice_id, st); log(`delivered ${invoice_id} (${g.product}, tx ${g.tx_hash})`); return json(res, 200, g); }
+      // Paid but the goods could not be produced: not the buyer's fault, so never 402 (that would ask them to pay again).
+      catch (e) { log(`delivery failed ${invoice_id}: ${e.message}`); return json(res, 500, { delivered: false, status: 'paid', error: `delivery failed after payment: ${e.message}; retry POST /deliver`, invoice_id }); }
     }
     return json(res, 404, { error: 'not found', routes: ['GET /offer', 'POST /order', 'GET /invoice/:id', 'POST /deliver'] });
   } catch (e) { log('error', e.message); return json(res, 500, { error: e.message }); }
