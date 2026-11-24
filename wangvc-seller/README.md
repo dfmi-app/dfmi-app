@@ -38,6 +38,14 @@ node serve.mjs --port 4450
 
 The buyer side is `../buyers/buy.mjs` or a `SessionKeyWallet` buyer (`../buykit`). The question on `wangvc-ask` is captured at `/order` (kept in the invoice memo + an in-process map) and replayed at delivery.
 
+## Paid x402 routes: orders and limits
+
+`GET /signals` and `GET /ask?q=…` are also sold as plain x402 resources (402 offer → `X-PAYMENT` → goods), through `x402-lib/`:
+
+- **Persistent orders** (`orders.db`, SQLite via `node:sqlite`, Node ≥ 22.5). The order is keyed by the payment and written *before* settlement. Retrying with the same `X-PAYMENT` returns the stored goods instead of `402 authorization already used`, so a lost response, a failed production run or a seller restart never loses a paid order. `GET /orders/:id` returns status and receipt. An order that keeps failing to deliver moves to `refund_due` for the operator.
+- **No error object is ever delivered as goods**: if the data cannot be produced, the order stays paid-undelivered and is retried, instead of being marked delivered.
+- **Resource limits**: request bodies are capped (413, reading stops), `X-PAYMENT` is capped at 8 KB, per-IP token-bucket rate limit plus global and per-IP concurrency caps, and server timeouts. Tune with `SELLER_RATE_PER_MIN`, `SELLER_BURST`, `SELLER_MAX_CONCURRENT`, `SELLER_MAX_CONCURRENT_PER_IP`. Behind a reverse proxy set `TRUST_PROXY_IPS` (the proxy's address) so limits apply per real client.
+
 ## List it on dfmi
 
 Give the payout address a public category in the on-chain registry, then let the facilitator and bazaar pick it up:

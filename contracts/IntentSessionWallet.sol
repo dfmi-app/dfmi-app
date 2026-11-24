@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+interface IAgentRegistry {
+    function agentOf(address key) external view returns (uint256);
+    function getAgent(uint256 agentId) external view returns (address owner, string memory name, bool active, uint64 createdAt);
+}
+
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
@@ -35,10 +40,15 @@ interface IServiceRegistry {
  * lives in the grant, not in the signature. Re-granting a (revoked) key bumps its
  * generation, so any signature produced under an earlier grant is permanently void —
  * revocation cannot be undone by re-authorizing the same key.
+ *
+ * v3 (2026-11): pay() also reverts when the session key is bound to a deactivated agent identity owned
+ * by this wallet's owner (AgentRegistry.deactivate takes effect at settlement, not only in the UI).
  */
 contract IntentSessionWallet {
     address public owner;
     IERC20 public immutable token;
+    IAgentRegistry public immutable agentRegistry; // 0 = no identity-level check
+    uint256 public constant VERSION = 3; // v3: per-grant generation + agent deactivation enforced in pay()
     IServiceRegistry public immutable registry;
 
     struct Session {
@@ -67,11 +77,12 @@ contract IntentSessionWallet {
         _;
     }
 
-    constructor(address _owner, address _token, address _registry) {
+    constructor(address _owner, address _token, address _registry, address _agentRegistry) {
         require(_owner != address(0) && _token != address(0) && _registry != address(0), "zero arg");
         owner = _owner;
         token = IERC20(_token);
         registry = IServiceRegistry(_registry);
+        agentRegistry = IAgentRegistry(_agentRegistry);
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -104,7 +115,7 @@ contract IntentSessionWallet {
     function allowed(address sessionKey, address to) external view returns (bool ok, uint8 category) {
         Session storage s = sessions[sessionKey];
         category = registry.categoryOf(to);
-        if (!s.active) return (false, category);
+        if (!s.active || agentBlocked(sessionKey)) return (false, category);
         if (s.intentMask == 0) return (true, category);
         if (category == 0) return (false, 0);
         ok = (s.intentMask & (uint256(1) << category)) != 0;
@@ -122,6 +133,7 @@ contract IntentSessionWallet {
     ) external {
         Session storage s = sessions[sessionKey];
         require(s.active, "revoked or unknown session");
+        require(!agentBlocked(sessionKey), "agent deactivated");
         require(s.expiry == 0 || block.timestamp <= s.expiry, "session expired");
         require(block.timestamp <= deadline, "payment deadline passed");
         require(nonce == sessionNonce[sessionKey], "bad nonce");
@@ -150,9 +162,21 @@ contract IntentSessionWallet {
         emit OwnerWithdraw(to, amount);
     }
 
+    /// Identity-level kill switch, enforced at settlement: if the key is bound (in the AgentRegistry) to an
+    /// agent identity that THIS wallet's owner controls, and that agent has been deactivated, pay() reverts.
+    /// Bindings made by anyone else are ignored, so a third party cannot freeze this wallet by binding its
+    /// key to their own agent and deactivating it.
+    function agentBlocked(address sessionKey) public view returns (bool) {
+        if (address(agentRegistry) == address(0)) return false;
+        uint256 idPlus = agentRegistry.agentOf(sessionKey);
+        if (idPlus == 0) return false;
+        (address aOwner, , bool active, ) = agentRegistry.getAgent(idPlus - 1);
+        return aOwner == owner && !active;
+    }
+
     function remaining(address sessionKey) external view returns (uint256) {
         Session storage s = sessions[sessionKey];
-        if (!s.active || s.cap < s.spent) return 0;
+        if (!s.active || s.cap < s.spent || agentBlocked(sessionKey)) return 0;
         return s.cap - s.spent;
     }
 

@@ -3,14 +3,14 @@
  * deploy-intent.mjs — one-shot deployment of the intent layer:
  *   1. deploy ServiceRegistry (reused if dfmi.json already has serviceRegistry)
  *   2. register a category: splitter (the producer's payout address) → category 1 "market-data"
- *   3. deploy IntentSessionWallet (owner = DEPLOYER, dUSD, registry)
+ *   3. deploy IntentSessionWallet (owner = DEPLOYER, dUSD, registry, agentRegistry from dfmi.json or none)
  *   4. fund it → generate a session key → grantSession(cap, 7 days, intentMask = category 1 only)
  *   5. write intent-wallet.deployed.json (contains the session private key — keep it in .gitignore, never push it)
  *
  * Usage: node deploy-intent.mjs   (requires DEPLOYER_PRIVATE_KEY in .env; .env may live in this directory or its parent)
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits } from 'ethers';
+import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits, ZeroAddress } from 'ethers';
 
 const cfgUrl = new URL('./dfmi.json', import.meta.url);
 const cfg = JSON.parse(readFileSync(cfgUrl, 'utf8'));
@@ -54,7 +54,8 @@ if (cat === 0) {
 
 // 3. IntentSessionWallet
 const wf = new ContractFactory(walArt.abi, walArt.bytecode, owner);
-const w = await wf.deploy(owner.address, cfg.token, regAddr, { ...tx0, gasLimit: 4_000_000 });
+// v3: with an AgentRegistry, deactivating the agent a session key is bound to stops its payments at settlement
+const w = await wf.deploy(owner.address, cfg.token, regAddr, cfg.agentRegistry ?? ZeroAddress, { ...tx0, gasLimit: 4_000_000 });
 await w.waitForDeployment();
 const walletAddr = await w.getAddress();
 console.log(`✓ IntentSessionWallet deployed: ${walletAddr}`);

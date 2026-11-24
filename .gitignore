@@ -21,6 +21,10 @@ buyers/purchases.json
 Thumbs.db
 .vscode/
 
+# seller order state (persistent orders: payment → goods, receipts, refunds)
+orders.db
+orders.db-*
+
 # paykit local state
 paykit/invoices.json
 paykit/invoices.json.tmp

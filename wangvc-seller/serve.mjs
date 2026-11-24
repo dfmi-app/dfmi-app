@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../paykit/src/config.mjs';
 import { PayKit } from '../paykit/src/paykit.mjs';
 import { CATALOG, BOARDS } from './goods.mjs';
+import { readJson } from './x402-lib/limits.mjs';
+import { makeSellerKit, listen, SERVER_OPTS } from './x402-lib/seller-kit.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const cfg = loadConfig(process.env.PAYKIT_CONFIG ?? resolve(HERE, '..', 'paykit', 'paykit.config.json'));
@@ -37,7 +39,7 @@ const SEP = '¶'; // memo separator: "<product>¶<question>"
 const pending = new Map(); // invoice_id -> { product, question }
 
 const json = (res, code, obj, h = {}) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', ...h }); res.end(JSON.stringify(obj, null, 2)); };
-const body = (req) => new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 1e5) no(new Error('body too large')); }); req.on('end', () => { try { ok(b ? JSON.parse(b) : {}); } catch (e) { no(e); } }); });
+const body = (req) => readJson(req, req._res, 16 * 1024);
 const log = (...a) => console.error(`[wangvc-seller:${PORT}]`, ...a);
 
 // ---------- x402 resource mode (so bazaar can rate it; same protocol as producer) ----------
@@ -55,23 +57,18 @@ const requirements = (price, path, desc, inputs) => ({
   ...(inputs ? { inputs } : {}),
   extra: { name: cfg.tokenDomain.name, version: cfg.tokenDomain.version },
 });
+// limits + persistent orders (x402-lib, 2026-11): a retry with the same X-PAYMENT returns the stored goods,
+// GET /orders/<id> gives status + receipt, repeated delivery failure → refund_due.
+const kitx = makeSellerKit({ name: `wangvc-seller:${PORT}`, dbFile: process.env.ORDERS_DB ?? resolve(HERE, 'orders.db'), facilitator: FACILITATOR, facAuth: FAC_AUTH, env: process.env });
+kitx.startSweeper((row) => { const inp = JSON.parse(row.inputs || '{}'); return CATALOG[inp.product] ? () => CATALOG[inp.product](inp.args || {}) : null; });
 async function x402(req, res, { product, price, path, desc, goodsArgs, inputs }) {
   const REQ = requirements(price, path, desc, inputs);
-  const send = (code, obj, h = {}) => { res.writeHead(code, { 'content-type': 'application/json', ...CORS, ...h }); res.end(JSON.stringify(obj)); };
-  const header = req.headers['x-payment'];
-  if (!header) return send(402, { x402Version: 1, error: 'X-PAYMENT header is required', accepts: [REQ] });
-  try {
-    const paymentPayload = JSON.parse(Buffer.from(header, 'base64').toString());
-    const b = { paymentPayload, paymentRequirements: REQ };
-    const v = await fac('/verify', b);
-    if (!v.isValid) return send(402, { x402Version: 1, error: `payment invalid: ${v.invalidReason}`, accepts: [REQ] });
-    const s = await fac('/settle', b);
-    if (!s.success) return send(402, { x402Version: 1, error: `settlement failed: ${s.error}`, accepts: [REQ] });
+  return kitx.sell(req, res, { requirements: REQ, inputs: { product, args: goodsArgs || {} }, produce: async () => {
     const report = await CATALOG[product](goodsArgs || {});
-    const rcpt = Buffer.from(JSON.stringify({ success: true, network: s.network, payer: s.payer, transaction: s.transaction, blockNumber: s.blockNumber })).toString('base64');
-    log(`x402 delivered ${product} (tx ${s.transaction})`);
-    return send(200, report, { 'X-PAYMENT-RESPONSE': rcpt });
-  } catch (e) { log('x402 error', e.message); return send(500, { error: e.message }); }
+    if (report && report.error) throw new Error(report.error); // no data = not delivered (retry / refund), never a "delivered" error object
+    log(`x402 produced ${product}`);
+    return report;
+  } });
 }
 
 // the delivery gate — enforced in the /deliver route, which re-checks the chain every time and only
@@ -86,10 +83,9 @@ async function deliverGoods(invoice_id, st) {
   return { delivered: true, invoice_id, product, tx_hash: st.settlement?.tx_hash, payer: st.settlement?.payer_address, goods };
 }
 
-createServer(async (req, res) => {
-  const u = new URL(req.url, 'http://x');
+const server = createServer(SERVER_OPTS, kitx.serve(async (req, res, { url: u }) => {
+  req._res = res;
   try {
-    if (req.method === 'OPTIONS') { res.writeHead(204, { ...CORS, 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'X-PAYMENT, PAYMENT-SIGNATURE, Content-Type', 'access-control-max-age': '86400' }); return res.end(); }
     if (req.method === 'GET' && u.pathname === '/signals') return x402(req, res, { product: 'wangvc-brief', price: Number(PRICES['wangvc-brief']), path: '/signals', desc: 'wangvc full signal brief — all 12 dashboards' });
     if (req.method === 'GET' && u.pathname === '/ask') return x402(req, res, { product: 'wangvc-ask', price: Number(PRICES['wangvc-ask']), path: '/ask', desc: 'wangvc — one question routed to the right dashboard', goodsArgs: { question: u.searchParams.get('q') || '' }, inputs: [{ name: 'q', label: 'Your Question', labelZh: 'Your Question', placeholder: 'Your Question' }] });
     if (req.method === 'GET' && u.pathname === '/offer') {
@@ -142,6 +138,7 @@ createServer(async (req, res) => {
       // Paid but the goods could not be produced: not the buyer's fault, so never 402 (that would ask them to pay again).
       catch (e) { log(`delivery failed ${invoice_id}: ${e.message}`); return json(res, 500, { delivered: false, status: 'paid', error: `delivery failed after payment: ${e.message}; retry POST /deliver`, invoice_id }); }
     }
-    return json(res, 404, { error: 'not found', routes: ['GET /offer', 'POST /order', 'GET /invoice/:id', 'POST /deliver'] });
-  } catch (e) { log('error', e.message); return json(res, 500, { error: e.message }); }
-}).listen(PORT, () => log(`selling wangvc-brief, wangvc-ask as ${SELLER} on ${cfg.chain} | http://0.0.0.0:${PORT}/offer`));
+    return json(res, 404, { error: 'not found', routes: ['GET /offer', 'POST /order', 'GET /invoice/:id', 'POST /deliver', 'GET /orders/:id'] });
+  } catch (e) { if (e.status) throw e; log('error', e.message); return json(res, 500, { error: e.message }); }
+}));
+listen(server, PORT, process.env.BIND_HOST, () => log(`selling wangvc-brief, wangvc-ask as ${SELLER} on ${cfg.chain} | http://0.0.0.0:${PORT}/offer`));

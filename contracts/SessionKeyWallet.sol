@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+interface IAgentRegistry {
+    function agentOf(address key) external view returns (uint256);
+    function getAgent(uint256 agentId) external view returns (address owner, string memory name, bool active, uint64 createdAt);
+}
+
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
@@ -29,10 +34,15 @@ interface IERC20 {
  * void. Revocation therefore stays final: it cannot be undone by re-authorizing the same key.
  *
  * Revocation lives in the authorization path (the pay() gate), not in the balance. That is the point.
+ *
+ * v3 (2026-11): pay() also reverts when the session key is bound to a deactivated agent identity owned
+ * by this wallet's owner (AgentRegistry.deactivate takes effect at settlement, not only in the UI).
  */
 contract SessionKeyWallet {
     address public owner;
     IERC20 public immutable token;
+    IAgentRegistry public immutable agentRegistry; // 0 = no identity-level check
+    uint256 public constant VERSION = 3; // v3: per-grant generation + agent deactivation enforced in pay()
 
     struct Session {
         bool active; // owner can flip this false in one tx — the kill switch
@@ -59,10 +69,11 @@ contract SessionKeyWallet {
         _;
     }
 
-    constructor(address _owner, address _token) {
+    constructor(address _owner, address _token, address _agentRegistry) {
         require(_owner != address(0) && _token != address(0), "zero arg");
         owner = _owner;
         token = IERC20(_token);
+        agentRegistry = IAgentRegistry(_agentRegistry);
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -102,7 +113,8 @@ contract SessionKeyWallet {
         bytes calldata signature
     ) external {
         Session storage s = sessions[sessionKey];
-        require(s.active, "revoked or unknown session"); // <-- revocation gate, in the auth path
+        require(s.active, "revoked or unknown session");
+        require(!agentBlocked(sessionKey), "agent deactivated"); // <-- revocation gate, in the auth path
         require(s.expiry == 0 || block.timestamp <= s.expiry, "session expired");
         require(block.timestamp <= deadline, "payment deadline passed");
         require(nonce == sessionNonce[sessionKey], "bad nonce");
@@ -124,9 +136,21 @@ contract SessionKeyWallet {
         emit OwnerWithdraw(to, amount);
     }
 
+    /// Identity-level kill switch, enforced at settlement: if the key is bound (in the AgentRegistry) to an
+    /// agent identity that THIS wallet's owner controls, and that agent has been deactivated, pay() reverts.
+    /// Bindings made by anyone else are ignored, so a third party cannot freeze this wallet by binding its
+    /// key to their own agent and deactivating it.
+    function agentBlocked(address sessionKey) public view returns (bool) {
+        if (address(agentRegistry) == address(0)) return false;
+        uint256 idPlus = agentRegistry.agentOf(sessionKey);
+        if (idPlus == 0) return false;
+        (address aOwner, , bool active, ) = agentRegistry.getAgent(idPlus - 1);
+        return aOwner == owner && !active;
+    }
+
     function remaining(address sessionKey) external view returns (uint256) {
         Session storage s = sessions[sessionKey];
-        if (!s.active || s.cap < s.spent) return 0;
+        if (!s.active || s.cap < s.spent || agentBlocked(sessionKey)) return 0;
         return s.cap - s.spent;
     }
 
