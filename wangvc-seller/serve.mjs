@@ -59,7 +59,7 @@ const requirements = (price, path, desc, inputs) => ({
 });
 // limits + persistent orders (x402-lib, 2026-11): a retry with the same X-PAYMENT returns the stored goods,
 // GET /orders/<id> gives status + receipt, repeated delivery failure → refund_due.
-const kitx = makeSellerKit({ name: `wangvc-seller:${PORT}`, dbFile: process.env.ORDERS_DB ?? resolve(HERE, 'orders.db'), facilitator: FACILITATOR, facAuth: FAC_AUTH, env: process.env });
+const kitx = makeSellerKit({ chain: cfg, name: `wangvc-seller:${PORT}`, dbFile: process.env.ORDERS_DB ?? resolve(HERE, 'orders.db'), facilitator: FACILITATOR, facAuth: FAC_AUTH, env: process.env });
 kitx.startSweeper((row) => { const inp = JSON.parse(row.inputs || '{}'); return CATALOG[inp.product] ? () => CATALOG[inp.product](inp.args || {}) : null; });
 async function x402(req, res, { product, price, path, desc, goodsArgs, inputs }) {
   const REQ = requirements(price, path, desc, inputs);

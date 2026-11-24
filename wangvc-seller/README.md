@@ -44,6 +44,16 @@ The buyer side is `../buyers/buy.mjs` or a `SessionKeyWallet` buyer (`../buykit`
 
 - **Persistent orders** (`orders.db`, SQLite via `node:sqlite`, Node ≥ 22.5). The order is keyed by the payment and written *before* settlement. Retrying with the same `X-PAYMENT` returns the stored goods instead of `402 authorization already used`, so a lost response, a failed production run or a seller restart never loses a paid order. `GET /orders/:id` returns status and receipt. An order that keeps failing to deliver moves to `refund_due` for the operator.
 - **No error object is ever delivered as goods**: if the data cannot be produced, the order stays paid-undelivered and is retried, instead of being marked delivered.
+- **Settlement outcome unknown → the order is kept, then reconciled on chain.** If the facilitator is unreachable, the seller restarts mid-settlement, or the facilitator answers with a refusal that also fits "already settled" (`authorization already used`), the order stays `settling`. The sweeper first asks the facilitator again (`/settle` is idempotent); if that does not settle it, it checks the chain itself (`x402-lib/chain-recon.mjs`, plain JSON-RPC, `eth_getLogs` in 9,000-block chunks):
+  - found → `paid` with the **original** transaction → delivered to the same `X-PAYMENT`, never charged twice;
+  - absent and the authorization expired → `void`, the buyer was never charged.
+
+  The chain is read from the paykit config (`rpc`, `token`).
+- **Refunds are tracked until they are on chain:** `refund_due → refund_sent → refunded`. An order is `refunded` only when a dUSD transfer of at least the order amount to the payer is verified on chain; `GET /orders/:id` shows the refund transaction.
+  - With `REFUND_PRIVATE_KEY` (a hot wallet holding dUSD), refunds are paid automatically. The transfer is signed and stored before it is broadcast, so a crash can only re-broadcast it, never pay it twice.
+  - Without a refund key, overdue refunds are alerted in the log until an operator records one.
+- **Operator tool:** `node orders-admin.mjs refunds --db orders.db` lists what is owed (exit 1 when a refund is overdue). `node orders-admin.mjs refund-record --db orders.db --cfg ../paykit/paykit.config.json <order_id> <tx>` records a manual refund, accepted only if the chain shows it; one transaction can refund one order only.
+- Tuning: `ORDER_SWEEP_MS`, `ORDER_RECON_AFTER_MS`, `ORDER_MAX_ATTEMPTS`, `ORDER_MAX_AGE_MS`, `REFUND_ALERT_MS`.
 - **Resource limits**: request bodies are capped (413, reading stops), `X-PAYMENT` is capped at 8 KB, per-IP token-bucket rate limit plus global and per-IP concurrency caps, and server timeouts. Tune with `SELLER_RATE_PER_MIN`, `SELLER_BURST`, `SELLER_MAX_CONCURRENT`, `SELLER_MAX_CONCURRENT_PER_IP`. Behind a reverse proxy set `TRUST_PROXY_IPS` (the proxy's address) so limits apply per real client.
 
 ## List it on dfmi
