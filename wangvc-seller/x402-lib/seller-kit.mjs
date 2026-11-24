@@ -16,7 +16,8 @@ export const PREFLIGHT = { ...CORS, 'access-control-allow-methods': 'GET, POST, 
 // chain: the seller's dfmi.json / paykit config ({ rpc, token, chainId, gasPriceGwei, insecure }). With it the seller can
 // settle "outcome unknown" orders against the chain itself and verify refunds; without it such orders are kept, never dropped.
 // Env: ORDER_SWEEP_MS (60000), ORDER_SWEEP_OLDER_MS (30000), ORDER_RECON_AFTER_MS (120000), REFUND_ALERT_MS (3600000),
-//      REFUND_PRIVATE_KEY (optional hot wallet holding dUSD: refunds are then paid automatically and verified on chain).
+//      REFUND_PRIVATE_KEY (optional hot wallet holding dUSD, used by THIS process only: refunds are paid automatically, one at a
+//      time, and verified on chain), REFUND_SOURCES (comma-separated senders a manual refund must come from; empty = any).
 export function makeSellerKit({ name, dbFile, facilitator, facAuth = '', env = {}, limits = {}, chain: chainCfg = null, sweepMs = 60_000, log = (...a) => console.log(`[${name}]`, ...a) }) {
   const E = (k, d) => env[k] ?? process.env[k] ?? d;
   sweepMs = Number(E('ORDER_SWEEP_MS', sweepMs));
@@ -28,7 +29,8 @@ export function makeSellerKit({ name, dbFile, facilitator, facAuth = '', env = {
   };
   const chain = chainCfg?.rpc && chainCfg?.token ? makeChain({ rpc: chainCfg.rpc, token: chainCfg.token, insecure: !!chainCfg.insecure }) : null;
   if (!chain) log('note: no chain config — orders with an unknown settlement outcome are kept but cannot be reconciled on chain');
-  const gate = makeGate({ orders, fac, log, chain, reconAfterMs: Number(E('ORDER_RECON_AFTER_MS', 120_000)), refundAlertMs: Number(E('REFUND_ALERT_MS', 3600_000)) });
+  const refundSources = String(E('REFUND_SOURCES', '')).split(',').map((s) => s.trim()).filter(Boolean); // allowed senders of manual refunds
+  const gate = makeGate({ orders, fac, log, chain, reconAfterMs: Number(E('ORDER_RECON_AFTER_MS', 120_000)), refundAlertMs: Number(E('REFUND_ALERT_MS', 3600_000)), refundSources });
   const refundKey = E('REFUND_PRIVATE_KEY', '');
   const refunderReady = refundKey && chain
     ? makeRefunder({ chain, privateKey: refundKey, token: chainCfg.token, chainId: Number(chainCfg.chainId), gasPriceGwei: chainCfg.gasPriceGwei ?? 1 })

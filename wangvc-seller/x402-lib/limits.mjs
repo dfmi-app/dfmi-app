@@ -30,7 +30,8 @@ export function clientIp(req) {
   _trusted ??= TRUSTED();
   const peer = req.socket?.remoteAddress || '';
   if (_trusted.has(peer) || _trusted.has(peer.replace(/^::ffff:/, ''))) {
-    const h = String(req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    // only X-Real-IP: our nginx always overwrites it with $remote_addr; X-Forwarded-For's first entry is client-controlled
+    const h = String(req.headers['x-real-ip'] || '').trim();
     if (h) return h;
   }
   return peer || 'unknown';
@@ -144,23 +145,56 @@ export function decodePaymentHeader(header, maxLen = 8192) {
 }
 
 // ---------- SSRF-safe outbound fetch ----------
+function privateV4(p) {
+  if (p[0] === 0 || p[0] === 127 || p[0] === 10) return true;
+  if (p[0] === 169 && p[1] === 254) return true;                 // link-local + cloud metadata (169.254.169.254)
+  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+  if (p[0] === 192 && p[1] === 168) return true;
+  if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true;    // CGNAT
+  if (p[0] === 198 && (p[1] === 18 || p[1] === 19)) return true; // benchmarking
+  if (p[0] === 192 && p[1] === 0 && (p[2] === 0 || p[2] === 2)) return true; // IETF protocol assignments, TEST-NET-1
+  if (p[0] === 198 && p[1] === 51 && p[2] === 100) return true;  // TEST-NET-2
+  if (p[0] === 203 && p[1] === 0 && p[2] === 113) return true;   // TEST-NET-3
+  if (p[0] >= 224) return true;                                   // multicast / reserved / broadcast
+  return false;
+}
+/** IPv6 text → 8 hextets (numbers), accepting every textual form (compressed, embedded dotted quad); null if invalid */
+function hextets(a) {
+  let s = String(a).toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, ''); // brackets, zone id
+  const dq = s.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (dq) { const b = dq.slice(1).map(Number); s = s.slice(0, dq.index) + ((b[0] << 8) | b[1]).toString(16) + ':' + ((b[2] << 8) | b[3]).toString(16); }
+  const halves = s.split('::'); if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [], tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const h = [...head, ...Array(fill).fill('0'), ...tail].map((x) => parseInt(x, 16));
+  return h.length === 8 && h.every((x) => Number.isInteger(x) && x >= 0 && x <= 0xffff) ? h : null;
+}
+/**
+ * true for every address a public-URL fetch must never reach: loopback, private, link-local (incl. cloud metadata),
+ * CGNAT, reserved — in IPv4 and in EVERY IPv6 spelling of them. IPv4 embedded in IPv6 (mapped ::ffff:a.b.c.d /
+ * ::ffff:7f00:1, compatible ::a.b.c.d, translated ::ffff:0:a.b.c.d, 6to4 2002:AABB:CCDD::) is checked as IPv4;
+ * transition / relay ranges that can reach internal space (NAT64, Teredo) are refused outright.
+ */
 export function isPrivateIP(ip) {
-  if (net.isIPv4(ip)) {
-    const p = ip.split('.').map(Number);
-    if (p[0] === 0 || p[0] === 127 || p[0] === 10) return true;
-    if (p[0] === 169 && p[1] === 254) return true;                 // link-local + cloud metadata
-    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
-    if (p[0] === 192 && p[1] === 168) return true;
-    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true;    // CGNAT
-    if (p[0] === 198 && (p[1] === 18 || p[1] === 19)) return true; // benchmarking
-    if (p[0] >= 224) return true;                                   // multicast / reserved / broadcast
-    return false;
-  }
-  const a = String(ip).toLowerCase();
-  if (a === '::1' || a === '::') return true;
-  if (a.startsWith('fe8') || a.startsWith('fe9') || a.startsWith('fea') || a.startsWith('feb') || a.startsWith('fc') || a.startsWith('fd') || a.startsWith('ff')) return true;
-  const m = a.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/); if (m) return isPrivateIP(m[1]);
-  if (a.startsWith('64:ff9b:')) return true; // NAT64 can reach v4 private space
+  if (net.isIPv4(ip)) return privateV4(ip.split('.').map(Number));
+  if (!net.isIPv6(String(ip).replace(/^\[|\]$/g, '').replace(/%.*$/, ''))) return true; // not an IP we understand → refuse
+  const h = hextets(ip); if (!h) return true;
+  const v4 = (hi, lo) => privateV4([hi >> 8, hi & 255, lo >> 8, lo & 255]);
+  const zero = (n) => h.slice(0, n).every((x) => x === 0);
+  if (zero(8)) return true;                                                     // ::
+  if (zero(7) && h[7] === 1) return true;                                       // ::1
+  if (zero(5) && h[5] === 0xffff) return v4(h[6], h[7]);                        // ::ffff:a.b.c.d  (mapped)
+  if (zero(4) && h[4] === 0xffff && h[5] === 0) return v4(h[6], h[7]) || true;  // ::ffff:0:a.b.c.d (translated): never needed
+  if (zero(6)) return true;                                                     // ::a.b.c.d (deprecated compatible)
+  if (h[0] === 0x64 && h[1] === 0xff9b) return true;                            // NAT64 64:ff9b::/96 and 64:ff9b:1::/48
+  if (h[0] === 0x2002) return v4(h[1], h[2]);                                   // 6to4 embeds an IPv4
+  if (h[0] === 0x2001 && h[1] === 0) return true;                               // Teredo 2001::/32
+  if (h[0] === 0x2001 && h[1] === 0xdb8) return true;                           // documentation
+  if (h[0] === 0x100 && zero(4)) return true;                                   // discard-only 100::/64
+  if ((h[0] & 0xfe00) === 0xfc00) return true;                                  // ULA fc00::/7
+  if ((h[0] & 0xffc0) === 0xfe80 || (h[0] & 0xffc0) === 0xfec0) return true;    // link-local fe80::/10, site-local fec0::/10
+  if ((h[0] & 0xff00) === 0xff00) return true;                                  // multicast
   return false;
 }
 

@@ -60,12 +60,17 @@ const requirements = (price, path, desc, inputs) => ({
 // limits + persistent orders (x402-lib, 2026-11): a retry with the same X-PAYMENT returns the stored goods,
 // GET /orders/<id> gives status + receipt, repeated delivery failure → refund_due.
 const kitx = makeSellerKit({ chain: cfg, name: `wangvc-seller:${PORT}`, dbFile: process.env.ORDERS_DB ?? resolve(HERE, 'orders.db'), facilitator: FACILITATOR, facAuth: FAC_AUTH, env: process.env });
-kitx.startSweeper((row) => { const inp = JSON.parse(row.inputs || '{}'); return CATALOG[inp.product] ? () => CATALOG[inp.product](inp.args || {}) : null; });
+// ONE producer for the live request and the background sweeper: an error result is never stored as goods
+async function produceGoods(product, args) {
+  const report = await CATALOG[product](args || {});
+  if (!report || report.error) throw new Error(report?.error || 'no goods produced'); // not delivered → retried, then refund_due
+  return report;
+}
+kitx.startSweeper((row) => { const inp = JSON.parse(row.inputs || '{}'); return CATALOG[inp.product] ? () => produceGoods(inp.product, inp.args) : null; });
 async function x402(req, res, { product, price, path, desc, goodsArgs, inputs }) {
   const REQ = requirements(price, path, desc, inputs);
   return kitx.sell(req, res, { requirements: REQ, inputs: { product, args: goodsArgs || {} }, produce: async () => {
-    const report = await CATALOG[product](goodsArgs || {});
-    if (report && report.error) throw new Error(report.error); // no data = not delivered (retry / refund), never a "delivered" error object
+    const report = await produceGoods(product, goodsArgs);
     log(`x402 produced ${product}`);
     return report;
   } });

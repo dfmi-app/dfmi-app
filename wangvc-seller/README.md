@@ -45,15 +45,27 @@ The buyer side is `../buyers/buy.mjs` or a `SessionKeyWallet` buyer (`../buykit`
 - **Persistent orders** (`orders.db`, SQLite via `node:sqlite`, Node ≥ 22.5). The order is keyed by the payment and written *before* settlement. Retrying with the same `X-PAYMENT` returns the stored goods instead of `402 authorization already used`, so a lost response, a failed production run or a seller restart never loses a paid order. `GET /orders/:id` returns status and receipt. An order that keeps failing to deliver moves to `refund_due` for the operator.
 - **No error object is ever delivered as goods**: if the data cannot be produced, the order stays paid-undelivered and is retried, instead of being marked delivered.
 - **Settlement outcome unknown → the order is kept, then reconciled on chain.** If the facilitator is unreachable, the seller restarts mid-settlement, or the facilitator answers with a refusal that also fits "already settled" (`authorization already used`), the order stays `settling`. The sweeper first asks the facilitator again (`/settle` is idempotent); if that does not settle it, it checks the chain itself (`x402-lib/chain-recon.mjs`, plain JSON-RPC, `eth_getLogs` in 9,000-block chunks):
-  - found → `paid` with the **original** transaction → delivered to the same `X-PAYMENT`, never charged twice;
-  - absent and the authorization expired → `void`, the buyer was never charged.
+  - found → `paid` with the **original** transaction → delivered to the same `X-PAYMENT`, never charged twice. "Found" means the decoded, executed call: a direct `pay()` on the wallet (or `transferWithAuthorization` on the token) with every field equal, not a byte search.
+  - never executed, proven from chain **state** (the session nonce is unused in the same grant generation, or `authorizationState` is false), and it can no longer execute → `void`, the buyer was never charged. An empty log scan alone never counts as "not charged". Anything the chain does not prove either way (RPC errors, a consumed nonce whose transaction cannot be identified) stays **unknown**, and the order is kept.
+- **A refused payment is kept, not deleted.** If the facilitator refuses and the chain shows it has not executed, the order becomes `refused`. The sweeper keeps watching the chain read-only and never re-submits. If it executes after all (relayed by someone else), it becomes `paid` and is delivered. A retry by the buyer re-evaluates it.
 
   The chain is read from the paykit config (`rpc`, `token`).
-- **Refunds are tracked until they are on chain:** `refund_due → refund_sent → refunded`. An order is `refunded` only when a dUSD transfer of at least the order amount to the payer is verified on chain; `GET /orders/:id` shows the refund transaction.
-  - With `REFUND_PRIVATE_KEY` (a hot wallet holding dUSD), refunds are paid automatically. The transfer is signed and stored before it is broadcast, so a crash can only re-broadcast it, never pay it twice.
-  - Without a refund key, overdue refunds are alerted in the log until an operator records one.
-- **Operator tool:** `node orders-admin.mjs refunds --db orders.db` lists what is owed (exit 1 when a refund is overdue). `node orders-admin.mjs refund-record --db orders.db --cfg ../paykit/paykit.config.json <order_id> <tx>` records a manual refund, accepted only if the chain shows it; one transaction can refund one order only.
-- Tuning: `ORDER_SWEEP_MS`, `ORDER_RECON_AFTER_MS`, `ORDER_MAX_ATTEMPTS`, `ORDER_MAX_AGE_MS`, `REFUND_ALERT_MS`.
+- **Refunds are tracked until they are on chain:** `refund_due → refund_sent → refunded` (or `refund_due → refund_manual → …` for an operator refund). An order is `refunded` only when **one** dUSD transfer of at least the order amount to the payer, mined after the order became refundable, is verified on chain. `GET /orders/:id` shows the refund transaction.
+  - **Automatic refunds** (`REFUND_PRIVATE_KEY`, a hot wallet holding dUSD, used by this one process only):
+    - one refund in flight at a time;
+    - the transfer is signed and stored before it is broadcast;
+    - a refund whose transaction is not visible is only ever re-broadcast with the same bytes. It is replaced only when its nonce was used by another transaction **and** no matching transfer from the refund wallet exists on chain.
+  - Every status change that moves money is a conditional update, so a second writer (the CLI, another process) cannot apply it twice. Run one seller process per `orders.db`.
+  - Without a refund key, overdue refunds are alerted in the log until an operator claims one and records it.
+- **Operator tool (`orders-admin.mjs`):**
+  - `refunds --db orders.db` lists what is owed; it exits 1 when a refund is overdue.
+  - Manual refund:
+    1. `refund-claim --db orders.db <order_id>`: the automatic refunder will no longer touch it;
+    2. pay the payer;
+    3. `refund-record --db orders.db --cfg ../paykit/paykit.config.json <order_id> <tx>`: accepted only if the chain shows one matching transfer after the obligation (from an allowed sender when `REFUND_SOURCES` is set). One transaction refunds one order only, compared case-insensitively.
+- **Outbound fetches (`safeFetch`):** private, loopback, link-local and metadata addresses are refused in every IPv4 and IPv6 spelling, including IPv4-mapped forms such as `::ffff:7f00:1`.
+- Tuning: `ORDER_SWEEP_MS`, `ORDER_RECON_AFTER_MS`, `ORDER_MAX_ATTEMPTS`, `ORDER_MAX_AGE_MS`, `REFUND_ALERT_MS`, `REFUND_SOURCES`.
+- **Regression tests** for the order, reconciliation, refund and fetch rules (mock RPC, no chain): `node --test x402-lib/review.test.mjs`.
 - **Resource limits**: request bodies are capped (413, reading stops), `X-PAYMENT` is capped at 8 KB, per-IP token-bucket rate limit plus global and per-IP concurrency caps, and server timeouts. Tune with `SELLER_RATE_PER_MIN`, `SELLER_BURST`, `SELLER_MAX_CONCURRENT`, `SELLER_MAX_CONCURRENT_PER_IP`. Behind a reverse proxy set `TRUST_PROXY_IPS` (the proxy's address) so limits apply per real client.
 
 ## List it on dfmi

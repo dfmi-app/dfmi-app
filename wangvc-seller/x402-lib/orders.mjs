@@ -8,16 +8,19 @@
 //
 // States
 //   settling → paid → delivered                       normal
-//   settling → failed                                 the facilitator refused AND the chain shows no settlement: not charged
-//   settling → void                                   never settled and the authorization has expired: not charged, ever
-//   paid     → refund_due → refund_sent → refunded    charged but undeliverable; refunded = a dUSD transfer to the payer,
-//                                                     verified on chain (never just an operator's word)
+//   settling → refused                                the facilitator refused and the chain proves it has NOT executed (yet);
+//                                                     kept: the background only watches the chain (read-only, never re-submits)
+//                                                     until it executes (→ paid) or can never execute (→ void). A retry by the
+//                                                     buyer re-evaluates it.
+//   settling/refused → void                           never executed and can never execute: not charged, ever
+//   paid → refund_due → refund_sent → refunded        charged but undeliverable; 'refunded' only when the transfer is
+//                     ↘ refund_manual → refund_sent   verified on chain. refund_manual = claimed by an operator (the
+//                                                     automatic refunder never touches it), recorded with refund-record.
 //
-// When the outcome of a settlement is UNKNOWN (facilitator unreachable, crashed mid-request, or it answers with a
-// refusal that also fits "already settled" such as "authorization already used"), the order stays 'settling'. The
-// sweeper asks the facilitator again (/settle is idempotent) and, if that does not settle it, reconciles against the
-// chain itself (lib/chain-recon.mjs): found → 'paid' with the ORIGINAL tx, then delivery resumes; expired and not
-// found → 'void'. A paid order is therefore never dropped because one party lost its memory.
+// When the outcome of a settlement cannot be PROVEN (facilitator unreachable, crashed mid-request, an ambiguous
+// refusal, RPC errors, or chain data that does not prove either way), the order stays 'settling' — it is never dropped.
+// Every status change that matters for money is a conditional update (WHERE status = expected), so a second writer
+// (another process, the admin CLI) cannot apply the same transition twice. Deploy one seller process per orders.db.
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes } from 'node:crypto';
 import { decodePaymentHeader, HttpError } from './limits.mjs';
@@ -28,6 +31,7 @@ const stable = (v) => Array.isArray(v) ? `[${v.map(stable).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stable(v[k])).join(',')}}`
   : JSON.stringify(typeof v === 'string' ? v.toLowerCase() : v);
 const now = () => new Date().toISOString();
+const REFUND_STATES = ['refund_due', 'refund_manual', 'refund_sent', 'refunded'];
 
 /** One authorization can only ever settle once: exact = (asset, from, nonce); session = (wallet, key, generation, nonce). */
 export function paymentKey(pp, requirements) {
@@ -43,7 +47,8 @@ export function refundTarget(o) {
   return pp.scheme === 'dfmi-session' ? pp.payload?.wallet : pp.payload?.authorization?.from;
 }
 
-const REFUND_COLS = ['refund_to TEXT', 'refund_tx TEXT', 'refund_raw TEXT', 'refund_nonce INTEGER', 'refund_block INTEGER', 'refund_at TEXT', 'refunded_at TEXT', 'refund_by TEXT', 'recon TEXT'];
+const REFUND_COLS = ['refund_to TEXT', 'refund_tx TEXT', 'refund_raw TEXT', 'refund_nonce INTEGER', 'refund_block INTEGER', 'refund_at TEXT', 'refunded_at TEXT', 'refund_by TEXT', 'recon TEXT',
+  'refund_due_at TEXT', 'refund_from TEXT', 'refund_history TEXT'];
 
 export function openOrders(file, { maxAttempts = 5, maxAgeMs = 24 * 3600_000 } = {}) {
   const db = new DatabaseSync(file);
@@ -60,22 +65,28 @@ export function openOrders(file, { maxAttempts = 5, maxAgeMs = 24 * 3600_000 } =
   // in-place upgrade of order databases created before the refund lifecycle existed
   const have = new Set(db.prepare('PRAGMA table_info(orders)').all().map((c) => c.name));
   for (const c of REFUND_COLS) if (!have.has(c.split(' ')[0])) db.exec(`ALTER TABLE orders ADD COLUMN ${c}`);
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS orders_refund_tx ON orders(refund_tx) WHERE refund_tx IS NOT NULL`); // one refund tx pays one order
+  // one refund transaction pays one order — compared case-insensitively (0xAB… and 0xab… are the same tx)
+  db.exec(`DROP INDEX IF EXISTS orders_refund_tx;
+    UPDATE orders SET refund_tx = lower(refund_tx) WHERE refund_tx IS NOT NULL AND refund_tx <> lower(refund_tx);
+    CREATE UNIQUE INDEX IF NOT EXISTS orders_refund_tx_lc ON orders(lower(refund_tx)) WHERE refund_tx IS NOT NULL;`);
   const q = {
     byId: db.prepare('SELECT * FROM orders WHERE id = ?'),
     byKey: db.prepare('SELECT * FROM orders WHERE payment_key = ?'),
     insert: db.prepare(`INSERT OR IGNORE INTO orders (id, payment_key, payload_hash, resource, inputs, payer, amount, scheme, status, goods, payment)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'settling', ?, ?)`),
-    set: (cols) => db.prepare(`UPDATE orders SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`),
+    set: (cols, cond) => db.prepare(`UPDATE orders SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?${cond ? ' AND status = ?' : ''}`),
     byStatus: db.prepare('SELECT * FROM orders WHERE status = ? ORDER BY created_at LIMIT ?'),
   };
   const setCache = new Map();
-  const update = (id, fields) => { const cols = Object.keys(fields); const k = cols.join(','); if (!setCache.has(k)) setCache.set(k, q.set(cols)); setCache.get(k).run(...cols.map((c) => fields[c]), id); return q.byId.get(id); };
+  const stmt = (cols, cond) => { const k = cols.join(',') + (cond ? '|c' : ''); if (!setCache.has(k)) setCache.set(k, q.set(cols, cond)); return setCache.get(k); };
+  const update = (id, fields) => { const cols = Object.keys(fields); stmt(cols, false).run(...cols.map((c) => fields[c]), id); return q.byId.get(id); };
+  /** conditional update: applied only while the row is still in status `from`; returns the new row, or null if someone else moved it */
+  const transition = (id, from, fields) => { const cols = Object.keys(fields); const r = stmt(cols, true).run(...cols.map((c) => fields[c]), id, from); return r.changes ? q.byId.get(id) : null; };
   return {
     db, maxAttempts, maxAgeMs,
     get: (id) => q.byId.get(id), byKey: (k) => q.byKey.get(k),
     create: (o) => { q.insert.run(o.id, o.payment_key, o.payload_hash, o.resource, o.inputs ?? null, o.payer ?? null, o.amount ?? null, o.scheme ?? null, o.goods ?? null, o.payment ?? null); return q.byKey.get(o.payment_key); },
-    update, list: (status, limit = 100) => q.byStatus.all(status, limit),
+    update, transition, list: (status, limit = 100) => q.byStatus.all(status, limit),
     close: () => db.close(),
   };
 }
@@ -83,30 +94,33 @@ export function openOrders(file, { maxAttempts = 5, maxAgeMs = 24 * 3600_000 } =
 /** Public receipt (never includes goods). */
 export function receipt(o) {
   if (!o) return null;
-  const refund = ['refund_due', 'refund_sent', 'refunded'].includes(o.status)
-    ? { compensation: { status: o.status, owed_to: o.refund_to || refundTarget(o), amount_atomic: o.amount, refund_tx: o.refund_tx || null, refund_block: o.refund_block ?? null, refunded_at: o.refunded_at || null,
-        note: o.status === 'refunded' ? 'Refunded: the transfer above is on chain.' : o.status === 'refund_sent' ? 'Refund transaction sent; waiting for it to be mined.' : 'Paid but could not be delivered: a refund to the payer is owed and tracked until it is on chain.' } }
+  const notes = { refunded: 'Refunded: the transfer above is on chain.', refund_sent: 'Refund transaction sent; waiting for it to be confirmed on chain.',
+    refund_manual: 'Paid but could not be delivered: an operator is refunding it; tracked until the transfer is on chain.',
+    refund_due: 'Paid but could not be delivered: a refund to the payer is owed and tracked until it is on chain.' };
+  const refund = REFUND_STATES.includes(o.status)
+    ? { compensation: { status: o.status, owed_to: o.refund_to || refundTarget(o), amount_atomic: o.amount, refund_tx: o.refund_tx || null, refund_block: o.refund_block ?? null, refunded_at: o.refunded_at || null, note: notes[o.status] } }
     : {};
   return { order_id: o.id, status: o.status, resource: o.resource, amount_atomic: o.amount, payer: o.payer, scheme: o.scheme,
     transaction: o.tx, block: o.block, attempts: o.attempts, last_error: o.status === 'delivered' ? null : o.last_error,
     created_at: o.created_at, paid_at: o.paid_at, delivered_at: o.delivered_at, ...refund,
-    ...(o.status === 'void' ? { charged: false, note: 'This payment was never settled and its authorization has expired: you were not charged.' } : {}),
+    ...(o.status === 'void' ? { charged: false, note: 'This payment was never settled and can no longer be: you were not charged.' } : {}),
+    ...(o.status === 'refused' ? { charged: false, note: 'The facilitator refused this payment and it has not executed on chain. Send it again to retry.' } : {}),
     ...(o.status === 'paid' || o.status === 'settling' ? { retry: 'Send the same X-PAYMENT again (or GET this URL) to resume delivery. You will not be charged again.' } : {}) };
 }
 
 /**
- * makeGate({ orders, fac, log, chain, refunder }) → { handle(req, res, opts), status(id, send), sweep({produceFor}), recordRefund(id, tx) }
- *   opts: { requirements, inputs, produce(ctx) → goods, produceFirst=false, send(code, obj, headers) }
+ * makeGate({ orders, fac, log, chain, refunder }) → { handle, status, sweep, claimRefund, recordRefund, setRefunder }
+ *   handle opts: { requirements, inputs, produce(ctx) → goods, produceFirst=false, send(code, obj, headers) }
  *   produce(ctx): ctx = { order, aux, saveAux(obj) } — saveAux persists state a resumed attempt must reuse
- *                 (the storefront stores its upstream X-PAYMENT there so a retry re-uses the same upstream payment).
  *   fac(path, body) → facilitator JSON (throw = transient, e.g. network)
- *   chain (optional, lib/chain-recon.mjs makeChain): the seller's own settlement check — without it an ambiguous
- *         refusal still keeps the order, but nothing can prove "settled" or "never settled" except the facilitator.
- *   refunder (optional, makeRefunder): pays refund_due orders automatically; without it they are alerted until an
- *         operator records a refund that verifies on chain (recordRefund / scripts/orders-admin.mjs refund-record).
+ *   chain (lib/chain-recon.mjs makeChain): the seller's own settlement check; without it nothing is ever judged
+ *         "not charged" or "settled" except by the facilitator, and ambiguous orders simply stay kept.
+ *   refunder (makeRefunder): pays refund_due orders automatically, one at a time; without it they are alerted until an
+ *         operator claims and records a refund (orders-admin refund-claim / refund-record).
+ *   refundSources: allowed senders of a manual refund (empty = any sender, still one matching transfer after the obligation).
  */
 export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/', chain = null, refunder: refunder0 = null,
-  reconAfterMs = 120_000, refundAlertMs = 3600_000, alert = (m) => log(`ALERT ${m}`) }) {
+  reconAfterMs = 120_000, refundAlertMs = 3600_000, refundSources = [], alert = (m) => log(`ALERT ${m}`) }) {
   let refunder = refunder0;
   const locks = new Map(); // order id → promise (one resume at a time per order in this process)
   const withLock = async (id, fn) => {
@@ -117,25 +131,28 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
   const settleHeader = (o) => Buffer.from(JSON.stringify({ success: true, network: JSON.parse(o.settle || '{}').network, payer: o.payer, transaction: o.tx, blockNumber: o.block, orderId: o.id })).toString('base64');
   const hdrs = (o) => ({ 'X-ORDER-ID': o.id, 'X-ORDER-STATUS-URL': statusBase + o.id });
   const lastAlert = new Map();
+  const alertOnce = (id, msg) => { if (Date.now() - (lastAlert.get(id) || 0) > refundAlertMs) { lastAlert.set(id, Date.now()); alert(msg); } };
+  const history = (o, entry) => JSON.stringify([...(o.refund_history ? JSON.parse(o.refund_history) : []), { at: now(), ...entry }]);
+  const sec = (iso) => Math.floor(Date.parse(iso) / 1000) || 0;
 
   function paidFromChain(o, r, why) {
     const req = JSON.parse(o.payment).paymentRequirements || {};
     log(`order ${o.id}: settlement found on chain (tx ${r.tx}, block ${r.block}) after: ${why}`);
-    return orders.update(o.id, { status: 'paid', tx: r.tx, block: r.block, paid_at: now(), last_error: null,
+    return orders.transition(o.id, o.status, { status: 'paid', tx: r.tx, block: r.block, paid_at: now(), last_error: null,
       settle: JSON.stringify({ success: true, transaction: r.tx, blockNumber: r.block, network: req.network, payer: o.payer, recovered: 'chain' }),
-      recon: JSON.stringify({ at: now(), why, result: 'settled', tx: r.tx }) });
+      recon: JSON.stringify({ at: now(), why, result: 'settled', tx: r.tx }) }) || orders.get(o.id);
   }
 
-  /** the facilitator could not give a clean answer: ask the chain. Never drops an order whose outcome is unknown. */
+  /** ask the chain. Never drops an order whose outcome is not proven. */
   async function reconcileOrder(o, why) {
     if (!chain) return { o: orders.update(o.id, { last_error: `settlement outcome unknown: ${why} (order kept)` }), transient: true };
     let r;
     try { r = await chain.reconcile(o); }
-    catch (e) { return { o: orders.update(o.id, { last_error: `settlement outcome unknown: ${why}; chain check failed: ${e.message} (order kept)` }), transient: true }; }
+    catch (e) { return { o: orders.update(o.id, { last_error: `settlement outcome unknown: ${why}; chain: ${e.message} (order kept)` }), transient: true }; }
     if (r.state === 'settled') return { o: paidFromChain(o, r, why) };
     if (r.final) {
       log(`order ${o.id}: void — ${why}; ${r.reason}`);
-      return { o: orders.update(o.id, { status: 'void', last_error: `${why}; ${r.reason} — not charged`, recon: JSON.stringify({ at: now(), why, result: 'void' }) }), voided: true };
+      return { o: orders.transition(o.id, o.status, { status: 'void', last_error: `${why}; ${r.reason} — not charged`, recon: JSON.stringify({ at: now(), why, result: 'void' }) }) || orders.get(o.id), voided: true };
     }
     return { o: orders.update(o.id, { last_error: `${why}; ${r.reason} (order kept)` }), transient: true, unsettled: true };
   }
@@ -150,7 +167,7 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       return { o: orders.update(o.id, { last_error: why }), transient: true };
     }
     if (s && s.success) {
-      return { o: orders.update(o.id, { status: 'paid', tx: s.transaction, block: s.blockNumber ?? null, payer: s.payer ?? o.payer, settle: JSON.stringify(s), paid_at: now(), last_error: null }) };
+      return { o: orders.transition(o.id, 'settling', { status: 'paid', tx: s.transaction, block: s.blockNumber ?? null, payer: s.payer ?? o.payer, settle: JSON.stringify(s), paid_at: now(), last_error: null }) || orders.get(o.id) };
     }
     if (s && s.pending) {
       if (sweep && age > reconAfterMs) return reconcileOrder(o, 'settlement pending at the facilitator');
@@ -159,13 +176,13 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
     const reason = String(s?.error || 'settlement failed');
     if (chain) {
       const r = await reconcileOrder(o, `facilitator refused: ${reason}`);
-      if (!r.unsettled) return r;                      // settled (recovered), void, or unknown (kept)
-      // the chain confirms: no money moved and none has → a genuine refusal
-      return { o: orders.update(o.id, { status: 'failed', last_error: reason }), refused: reason };
+      if (!r.unsettled) return r;                      // settled (recovered), void, or unknown (kept as settling)
+      // proven not executed, but it still COULD execute (deadline not passed): keep it, watch the chain, never re-submit
+      return { o: orders.transition(o.id, 'settling', { status: 'refused', last_error: reason }) || orders.get(o.id), refused: reason };
     }
-    // no chain to ask: a refusal that also fits "already settled" is ambiguous → keep the order, never drop it
+    // no chain to ask: a refusal that also fits "already settled" is ambiguous → keep the order as settling
     if (CONSUMED_HINT.test(reason)) return { o: orders.update(o.id, { last_error: `settlement outcome unknown: ${reason} (order kept; configure the chain check to resolve it)` }), transient: true };
-    return { o: orders.update(o.id, { status: 'failed', last_error: reason }), refused: reason };
+    return { o: orders.transition(o.id, 'settling', { status: 'refused', last_error: reason }) || orders.get(o.id), refused: reason };
   }
 
   async function produceOrder(o, produce) {
@@ -173,21 +190,23 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
     const ctx = { order: o, aux, saveAux: (x) => { Object.assign(aux, x); orders.update(o.id, { aux: JSON.stringify(aux) }); } };
     try {
       const goods = await produce(ctx);
-      return orders.update(o.id, { status: 'delivered', goods: JSON.stringify(goods), delivered_at: now(), attempts: o.attempts + 1, last_error: null });
+      if (goods === undefined || goods === null) throw new Error('producer returned no goods');
+      if (typeof goods === 'object' && Object.prototype.hasOwnProperty.call(goods, 'error')) throw new Error(`producer returned an error instead of goods: ${String(goods.error).slice(0, 200)}`); // never store an error as delivered
+      return orders.transition(o.id, 'paid', { status: 'delivered', goods: JSON.stringify(goods), delivered_at: now(), attempts: o.attempts + 1, last_error: null }) || orders.get(o.id);
     } catch (e) {
       const attempts = o.attempts + 1;
       const old = Date.now() - Date.parse(o.paid_at || o.created_at) > orders.maxAgeMs;
       const giveUp = attempts >= orders.maxAttempts || old;
       log(`order ${o.id}: delivery attempt ${attempts} failed: ${e.message}${giveUp ? ' → refund_due' : ''}`);
-      return orders.update(o.id, { status: giveUp ? 'refund_due' : 'paid', attempts, last_error: String(e.message).slice(0, 300), ...(giveUp ? { refund_to: refundTarget(o) } : {}) });
+      return orders.transition(o.id, 'paid', { status: giveUp ? 'refund_due' : 'paid', attempts, last_error: String(e.message).slice(0, 300), ...(giveUp ? { refund_to: refundTarget(o), refund_due_at: now() } : {}) }) || orders.get(o.id);
     }
   }
 
   function respond(o, send, extra = {}) {
     if (o.status === 'delivered') return send(200, JSON.parse(o.goods), { 'X-PAYMENT-RESPONSE': settleHeader(o), ...hdrs(o), ...extra });
-    if (['refund_due', 'refund_sent', 'refunded'].includes(o.status)) return send(409, { error: `paid but not deliverable; refund ${o.status === 'refunded' ? 'completed' : 'in progress'}`, order: receipt(o) }, hdrs(o));
-    if (o.status === 'void') return send(402, { x402Version: 1, error: 'this payment was never settled and has expired; you were not charged', order: receipt(o) }, hdrs(o));
-    if (o.status === 'failed') return send(402, { x402Version: 1, error: `settlement failed: ${o.last_error}`, order: receipt(o) }, hdrs(o));
+    if (REFUND_STATES.includes(o.status)) return send(409, { error: `paid but not deliverable; refund ${o.status === 'refunded' ? 'completed' : 'in progress'}`, order: receipt(o) }, hdrs(o));
+    if (o.status === 'void') return send(402, { x402Version: 1, error: 'this payment was never settled and can no longer be; you were not charged', order: receipt(o) }, hdrs(o));
+    if (o.status === 'refused' || o.status === 'failed') return send(402, { x402Version: 1, error: `payment invalid: ${o.last_error}`, order: receipt(o) }, hdrs(o));
     // settling / paid: charged or maybe charged, goods not yet produced → retryable, never ask to pay again
     return send(503, { error: 'payment recorded, delivery not finished yet — retry with the same X-PAYMENT', order: receipt(o) }, { 'retry-after': '5', ...hdrs(o) });
   }
@@ -197,49 +216,68 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       const r = await settleOrder(o, body, opts);
       o = r.o;
       if (r.refused || r.transient || r.voided) return o;
-      if (produceFirst && o.goods) return orders.update(o.id, { status: 'delivered', delivered_at: now() });
+      if (produceFirst && o.goods && o.status === 'paid') return orders.transition(o.id, 'paid', { status: 'delivered', delivered_at: now() }) || orders.get(o.id);
     }
     if (o.status === 'paid') o = await produceOrder(o, produce);
     return o;
   }
 
-  // ---------- compensation: refund_due → refund_sent → refunded (verified on chain) ----------
+  // ---------- compensation ----------
   async function refundStep(o) {
     const to = o.refund_to || refundTarget(o);
+    const notBefore = sec(o.refund_due_at || o.paid_at || o.created_at);
     if (o.status === 'refund_due') {
-      if (refunder) {
+      if (refunder && chain) {
+        // one automatic refund in flight at a time: the hot wallet's nonces are never raced
+        if (orders.list('refund_sent', 500).some((x) => x.refund_raw)) return o;
         const p = await refunder.prepare(to, o.amount);
-        o = orders.update(o.id, { status: 'refund_sent', refund_to: to, refund_tx: p.tx, refund_raw: p.raw, refund_nonce: p.nonce, refund_at: now(), refund_by: `auto:${refunder.address}`, last_error: null });
-        log(`order ${o.id}: refund ${o.amount} → ${to} sent (tx ${p.tx})`);
-        await refunder.broadcast(p.raw).catch((e) => log(`order ${o.id}: refund broadcast failed, will retry: ${e.message}`));
-        return o;
+        const n = orders.transition(o.id, 'refund_due', { status: 'refund_sent', refund_to: to, refund_tx: p.tx, refund_raw: p.raw, refund_nonce: p.nonce, refund_at: now(), refund_by: `auto:${refunder.address}`, last_error: null,
+          refund_history: history(o, { event: 'prepared', tx: p.tx, nonce: p.nonce }) });
+        if (!n) return orders.get(o.id);                // someone else (an operator claim) moved it first
+        log(`order ${o.id}: refund ${o.amount} → ${to} sent (tx ${p.tx}, nonce ${p.nonce})`);
+        await refunder.broadcast(p.raw).catch((e) => log(`order ${o.id}: refund broadcast failed, will retry the same tx: ${e.message}`));
+        return n;
       }
-      const since = Date.parse(o.updated_at);
-      if (Date.now() - since > refundAlertMs && Date.now() - (lastAlert.get(o.id) || 0) > refundAlertMs) {
-        lastAlert.set(o.id, Date.now());
-        alert(`REFUND OVERDUE order ${o.id}: owes ${o.amount} (atomic) to ${to} since ${o.updated_at}; pay it and record it with: orders-admin refund-record ${o.id} <tx>`);
-      }
+      if (Date.now() - sec(o.refund_due_at || o.updated_at) * 1000 > refundAlertMs) alertOnce(o.id, `REFUND OVERDUE order ${o.id}: owes ${o.amount} (atomic) to ${to} since ${o.refund_due_at || o.updated_at}; claim it (orders-admin refund-claim ${o.id}), pay it, then orders-admin refund-record ${o.id} <tx>`);
       return o;
     }
-    if (o.status === 'refund_sent' && chain) {
-      let v = await chain.verifyRefund({ tx: o.refund_tx, to, minAmount: o.amount });
-      if (v.ok) { log(`order ${o.id}: refunded (tx ${o.refund_tx}, block ${v.block})`); return orders.update(o.id, { status: 'refunded', refund_block: v.block, refunded_at: now(), refund_raw: null, last_error: null }); }
-      if (v.pending && o.refund_raw && refunder) {
-        if (await chain.accountNonce(refunder.address) > Number(o.refund_nonce)) {
-          v = await chain.verifyRefund({ tx: o.refund_tx, to, minAmount: o.amount }); // mined in between?
-          if (v.ok) return orders.update(o.id, { status: 'refunded', refund_block: v.block, refunded_at: now(), refund_raw: null, last_error: null });
-          // our nonce was consumed by another transaction and ours never mined: it can never land → prepare a new one
-          return orders.update(o.id, { status: 'refund_due', refund_tx: null, refund_raw: null, refund_nonce: null, last_error: `refund tx ${o.refund_tx} was dropped` });
-        }
-        await refunder.broadcast(o.refund_raw).catch(() => {});
-        return o;
-      }
-      if (!v.ok && !v.pending) return orders.update(o.id, { status: 'refund_due', refund_tx: null, refund_raw: null, refund_nonce: null, last_error: `refund tx ${o.refund_tx} rejected: ${v.reason}` });
-      if (Date.now() - Date.parse(o.refund_at || o.updated_at) > refundAlertMs && Date.now() - (lastAlert.get(o.id) || 0) > refundAlertMs) {
-        lastAlert.set(o.id, Date.now()); alert(`REFUND NOT MINED order ${o.id}: tx ${o.refund_tx} still pending`);
-      }
+    if (o.status === 'refund_manual') {
+      if (Date.now() - sec(o.updated_at) * 1000 > refundAlertMs) alertOnce(o.id, `REFUND CLAIMED BUT NOT RECORDED order ${o.id}: owes ${o.amount} to ${to}; record the transfer with orders-admin refund-record ${o.id} <tx>`);
+      return o;
     }
+    if (o.status !== 'refund_sent' || !chain) return o;
+    const v = await chain.verifyRefund({ tx: o.refund_tx, to, minAmount: o.amount, notBefore, allowedFrom: o.refund_raw ? null : (refundSources.length ? refundSources : null) });
+    if (v.ok) {
+      log(`order ${o.id}: refunded (tx ${o.refund_tx}, block ${v.block})`);
+      return orders.transition(o.id, 'refund_sent', { status: 'refunded', refund_block: v.block, refund_from: v.from, refunded_at: now(), refund_raw: null, last_error: null, refund_history: history(o, { event: 'confirmed', tx: o.refund_tx, block: v.block }) }) || orders.get(o.id);
+    }
+    if (!o.refund_raw) {
+      // operator-recorded refund: never reset automatically (that could lead to paying twice) — alert until it resolves
+      if (v.reverted || (!v.pending && !v.unknown)) alertOnce(o.id, `REFUND TX NOT VALID order ${o.id}: ${o.refund_tx}: ${v.reason}; fix with orders-admin`);
+      else if (Date.now() - sec(o.refund_at || o.updated_at) * 1000 > refundAlertMs) alertOnce(o.id, `REFUND NOT CONFIRMED order ${o.id}: ${o.refund_tx} ${v.reason}`);
+      return o;
+    }
+    // our own signed refund that is not confirmed (yet)
+    if (v.reverted) return redoRefund(o, `refund tx ${o.refund_tx} reverted`);       // a mined, failed tx paid nothing
+    if (v.ok === false && !v.pending && !v.unknown) return redoRefund(o, `refund tx ${o.refund_tx} does not pay the order: ${v.reason}`);
+    const acct = refunder ? await chain.accountNonce(refunder.address, 'latest') : 0;
+    if (refunder && acct > Number(o.refund_nonce)) {
+      // our nonce is consumed. By our tx (receipt not visible yet) or by another one? Never guess: look for the transfer itself.
+      const again = await chain.verifyRefund({ tx: o.refund_tx, to, minAmount: o.amount, notBefore });
+      if (again.ok) return orders.transition(o.id, 'refund_sent', { status: 'refunded', refund_block: again.block, refund_from: again.from, refunded_at: now(), refund_raw: null, last_error: null, refund_history: history(o, { event: 'confirmed', tx: o.refund_tx, block: again.block }) }) || orders.get(o.id);
+      const t = await chain.findTransfer({ from: refunder.address, to, minAmount: o.amount, sinceTs: sec(o.refund_at || o.updated_at) });
+      if (t) return orders.transition(o.id, 'refund_sent', { status: 'refunded', refund_tx: t.tx, refund_block: t.block, refund_from: refunder.address, refunded_at: now(), refund_raw: null, last_error: null,
+        refund_history: history(o, { event: 'confirmed-by-transfer', tx: t.tx, block: t.block, replaced: o.refund_tx }) }) || orders.get(o.id);
+      return redoRefund(o, `refund tx ${o.refund_tx} was never mined and its nonce ${o.refund_nonce} is used by another transaction`);
+    }
+    // still possible to land: re-broadcast the SAME signed bytes, never a new refund
+    if (refunder) await refunder.broadcast(o.refund_raw).catch(() => {});
+    if (Date.now() - sec(o.refund_at || o.updated_at) * 1000 > refundAlertMs) alertOnce(o.id, `REFUND NOT MINED order ${o.id}: tx ${o.refund_tx} (${v.reason})`);
     return o;
+  }
+  function redoRefund(o, why) {
+    log(`order ${o.id}: ${why} — a new refund will be prepared`);
+    return orders.transition(o.id, 'refund_sent', { status: 'refund_due', refund_tx: null, refund_raw: null, refund_nonce: null, last_error: why, refund_history: history(o, { event: 'abandoned', tx: o.refund_tx, why }) }) || orders.get(o.id);
   }
 
   return {
@@ -251,8 +289,12 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       const body = { paymentPayload: pp, paymentRequirements: requirements };
 
       let o = orders.byKey(key);
+      // a refused (never executed) attempt does not own its nonce: a corrected payment with the same nonce replaces it
+      if (o && (o.status === 'refused' || o.status === 'failed') && o.payload_hash !== hash) { orders.db.prepare('DELETE FROM orders WHERE id = ? AND status = ?').run(o.id, o.status); o = null; }
       if (o && o.payload_hash !== hash) return send(409, { x402Version: 1, error: 'this authorization (nonce) already belongs to a different payment', accepts: [requirements] });
       if (o && o.resource !== requirements.resource) return send(409, { error: 'this payment was made for a different resource', order: receipt(o) }, hdrs(o));
+      // the buyer sends a refused payment again (e.g. after a top-up): evaluate it once more
+      if (o && (o.status === 'refused' || o.status === 'failed')) o = orders.transition(o.id, o.status, { status: 'settling' }) || orders.get(o.id);
 
       if (!o) {
         let v;
@@ -272,12 +314,6 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       }
       const redelivery = o.status === 'delivered';
       o = await withLock(o.id, async () => advance(orders.get(o.id), body, produce, produceFirst));
-      if (o.status === 'failed') {
-        // refused, and (when a chain check is configured) confirmed unsettled on chain: no money moved. Drop the row so a
-        // later retry is evaluated fresh (e.g. after a top-up) and the payment key is never squatted by a refused attempt.
-        orders.db.prepare('DELETE FROM orders WHERE id = ? AND status = ?').run(o.id, 'failed');
-        return send(402, { x402Version: 1, error: `payment invalid: ${o.last_error}`, accepts: [requirements] });
-      }
       if (o.status === 'delivered') { log(`order ${o.id} ${redelivery ? 're-delivered' : 'delivered'} (tx ${o.tx})`); if (!redelivery && onDelivered) { try { onDelivered(o); } catch (e) { log(`onDelivered: ${e.message}`); } } }
       return respond(o, send, redelivery ? { 'X-REDELIVERY': 'true' } : {});
     },
@@ -290,7 +326,7 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       return send(200, receipt(o));
     },
 
-    /** Background work: resume orders a crashed/abandoned request left behind, reconcile unknown outcomes, drive refunds. */
+    /** Background work: resume abandoned orders, reconcile unproven outcomes, watch refused ones, drive refunds. */
     async sweep({ produceFor, olderThanMs = 30_000 }) {
       for (const st of ['settling', 'paid']) {
         for (const row of orders.list(st, 50)) {
@@ -305,7 +341,17 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
           });
         }
       }
-      for (const st of ['refund_due', 'refund_sent']) {
+      // refused: read-only chain watch — executed after all (someone else relayed it) → paid → delivered; can never execute → void
+      if (chain) for (const row of orders.list('refused', 50)) {
+        if (Date.now() - Date.parse(row.updated_at) < olderThanMs) continue;
+        await withLock(row.id, async () => {
+          const o = orders.get(row.id); if (o.status !== 'refused') return;
+          const r = await reconcileOrder(o, `refused by the facilitator (${o.last_error})`);
+          if (r.o.status === 'paid') { const produce = produceFor(r.o); if (produce) await produceOrder(r.o, produce); }
+          else if (r.o.status === 'refused') orders.update(o.id, { last_error: o.last_error }); // bump updated_at: next check later
+        });
+      }
+      for (const st of ['refund_due', 'refund_manual', 'refund_sent']) {
         for (const row of orders.list(st, 50)) {
           try { await withLock(row.id, async () => refundStep(orders.get(row.id))); }
           catch (e) { log(`order ${row.id}: refund step failed: ${e.message}`); }
@@ -313,20 +359,32 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       }
     },
 
-    /** An operator paid a refund by hand: accept it only if the chain shows the transfer to the payer. */
+    /** An operator takes over a refund: the automatic refunder will not touch it. */
+    async claimRefund(id, by = 'operator') {
+      return withLock(id, async () => {
+        const o = orders.get(id); if (!o) throw new Error('unknown order');
+        const n = orders.transition(id, 'refund_due', { status: 'refund_manual', refund_by: by, last_error: null, refund_history: history(o, { event: 'claimed', by }) });
+        if (!n) throw new Error(`order is ${o.status}, not refund_due`);
+        return n;
+      });
+    },
+    /** The operator paid: accept it only if the chain shows ONE transfer to the payer, after the obligation, from an allowed sender. */
     async recordRefund(id, tx, by = 'operator') {
       if (!chain) throw new Error('no chain configured: a refund can only be recorded once it is verified on chain');
+      tx = String(tx).toLowerCase();
       return withLock(id, async () => {
         const o = orders.get(id);
         if (!o) throw new Error('unknown order');
-        if (o.status !== 'refund_due') throw new Error(`order is ${o.status}, not refund_due`);
+        if (o.status !== 'refund_manual') throw new Error(`order is ${o.status}; claim it first (refund-claim), so the automatic refunder cannot pay it too`);
         const to = o.refund_to || refundTarget(o);
-        const v = await chain.verifyRefund({ tx, to, minAmount: o.amount });
+        const v = await chain.verifyRefund({ tx, to, minAmount: o.amount, notBefore: sec(o.refund_due_at || o.paid_at || o.created_at), allowedFrom: refundSources.length ? refundSources : null });
         if (!v.ok && !v.pending) throw new Error(`refund not accepted: ${v.reason}`);
         try {
-          return v.ok
-            ? orders.update(id, { status: 'refunded', refund_to: to, refund_tx: tx, refund_block: v.block, refund_at: now(), refunded_at: now(), refund_by: by, last_error: null })
-            : orders.update(id, { status: 'refund_sent', refund_to: to, refund_tx: tx, refund_at: now(), refund_by: by, last_error: null });
+          const n = v.ok
+            ? orders.transition(id, 'refund_manual', { status: 'refunded', refund_to: to, refund_tx: tx, refund_block: v.block, refund_from: v.from, refund_at: now(), refunded_at: now(), refund_by: by, last_error: null, refund_history: history(o, { event: 'recorded', tx, block: v.block, from: v.from }) })
+            : orders.transition(id, 'refund_manual', { status: 'refund_sent', refund_to: to, refund_tx: tx, refund_at: now(), refund_by: by, last_error: null, refund_history: history(o, { event: 'recorded-pending', tx }) });
+          if (!n) throw new Error('order changed while recording; try again');
+          return n;
         } catch (e) { if (/UNIQUE/.test(e.message)) throw new Error('that transaction is already recorded as the refund of another order'); throw e; }
       });
     },

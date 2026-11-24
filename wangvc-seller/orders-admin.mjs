@@ -4,9 +4,12 @@
 //   node orders-admin.mjs show    --db <orders.db> <order_id>
 //   node orders-admin.mjs refunds --db <orders.db>                       every order owed / being / already refunded, with age
 //   node orders-admin.mjs retry   --db <orders.db> <order_id>            refund_due → paid (delivery is retried; only before any refund was sent)
+//   node orders-admin.mjs refund-claim  --db <orders.db> <order_id>       take a refund_due order over (→ refund_manual): the
+//        automatic refunder will not pay it. Do this BEFORE paying by hand, so the order cannot be refunded twice.
 //   node orders-admin.mjs refund-record --db <orders.db> --cfg <dfmi.json> <order_id> <refund_tx>
-//        record a refund paid by hand. Accepted only if the chain shows a dUSD transfer of at least the order amount
-//        to the payer (mined → refunded; still pending → refund_sent, the seller's sweeper confirms it later).
+//        record the refund you paid. Accepted only if the chain shows ONE dUSD transfer of at least the order amount to
+//        the payer, mined after the order became refundable (and, with REFUND_SOURCES set, from an allowed sender).
+//        Mined → refunded; still pending → refund_sent (the seller's sweeper confirms it later).
 // Exit code of `refunds`: 1 while any refund is owed for longer than --max-age-h (default 24), so cron/monitoring can page.
 import { readFileSync } from 'node:fs';
 import { openOrders, makeGate, refundTarget } from './x402-lib/orders.mjs';
@@ -16,7 +19,8 @@ const opt = (n, d) => { const i = args.indexOf(n); return i > -1 ? args.splice(i
 const dbFile = opt('--db'); const status = opt('--status', null); const limit = Number(opt('--limit', 50));
 const cfgFile = opt('--cfg', null); const maxAgeH = Number(opt('--max-age-h', 24));
 const [cmd, id, extra] = args;
-if (!dbFile || !cmd) { console.error('usage: orders-admin.mjs list|show|refunds|retry|refund-record --db <orders.db> …'); process.exit(2); }
+if (!dbFile || !cmd) { console.error('usage: orders-admin.mjs list|show|refunds|retry|refund-claim|refund-record --db <orders.db> …'); process.exit(2); }
+const SOURCES = String(process.env.REFUND_SOURCES || '').split(',').map((s) => s.trim()).filter(Boolean);
 const orders = openOrders(dbFile);
 const db = orders.db;
 const pub = (o) => ({ id: o.id, status: o.status, resource: o.resource, payer: o.payer, amount: o.amount, tx: o.tx, attempts: o.attempts, last_error: o.last_error,
@@ -31,23 +35,27 @@ if (cmd === 'list') {
 } else if (cmd === 'show') {
   const o = orders.get(id); console.log(o ? JSON.stringify(pub(o), null, 1) : 'not found');
 } else if (cmd === 'refunds') {
-  const rows = db.prepare(`SELECT * FROM orders WHERE status IN ('refund_due','refund_sent','refunded') ORDER BY status, updated_at`).all();
+  const rows = db.prepare(`SELECT * FROM orders WHERE status IN ('refund_due','refund_manual','refund_sent','refunded') ORDER BY status, updated_at`).all();
   let overdue = 0;
   for (const o of rows) {
     const ageH = (Date.now() - Date.parse(o.status === 'refunded' ? o.refunded_at || o.updated_at : o.updated_at)) / 3600_000;
     if (o.status !== 'refunded' && ageH > maxAgeH) overdue++;
     console.log(`${o.status.padEnd(11)} ${o.id}  owes ${o.amount} → ${o.refund_to || refundTarget(o)}  ${o.refund_tx ? 'tx ' + o.refund_tx : 'no refund tx yet'}  ${o.status === 'refunded' ? 'done ' + o.refunded_at : `open ${ageH.toFixed(1)} h`}`);
   }
-  const c = Object.fromEntries(db.prepare(`SELECT status, COUNT(*) n FROM orders WHERE status IN ('refund_due','refund_sent','refunded') GROUP BY status`).all().map((r) => [r.status, r.n]));
-  console.error(`refund_due=${c.refund_due || 0} refund_sent=${c.refund_sent || 0} refunded=${c.refunded || 0} overdue(>${maxAgeH}h)=${overdue}`);
+  const c = Object.fromEntries(db.prepare(`SELECT status, COUNT(*) n FROM orders WHERE status IN ('refund_due','refund_manual','refund_sent','refunded') GROUP BY status`).all().map((r) => [r.status, r.n]));
+  console.error(`refund_due=${c.refund_due || 0} refund_manual=${c.refund_manual || 0} refund_sent=${c.refund_sent || 0} refunded=${c.refunded || 0} overdue(>${maxAgeH}h)=${overdue}`);
   process.exitCode = overdue ? 1 : 0;
 } else if (cmd === 'retry') {
   const r = db.prepare(`UPDATE orders SET status='paid', attempts=0, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'refund_due' AND refund_tx IS NULL`).run(id);
   console.log(r.changes ? 'requeued for delivery' : 'not in refund_due (or a refund was already sent)');
+} else if (cmd === 'refund-claim') {
+  const gate = makeGate({ orders, fac: null });
+  try { const o = await gate.claimRefund(id, 'operator'); console.log(`claimed: order ${o.id} is refund_manual; pay ${o.amount} (atomic) to ${o.refund_to || refundTarget(o)}, then refund-record`); }
+  catch (e) { console.error(`rejected: ${e.message}`); process.exitCode = 1; }
 } else if (cmd === 'refund-record') {
   if (!cfgFile) { console.error('refund-record needs --cfg <dfmi.json> (rpc + token) to verify the refund on chain'); process.exit(2); }
   const cfg = JSON.parse(readFileSync(cfgFile, 'utf8'));
-  const gate = makeGate({ orders, fac: null, chain: makeChain({ rpc: cfg.rpc, token: cfg.token, insecure: !!cfg.insecure }) });
+  const gate = makeGate({ orders, fac: null, chain: makeChain({ rpc: cfg.rpc, token: cfg.token, insecure: !!cfg.insecure }), refundSources: SOURCES });
   try {
     const o = await gate.recordRefund(id, extra, 'operator');
     console.log(`${o.status}: order ${o.id} refund tx ${o.refund_tx}${o.refund_block ? ' (block ' + o.refund_block + ')' : ' (pending; the seller confirms it once mined)'}`);
