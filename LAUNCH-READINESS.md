@@ -2,13 +2,13 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3).
 
 | # | Issue | Status |
 |---|---|---|
 | 1 | Placeholders in the Terms of Service (governing law, courts or arbitration) | **Fixed** |
 | 2 | The privacy policy does not match what the pages store | **Fixed** |
-| 3 | Server-side sign-in: replay, expiry and invalidation | **Fixed** (session invalidation added). Passkey verification on the server remains open; see below. |
+| 3 | Server-side sign-in: replay, expiry and invalidation | **Fixed** (session invalidation added; passkeys verified on the server since 25 November) |
 | 4 | Private keys in the browser wallet | **Fixed** (decrypted keys are no longer written to storage) |
 | 5 | Payment failures, monitoring, rate limits, backup restore, load testing | **Evidence below** |
 
@@ -20,7 +20,7 @@ The reviewer re-checked the live pages at 7:08 PM. Our response to each point:
 |---|---|
 | Terms and Privacy still have placeholders | The corrected pages went live at 7:01 PM; the re-check most likely read a cached copy (cause and fix below). |
 | Privacy Policy does not cover encrypted keys, passkey bindings or session tokens | Section 3 has listed all three since 4:43 PM: wallets saved encrypted with the user's password, passkey public keys and their address bindings, and the mail session token. |
-| Identity page says a production deployment should verify on the server | The sentence is replaced (7:24 PM). See item 3. |
+| Identity page says a production deployment should verify on the server | The sentence was replaced (7:24 PM), and since 25 November, 8:05 AM, passkeys are verified on the server. See item 3. |
 | Faucet buy page asks for a one-time wallet's private key | Changed (7:25 PM): buyers choose a wallet instead. See item 4. |
 | Console keeps an encrypted private key in the browser | That is the design. See item 4. |
 | Duplicate charges, failed delivery, backup restore, load | These cannot be seen on the public pages. The evidence is in item 5, and the checks marked "you can run" there work from anywhere. |
@@ -100,13 +100,29 @@ The 14 server cases cover:
 
 No email was sent.
 
-**Identity page.** Passkeys on identity.dfmi.app are verified in the browser only. That page is a demonstration: no dfmi service accepts a passkey for sign-in, and a passkey sign-in there cannot be exchanged for a service session.
+**Passkeys are verified on the server (25 November, 8:05 AM).** Passkeys on identity.dfmi.app used to be checked only by the page itself, so they could not be trusted for a real sign-in. The mail server now registers and verifies them, and the identity page uses it.
+- Every registration and sign-in uses a challenge the server generated: single use, valid for 2 minutes.
+- Before it issues a session, the server verifies the authenticator's response: the origin, the RP ID, the challenge, user presence, the signature against the public key stored at registration, and the signature counter. A counter that goes backwards, as from a cloned authenticator, is refused.
+- The server stores only the passkey's public key, credential ID, bound address and counter. The browser keeps no passkey data.
+- A passkey can be added or removed only by a session proved by a wallet signature. A passkey session cannot add passkeys or remove the owner's.
+- "Sign out on all devices" also ends passkey sessions. Sending mail still requires a wallet signature.
+- Verification uses a standard WebAuthn library. The Privacy Policy (section 2) describes what is stored.
 
-Its notice used to say that "a production deployment should additionally have the server generate nonces and verify signatures and passkey assertions". Since 7:24 PM it says what is true:
-- sign-ins on that page are a demonstration and give access to nothing;
-- signing in to a real dfmi service is done by that service's server: the mail service issues a single-use challenge that expires after 2 minutes, verifies the wallet signature on the server, and can revoke sessions.
+**Tests.** A software authenticator produced real WebAuthn responses for these tests.
 
-**Open.** If passkeys are ever used for a real sign-in, the server must verify the assertion first.
+| Test | Result |
+|---|---|
+| Server, 25 checks: registration, sign-in with and without an address, replay, a response for another challenge, a tampered signature, another origin, another RP ID, a counter going backwards, an unknown passkey, permissions, removal, restart, sign out on all devices | all pass. The previous server fails 20 of them, because it had no such endpoints. |
+| The real identity page with the real server, 8 checks, including a forged assertion | all pass |
+| The earlier session tests (14) and the TLS test (3) | still pass |
+
+**Live check (8:07 AM).** Against the public API, a throwaway wallet and the software authenticator:
+- registered a passkey and signed in with it; the session worked;
+- a forged signature, a replayed response, a request from another site, and a passkey session removing a passkey were all refused.
+
+The test passkey was then removed, and all of that address's sessions were ended.
+
+The identity page's notice describes this. Key sign-ins on that page on their own remain a demonstration.
 
 ## 4. Private keys stay in memory
 
