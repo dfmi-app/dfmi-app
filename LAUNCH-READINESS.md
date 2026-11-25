@@ -2,19 +2,42 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific.
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm).
 
 | # | Issue | Status |
 |---|---|---|
-| 1 | Placeholders in the Terms of Service (governing law, courts or arbitration) | **Open.** This is a legal decision, and it is pending. |
+| 1 | Placeholders in the Terms of Service (governing law, courts or arbitration) | **Fixed** |
 | 2 | The privacy policy does not match what the pages store | **Fixed** |
 | 3 | Server-side sign-in: replay, expiry and invalidation | **Fixed** (session invalidation added). Passkey verification on the server remains open; see below. |
 | 4 | Private keys in the browser wallet | **Fixed** (decrypted keys are no longer written to storage) |
 | 5 | Payment failures, monitoring, rate limits, backup restore, load testing | **Evidence below** |
 
-## 1. Terms of Service placeholders: open
+## Follow-up review, 7:08 PM
 
-Section 15 of the Terms, and section 10 of the Privacy Policy, still contain `[GOVERNING JURISDICTION]` placeholders. Choosing the governing law and the venue (courts or individual arbitration) is a legal decision, not an engineering one. It will be made with counsel, and the text will be updated in English and Chinese together.
+The reviewer re-checked the live pages at 7:08 PM. Our response to each point:
+
+| Point | Response |
+|---|---|
+| Terms and Privacy still have placeholders | The corrected pages went live at 7:01 PM; the re-check most likely read a cached copy (cause and fix below). |
+| Privacy Policy does not cover encrypted keys, passkey bindings or session tokens | Section 3 has listed all three since 4:43 PM: wallets saved encrypted with the user's password, passkey public keys and their address bindings, and the mail session token. |
+| Identity page says a production deployment should verify on the server | The sentence is replaced (7:24 PM). See item 3. |
+| Faucet buy page asks for a one-time wallet's private key | Changed (7:25 PM): buyers choose a wallet instead. See item 4. |
+| Console keeps an encrypted private key in the browser | That is the design. See item 4. |
+| Duplicate charges, failed delivery, backup restore, load | These cannot be seen on the public pages. The evidence is in item 5, and the checks marked "you can run" there work from anywhere. |
+
+**Why the old pages were seen.** HTML was sent without a `Cache-Control` header, so browsers and fetching tools chose their own cache lifetime from the `Last-Modified` date. The previous Terms dated from October, so a cache could keep serving that copy for days after an update.
+
+**Change (7:24 PM).** Every HTML page on dfmi.app and its static subdomains is now sent with `Cache-Control: no-cache`. A client revalidates on every load, and gets a `304` when nothing changed. Scripts, images and JSON are unchanged. Also, `/terms`, `/privacy` and `/legal` now serve those pages; before, they served the home page.
+
+You can check it yourself: `curl -sI https://dfmi.app/terms.html` shows `Cache-Control: no-cache`. A reload that bypasses the cache shows section 15 with no placeholders.
+
+## 1. Terms of Service placeholders: fixed
+
+The bracketed placeholders are gone from both documents, in English and Chinese:
+- **Terms, section 15** (<https://dfmi.app/terms.html>): the Terms are governed by the laws of the State of California, United States. Disputes are resolved exclusively in the state or federal courts located in San Francisco County, California. The class-action waiver is unchanged.
+- **Privacy Policy, section 10** (<https://dfmi.app/privacy.html>): the Service is operated and hosted in the United States.
+
+No other page on the site has a placeholder; every public docroot was searched for them.
 
 ## 2. Privacy policy matches what the pages do
 
@@ -65,7 +88,13 @@ The 14 server cases cover:
 
 **Live check, 5:04 PM.** A throwaway key ran the whole flow against the public API, and all 7 steps passed: sign in, sign out (token rejected), two sessions, sign out on all devices (both rejected), and signing in again. No payment was involved.
 
-**Open.** Passkeys on identity.dfmi.app are verified in the browser only. That page is a demonstration and is not used to sign in to any service. If passkeys are ever used for a real sign-in, the server must verify the assertion.
+**Identity page.** Passkeys on identity.dfmi.app are verified in the browser only. That page is a demonstration: no dfmi service accepts a passkey for sign-in, and a passkey sign-in there cannot be exchanged for a service session.
+
+Its notice used to say that "a production deployment should additionally have the server generate nonces and verify signatures and passkey assertions". Since 7:24 PM it says what is true:
+- sign-ins on that page are a demonstration and give access to nothing;
+- signing in to a real dfmi service is done by that service's server: the mail service issues a single-use challenge that expires after 2 minutes, verifies the wallet signature on the server, and can revoke sessions.
+
+**Open.** If passkeys are ever used for a real sign-in, the server must verify the assertion first.
 
 ## 4. Private keys stay in memory
 
@@ -76,6 +105,15 @@ The 14 server cases cover:
 - A key left in a tab by an older version is deleted as soon as the page loads, and is never used.
 - The identity page's notice now describes this correctly. It also lists the page's network calls accurately: before, it claimed the only calls were read-only RPC.
 - The identity page now loads ethers with a Subresource Integrity hash, which the other pages already had.
+
+**Faucet buy flow (7:25 PM).** The buy step on faucet.dfmi.app used to ask the user to paste a one-time wallet's private key. Now it has a **Choose a wallet** button, which opens the same picker the other dfmi pages use:
+- a browser wallet (MetaMask and similar), which the page switches to the dfmi chain before signing;
+- a dfmi wallet saved encrypted in that browser;
+- a keystore file.
+
+The wallet generated in step 1 is selected automatically, and its key is held in the page's memory only. Pasting a throwaway key is kept only as a collapsed advanced option, for keys generated offline with the command-line tool; the field is cleared as soon as the key is read. Only the payment signature is ever sent.
+
+**Why the console keeps an encrypted key.** The owner console is where a user creates or imports the owner key of their on-chain wallet. It saves that key in the browser in the standard Ethereum keystore format, encrypted with the user's password. It is decrypted only in the page's memory after the password is entered, and is never sent to a server. A user who clears site data loses that copy, so the console asks them to keep the recovery phrase or a backup file. Privacy Policy section 3 describes this storage.
 
 Unchanged and already in place:
 - Wallets saved in the browser use the standard Ethereum keystore format, encrypted with the user's password.
@@ -88,6 +126,7 @@ Unchanged and already in place:
 |---|---|---|
 | Identity, console and wallet app, 12 checks | 9 fail | all pass |
 | Points page | — | loads without errors, and the old key is deleted |
+| Faucet buy flow, 6 checks (each way to pay, no key left in any field or in storage, nothing paid without a wallet) | 6 fail | all pass |
 
 The 12 checks are: the old key is deleted, it is not used to sign in, password unlock still works, and no key is in storage after unlocking.
 
@@ -125,7 +164,30 @@ Alerting rules:
 - When it passes again, a recovery message is sent.
 - A daily heartbeat means that silence would show the monitor itself had stopped.
 
-The alert path was drilled end to end: a simulated failure produced an alert, then a recovery message. The first real run passed 37 of 37 checks. It also found one stale catalog entry: a resource that was re-registered under a new id in August. That entry is kept because the catalog is built from settlement history, and payment records are never deleted.
+The alert path was drilled end to end: a simulated failure produced an alert, then a recovery message. The first real run passed 37 of 37 checks. It also found one stale catalog entry: a resource that was re-registered under a new id in August, which now answers `404`. That led to the catalog fix below.
+
+### Catalog: resources that no longer exist are hidden
+
+The payment catalog is built from settlement history, and payment records are never deleted, so a resource that was retired stayed listed. Buyers and agents read the catalog to find sellers.
+
+**Change.** The facilitator now probes every listed resource with an unpaid request every 10 minutes.
+- A resource is hidden from `/catalog` only after it answers `404` or `410` twice in a row.
+- A timeout or a `5xx` error never hides an entry, and never brings a hidden one back. An outage is not a removal.
+- A hidden resource is listed again as soon as it answers `402` again, or a payment to it settles.
+- The settlement history is not modified. `/catalog?all=1` returns every entry, with the hidden ones marked `inactive`, and when and why they were hidden.
+- The hidden state is kept across restarts. The format of `/catalog` is unchanged, so the pages and agents that read it need no change.
+- Only the service's own domain is probed.
+
+**Tests.** Six cases against local stand-in sellers that answer `402`, `404`, `410` and `503`, never answer, or come back after being hidden. The facilitator that was live before the change fails 4 of them; the new one passes all 6. The existing facilitator regression suite (10 cases) and the wallet end-to-end tests (3) still pass.
+
+**Live check.** Deployed at 7:02 PM. The first probe, at 7:03 PM, recorded one `404` for the retired resource. The second, at 7:12 PM, hid it:
+- `/catalog` went from 8 entries to 7;
+- `/catalog?all=1` still returns all 8, with that one marked `inactive` (`404`);
+- the settlement history file is unchanged.
+
+The monitor's exception for that entry was removed, and the monitor passes 37 of 37 checks.
+
+You can run: `curl -s https://facilitator.dfmi.app/catalog` and `curl -s 'https://facilitator.dfmi.app/catalog?all=1'`.
 
 ### Rate limiting, verified on the live site
 
@@ -135,6 +197,8 @@ Every seller limits each client IP to 60 requests per minute, with a burst of 20
 |---|---|
 | 30 unpaid requests to the market-report seller | 21 × `402`, then 9 × `429` with `Retry-After: 1` |
 | 30 unpaid requests to the wangvc-seller `/signals` | 21 × `402`, then 9 × `429` with `Retry-After: 1` |
+
+You can run the same check: send about 30 quick unpaid requests to `https://producer.dfmi.app/market-report`. The first ones answer `402`, and once the burst is used up they answer `429`.
 
 ### Load tests
 
