@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3).
 
 | # | Issue | Status |
 |---|---|---|
@@ -87,6 +87,18 @@ The 14 server cases cover:
 - an object-storage outage fails closed.
 
 **Live check, 5:04 PM.** A throwaway key ran the whole flow against the public API, and all 7 steps passed: sign in, sign out (token rejected), two sessions, sign out on all devices (both rejected), and signing in again. No payment was involved.
+
+**TLS certificate verification (7:58 PM).** The mail server had turned off TLS certificate verification for all of its outgoing connections. Those connections go to the dfmi chain node, which resolves `.dfmi` names to wallet addresses, and to the cloud email and storage services. With verification off, anyone able to intercept that traffic could have impersonated the node, for example to map a name to the wrong wallet.
+
+**Change.** Verification is on, with the system's default certificate authorities. Before the change, each endpoint the server uses was checked from the server host and passed with verification on.
+
+**Tests.** A stand-in chain node presented a self-signed certificate. The old server sent it 12 requests at startup; the new server sent none, and still worked once that certificate was trusted. The 14 session tests above still pass.
+
+**Live check.** After the restart:
+- the server resolved `.dfmi` names through the node, with no certificate errors in its log;
+- a throwaway key signed in, looked up a `.dfmi` name, signed out, and its token was then rejected.
+
+No email was sent.
 
 **Identity page.** Passkeys on identity.dfmi.app are verified in the browser only. That page is a demonstration: no dfmi service accepts a passkey for sign-in, and a passkey sign-in there cannot be exchanged for a service session.
 
