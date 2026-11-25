@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4).
 
 | # | Issue | Status |
 |---|---|---|
@@ -118,6 +118,8 @@ Its notice used to say that "a production deployment should additionally have th
 - The identity page's notice now describes this correctly. It also lists the page's network calls accurately: before, it claimed the only calls were read-only RPC.
 - The identity page now loads ethers with a Subresource Integrity hash, which the other pages already had.
 
+**Wallet app Send (9:29 PM).** The Send page of wallet.dfmi.app took the transaction nonce when the preview opened, and counted only confirmed transactions. A second transfer previewed while the first was unconfirmed reused its nonce and was rejected by the node; no funds were lost. The nonce is now taken when the user confirms, and counts pending transactions. A jsdom test replays that sequence: the old page fails and the new one passes.
+
 **Faucet buy flow (7:25 PM).** The buy step on faucet.dfmi.app used to ask the user to paste a one-time wallet's private key. Now it has a **Choose a wallet** button, which opens the same picker the other dfmi pages use:
 - a browser wallet (MetaMask and similar), which the page switches to the dfmi chain before signing;
 - a dfmi wallet saved encrypted in that browser;
@@ -154,6 +156,27 @@ The regression suite covers these. They are described in this branch's earlier c
 - refunds are tracked to completion, and are never sent twice;
 - revoked or deactivated agents are refused at settlement;
 - the services recover after a crash.
+
+### Automatic refunds (9:29 PM)
+
+A refund is owed when an order was charged but could still not be delivered after retrying for about 24 hours. Until now an owed refund was recorded and alerted, and an operator paid it by hand.
+
+**Change.** The market-report seller, which takes almost all of the paid traffic, now pays owed refunds by itself:
+- the money comes from a dedicated refund wallet, used by that one seller process only;
+- refunds are paid one at a time, and each signed transaction is stored before it is broadcast, so a crash can only re-send the same transaction, never a second refund;
+- an order is marked refunded only once the transfer is confirmed on chain.
+
+The other sellers keep the manual process, with an alert after 1 hour.
+
+**Tests.** The refund path is exercised end to end on a local chain: an undeliverable order is refunded automatically and verified on chain, the buyer is made whole, and a retry never delivers or charges again. The 6 order-recovery tests pass.
+
+**Live check.** After the restart:
+- the seller's log confirms the automatic refunder is active;
+- unpaid requests still get `402`.
+
+No refund was triggered on purpose, and none was owed: since order tracking started, every order of every seller was delivered.
+
+**Monitoring.** A new check alerts when the refund wallet runs low on dUSD, or on the native coin that pays the fees. The monitor now passes 38 of 38 checks.
 
 ### Monitoring and alerting
 
