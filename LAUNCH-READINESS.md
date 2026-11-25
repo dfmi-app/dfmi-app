@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)). That afternoon we added tools for the four remaining scenarios, found and fixed two problems, and deployed the fixes at 1:05 PM ([The four scenarios](#the-four-scenarios-25-november-afternoon)).
 
 | # | Issue | Status |
 |---|---|---|
@@ -14,13 +14,16 @@ This page records what changed for each issue, how it was tested, and what was c
 
 ## Verify it yourself
 
-The rest of this page states what we changed and tested, but a reader can't see our servers. To check the claims independently, the [`verify/`](verify/) directory has two scripts. They call only public endpoints and need no account, key or access to our servers.
+The rest of this page states what we changed and tested, but a reader can't see our servers. To check the claims independently, the [`verify/`](verify/) directory has scripts that call only public endpoints, plus a drill that runs on a local test chain. None needs an account, key or access to our servers.
 
 | Script | What it checks | Cost |
 |---|---|---|
 | `verify-auth.mjs` (28 checks, about 2.5 min) | Wallet sign-in: challenges are single use and expire after 2 minutes; wrong signatures are refused. Sign out and "sign out on all devices" revoke sessions. Passkeys are verified by the server: replays, forged signatures, other sites and cloned authenticators are refused. The script cleans up after itself. | none |
 | `verify-payments.mjs` | Every catalog resource answers `402` with complete payment requirements. The public monitor status is fresh and all checks pass, including backup freshness and the weekly restore drill. Rate limiting answers `429`. | none |
 | `verify-payments.mjs --buy` | One purchase, then the **same payment sent again**: the same order and transaction come back, and the chain shows exactly one charge. The order is reported delivered. | 0.02 dUSD from the free faucet claim |
+| `verify-payments.mjs --load` | The same payment sent concurrently, many buyers at once, and a sustained run: one order and one charge per purchase, `429` instead of errors when over the limit, no timeouts | test dUSD from the faucet, about 0.02 per purchase |
+| `verify-browser.mjs` (22 checks) | In a real browser: private keys are stored only encrypted, never in plain form in any browser storage; sign out leaves nothing that still works; passkeys are created and verified for real | none |
+| `drills/payment-faults.mjs` (31 checks) | On a local chain: crashes, outages and refunds in the payment path; every order is delivered or refunded exactly once | none (local) |
 
 **Monitor status.** The status of our health monitor is published at <https://dfmi.app/status.json>.
 - It is rewritten after every 5-minute run, so a stale `generatedAt` means the monitor stopped.
@@ -58,6 +61,24 @@ The test passkey was removed and all test sessions were revoked. No operator acc
 4. **Browser wallets.** The scripts do not check private-key storage in a real browser or passkey prompts on real devices.
 
 Until these are covered, dfmi stays in the small experimental trial the reviewer recommended.
+
+## The four scenarios, 25 November afternoon
+
+We added a tool for each scenario. The first three ship in [`verify/`](verify/) and can be run independently; the restore drill needs our servers and backups, so only our result is reported here. **These are our own runs. They have not been independently accepted yet.**
+
+| # | Scenario | Tool | Our result |
+|---|---|---|---|
+| 1 | Payment failures and refunds | `verify/drills/payment-faults.mjs`: a local chain and the published seller library, with faults injected. Eight scenarios: the seller crashes after the charge and before delivery; the facilitator loses its record; settlement fails or the facilitator is down; the authorization expires; the product can never be made (automatic refund); the refund crashes just before, or just after, it is broadcast | **31 of 31** passed. Each charged order is either delivered or refunded **exactly once**; no buyer is charged twice or refunded twice. Against the seller library from before the fixes, **11 checks fail**, so the drill catches these bugs |
+| 2 | Concurrency on the paid path | `verify-payments.mjs --load`: the same authorization sent 6 times at once, 6 buyers buying at once, then a 60-second sustained run (one purchase every 3 seconds) | Run on a local chain: every request ends `200`; concurrent copies of one payment give one order and **one** on-chain transfer; each purchase is charged exactly once; no timeouts. Over-limit requests get `429` with `Retry-After`, never a `5xx`. Limits are per IP (60 per minute, 2 in flight) and 8 in flight per seller, so one machine measures one client's share. Running `--load` against production costs real test dUSD from the faucet, so we leave that run to the reviewer |
+| 3 | Full restore drill | Not public (it needs server access). The production services are rebuilt on a separate machine from a backup about 6 hours old, with the code that runs in production and a relayer key that holds no funds | **21 of 21** passed in 84 seconds. The backup restores and passes integrity checks. Its 22 orders and the ledger's 1,538 settlements are all found on chain. The 8 real orders made after the backup were recovered from the chain and delivered by the restored system, with their original order ids and transactions. Nothing was charged twice, and the relayer sent no transaction |
+| 3 | Revoked sessions after a restore | Mail server tests | See problem 2 below. The fix is live; the restore procedure now includes the step |
+| 4 | Browser wallets | `verify/verify-browser.mjs`: real Chromium with a virtual WebAuthn authenticator, against the live wallet and identity pages. It imports a throwaway key through the page, then searches every browser store (localStorage, sessionStorage, IndexedDB, Cache Storage, cookies) for the key or the recovery phrase | First run: 20 of 22 (problem 1 below). After the fix, at 1:06 PM: **22 of 22** against production. Passkey prompts on real phones and laptops can't be scripted; [`verify/README.md`](verify/README.md) has a manual checklist for them |
+
+**Problems found and fixed** (both live at 1:05 PM):
+1. **Sign out on identity.dfmi.app did not fully sign out.** The page hid the signed-in state, but the mail session stayed valid on the server, its token stayed in `localStorage`, and the unlocked key stayed in memory. Sign out now ends the session on the server, deletes the token and forgets the key. The browser check tries every token-like value left in storage against the server after sign out; none is accepted.
+2. **Restoring session storage from a backup could bring back sessions that had been signed out.** The mail server now takes a `SESSIONS_NOT_BEFORE` setting: after a restore it is set to the restore time, every session issued earlier is refused, and users sign in again. A malformed value stops the server rather than being ignored. Tested both ways: a rebuilt server keeps revocations, and a rolled-back store with the setting refuses every older session. Without the setting the rollback test fails, which is why it is now a step in the restore procedure.
+
+**Still open:** independent acceptance of these four results, and a real-device passkey check using the manual checklist.
 
 ## Follow-up review, 7:08 PM
 
