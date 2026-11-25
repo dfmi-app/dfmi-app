@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)).
 
 | # | Issue | Status |
 |---|---|---|
@@ -11,6 +11,27 @@ This page records what changed for each issue, how it was tested, and what was c
 | 3 | Server-side sign-in: replay, expiry and invalidation | **Fixed** (session invalidation added; passkeys verified on the server since 25 November) |
 | 4 | Private keys in the browser wallet | **Fixed** (decrypted keys are no longer written to storage) |
 | 5 | Payment failures, monitoring, rate limits, backup restore, load testing | **Evidence below** |
+
+## Verify it yourself
+
+The rest of this page states what we changed and tested, but a reader can't see our servers. To check the claims independently, the [`verify/`](verify/) directory has two scripts. They call only public endpoints and need no account, key or access to our servers.
+
+| Script | What it checks | Cost |
+|---|---|---|
+| `verify-auth.mjs` (28 checks, about 2.5 min) | Wallet sign-in: challenges are single use and expire after 2 minutes; wrong signatures are refused. Sign out and "sign out on all devices" revoke sessions. Passkeys are verified by the server: replays, forged signatures, other sites and cloned authenticators are refused. The script cleans up after itself. | none |
+| `verify-payments.mjs` | Every catalog resource answers `402` with complete payment requirements. The public monitor status is fresh and all checks pass, including backup freshness and the weekly restore drill. Rate limiting answers `429`. | none |
+| `verify-payments.mjs --buy` | One purchase, then the **same payment sent again**: the same order and transaction come back, and the chain shows exactly one charge. The order is reported delivered. | 0.02 dUSD from the free faucet claim |
+
+**Monitor status.** The status of our health monitor is published at <https://dfmi.app/status.json>.
+- It is rewritten after every 5-minute run, so a stale `generatedAt` means the monitor stopped.
+- It shows each check group's pass/fail and the times of the newest backup and the last restore drill.
+
+**Our own runs, 25 November:**
+- `verify-auth.mjs` against production at 8:41 AM: 28 of 28 passed.
+- `verify-payments.mjs` (read-only) against production at 8:44 AM: 13 of 13 passed.
+- `--buy` was run on a local test chain, not against production: all 9 purchase checks passed. Against the seller code from before the fixes, the script fails: a retried payment answers `402`, so the buyer paid and got nothing. So the script does catch the bug it checks for.
+
+See [`verify/README.md`](verify/README.md) for details.
 
 ## Follow-up review, 7:08 PM
 

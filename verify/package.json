@@ -1,0 +1,1 @@
+{ "name": "dfmi-verify", "private": true, "type": "module", "description": "Black-box checks of dfmi sign-in and x402 payments, against the public endpoints", "dependencies": { "ethers": "6.13.4" } }
