@@ -1,0 +1,176 @@
+# Launch-readiness review: response (2026-11-24)
+
+On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
+
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific.
+
+| # | Issue | Status |
+|---|---|---|
+| 1 | Placeholders in the Terms of Service (governing law, courts or arbitration) | **Open.** This is a legal decision, and it is pending. |
+| 2 | The privacy policy does not match what the pages store | **Fixed** |
+| 3 | Server-side sign-in: replay, expiry and invalidation | **Fixed** (session invalidation added). Passkey verification on the server remains open; see below. |
+| 4 | Private keys in the browser wallet | **Fixed** (decrypted keys are no longer written to storage) |
+| 5 | Payment failures, monitoring, rate limits, backup restore, load testing | **Evidence below** |
+
+## 1. Terms of Service placeholders: open
+
+Section 15 of the Terms, and section 10 of the Privacy Policy, still contain `[GOVERNING JURISDICTION]` placeholders. Choosing the governing law and the venue (courts or individual arbitration) is a legal decision, not an engineering one. It will be made with counsel, and the text will be updated in English and Chinese together.
+
+## 2. Privacy policy matches what the pages do
+
+**Change.** The policy is at <https://dfmi.app/privacy.html> and was last updated on 24 November 2026. Its section 3 used to say that only `sessionStorage` is used, for language and navigation. We listed every key that each live page writes, and the section now describes all of them:
+- preferences;
+- wallets saved encrypted with the user's password (`localStorage`);
+- records of the console and the wallet app;
+- passkey public keys and their address bindings;
+- the mail session token;
+- the marketplace session (Amazon Cognito).
+
+**Other sections now also say:**
+- Card purchases go through Stripe's form, so dfmi never sees card numbers.
+- Marketplace accounts are managed by Amazon Cognito, which stores the passwords.
+- Stripe and Cognito are listed as service providers, and card purchase records have a stated retention.
+
+**Test.** The page was rendered with jsdom: all 56 text blocks have a Chinese translation, and the language switch works.
+
+## 3. Sign-in sessions can be revoked
+
+The mail service signs users in with a wallet signature. It already did the following on the server:
+- The server issues the challenge, which can be used once and expires after 2 minutes.
+- The server verifies the signature.
+- Sessions expire after 12 hours and are persisted, so a restart does not sign everyone out.
+
+What was missing was invalidation.
+
+**Change.**
+- `POST /api/auth/logout` revokes the current session immediately. The **Sign out** button now calls it. Before, the button only cleared the browser's copy, and the token kept working on the server.
+- `POST /api/auth/logout-all` revokes every session that address was issued up to now, for a lost or shared device. It is in Settings as **Sign out on all devices**.
+  - The cut-off time is persisted, so the revocation survives a restart.
+  - It also applies to sessions created before this change.
+  - If the revocation record cannot be read, the request is refused rather than allowed.
+
+**Tests.**
+
+| Test | Before | After |
+|---|---|---|
+| Server, 14 cases (the real server, with object storage replaced by an in-memory stub) | 7 fail | all pass |
+| Page, 6 cases (jsdom: both buttons call the right endpoint and sign out locally) | — | all pass |
+
+The 14 server cases cover:
+- a logged-out token is rejected;
+- after sign out on all devices, both of an address's sessions are rejected and other addresses are unaffected;
+- revocation still applies after a restart;
+- signing in again works;
+- an object-storage outage fails closed.
+
+**Live check, 5:04 PM.** A throwaway key ran the whole flow against the public API, and all 7 steps passed: sign in, sign out (token rejected), two sessions, sign out on all devices (both rejected), and signing in again. No payment was involved.
+
+**Open.** Passkeys on identity.dfmi.app are verified in the browser only. That page is a demonstration and is not used to sign in to any service. If passkeys are ever used for a real sign-in, the server must verify the assertion.
+
+## 4. Private keys stay in memory
+
+**Finding.** After unlocking, the console, the wallet app and the shared sign-in component (used by the identity, points and mail pages) wrote the **decrypted** private key to `sessionStorage`, so that a reload kept the user signed in. Any script running in that tab could then read it. The identity page also stated "keys are decrypted in memory and discarded", which was not true.
+
+**Change.**
+- A decrypted key is now held only in the page's memory and is never written to storage. The tab remembers only which wallet was used, so after a reload the user enters their password again. Browser-extension wallets (MetaMask and similar) are unaffected.
+- A key left in a tab by an older version is deleted as soon as the page loads, and is never used.
+- The identity page's notice now describes this correctly. It also lists the page's network calls accurately: before, it claimed the only calls were read-only RPC.
+- The identity page now loads ethers with a Subresource Integrity hash, which the other pages already had.
+
+Unchanged and already in place:
+- Wallets saved in the browser use the standard Ethereum keystore format, encrypted with the user's password.
+- Pages load ethers with Subresource Integrity, and the site sends an enforcing Content-Security-Policy.
+- The faucet's buy flow signs in the browser and sends only addresses and payment signatures, never the key.
+
+**Tests.** jsdom loaded the real pages with a plaintext key left in storage, as an older version would have left it. Two checks fail on the old pages, and all checks pass on the new ones:
+
+| Test | Old pages | New pages |
+|---|---|---|
+| Identity, console and wallet app, 12 checks | 9 fail | all pass |
+| Points page | — | loads without errors, and the old key is deleted |
+
+The 12 checks are: the old key is deleted, it is not used to sign in, password unlock still works, and no key is in storage after unlocking.
+
+The new files went live at 4:56 PM. Each one was checked to be byte-identical to the tested version, and all 6 pages return 200.
+
+## 5. Payment failures and operations
+
+### Payment failures
+
+The regression suite covers these. They are described in this branch's earlier commits and in `wangvc-seller/x402-lib/review.test.mjs`. Each case is shown failing on the old code and passing on the fixed code:
+- a retried payment request is charged once;
+- an order that was charged but not delivered is kept and recovered from the chain;
+- refunds are tracked to completion, and are never sent twice;
+- revoked or deactivated agents are refused at settlement;
+- the services recover after a crash.
+
+### Monitoring and alerting
+
+A read-only health check runs every 5 minutes. It never pays, refunds or restarts anything. Alerts go to the operator by Telegram.
+
+The checks are:
+- every service process is up and not crash-looping;
+- every paid resource answers an unpaid request with `402` within 5 s, through the public TLS endpoint;
+- the payment catalog is up, and every resource it lists answers `402`;
+- the public pages and the mail API are up;
+- the chain head is less than 2 minutes old;
+- the demo buyer agent has bought on chain within the last 75 minutes;
+- no order has been stuck settling for more than 30 minutes, and no refund has been owed for more than 1 hour;
+- the hourly backup is fresh, and the weekly restore drill passed;
+- the disk has space, and TLS certificates are more than 14 days from expiry.
+
+Alerting rules:
+- A check must fail twice in a row before it alerts.
+- While it keeps failing, it alerts again every 6 hours.
+- When it passes again, a recovery message is sent.
+- A daily heartbeat means that silence would show the monitor itself had stopped.
+
+The alert path was drilled end to end: a simulated failure produced an alert, then a recovery message. The first real run passed 37 of 37 checks. It also found one stale catalog entry: a resource that was re-registered under a new id in August. That entry is kept because the catalog is built from settlement history, and payment records are never deleted.
+
+### Rate limiting, verified on the live site
+
+Every seller limits each client IP to 60 requests per minute, with a burst of 20 and at most 2 requests in flight, plus a cap on requests in flight across all clients. The client IP is taken from the reverse proxy, and only when the connection comes from that proxy.
+
+| Live test (one outside IP, through the public endpoint) | Result |
+|---|---|
+| 30 unpaid requests to the market-report seller | 21 × `402`, then 9 × `429` with `Retry-After: 1` |
+| 30 unpaid requests to the wangvc-seller `/signals` | 21 × `402`, then 9 × `429` with `Retry-After: 1` |
+
+### Load tests
+
+All load tests sent **unpaid** requests only, so no charges were made.
+
+**Live, through the reverse proxy and TLS, from a source exempt from the rate limit:**
+
+| Target | Concurrency | Requests | req/s | p50 | p95 | p99 | Errors |
+|---|---|---|---|---|---|---|---|
+| seller, unpaid → `402` | 1 | 50 | 167 | 3.7 ms | 8.4 ms | 102 ms | 0 |
+| seller, unpaid → `402` | 8 | 400 | 426 | 12.9 ms | 32 ms | 129 ms | 0 |
+| facilitator `/catalog` | 8 | 200 | 307 | 14.9 ms | 87 ms | 155 ms | 0 |
+
+The host's load average afterwards was 0.10.
+
+**Local capacity of the deployed seller code (one Node process):**
+
+| Phase | c=1 | c=8 | c=32 | c=128 | Result |
+|---|---|---|---|---|---|
+| Limits lifted | 1.5k req/s | 6.9k req/s | 12.2k req/s | 17.5k req/s | All `402`; p99 under 71 ms |
+| Production limiter, one abusive IP | — | — | — | — | 19 × `402`, then every request `429` |
+
+Throughput is the same in both phases, so the limiter adds no measurable cost.
+
+**Not load-tested:** the paid path, which settles on chain. A load test of it would make real charges on the production chain. It needs a separate test chain with a funded test buyer. Concurrency and retries of settlement are exercised by the integration suite on a local EVM.
+
+### Backup and restore
+
+The payment databases and the settlement ledger are snapshotted hourly, with an integrity check on each copy, and kept for 14 days. The server volume also gets a daily snapshot, kept for 7 days.
+
+A weekly drill restores the newest snapshot into a private temporary directory, then:
+- runs SQLite `integrity_check` on each database;
+- compares its tables with the live database;
+- checks that every row in the backup still exists live;
+- checks that the settlement ledger in the backup is a subset of the live one.
+
+The monitor alerts if the last drill failed or is more than 8 days old.
+
+The first drill, at 5:09 PM, passed. It restored 6 databases and a ledger of 1,526 settlements, with nothing missing live. The backup was one order behind live, because that purchase was made after the snapshot was taken.
