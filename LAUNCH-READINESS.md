@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)).
 
 | # | Issue | Status |
 |---|---|---|
@@ -32,6 +32,32 @@ The rest of this page states what we changed and tested, but a reader can't see 
 - `--buy` was run on a local test chain, not against production: all 9 purchase checks passed. Against the seller code from before the fixes, the script fails: a retried payment answers `402`, so the buyer paid and got nothing. So the script does catch the bug it checks for.
 
 See [`verify/README.md`](verify/README.md) for details.
+
+## Independent acceptance, 25 November
+
+The reviewer ran the kit at commit `6e7b830` against production, from their own machine, between 10:19 and 10:22 AM. Result: **51 of 51 checks passed, 0 failed** (sign-in 28 of 28, payments 23 of 23, including `--buy`).
+
+| Area | Observed |
+|---|---|
+| Wallet signature sign-in | A correct signature signs in; a wrong signature, an edited message and a replay are refused |
+| Challenge expiry | After a real 125-second wait the expired challenge is refused |
+| Session revocation | After sign out and "sign out on all devices" the tokens are refused |
+| Server-verified passkeys | A normal sign-in works; forged, replayed, wrong-origin and counter-rollback responses are refused |
+| Payment retry | The same payment authorization sent again returns the same order and transaction |
+| On-chain charge | Balance 10 → 9.98 dUSD; exactly one 0.02 dUSD transfer |
+| Rate limiting | 11 of 30 requests answered `429` with `Retry-After` |
+
+The test passkey was removed and all test sessions were revoked. No operator account, wallet or asset was used.
+
+**Accepted independently:** sign-in (item 3) and a single payment retried (item 5).
+
+**Still to be shown before a full production release** (the reviewer found no failures; these are scenarios the kit does not cover yet):
+1. **Payment failures and refunds.** Charged but not delivered, settlement interrupted, a crash in the middle of a refund: recovery and refund are not yet independently verified.
+2. **Concurrency on the paid path.** The kit retries in sequence. Still needed: the same authorization submitted concurrently, many buyers at once, and a sustained run, with capacity and timeout behaviour stated.
+3. **A full restore drill.** The monitor reports backup and restore checks passing; still needed is an independent check that after a restore, reconciliation and delivery continue and revoked sessions stay revoked.
+4. **Browser wallets.** The scripts do not check private-key storage in a real browser or passkey prompts on real devices.
+
+Until these are covered, dfmi stays in the small experimental trial the reviewer recommended.
 
 ## Follow-up review, 7:08 PM
 
