@@ -782,6 +782,32 @@ const ACCEPTED_EVENTS = new Set(['Send', 'Delivery', 'Bounce', 'Complaint', 'Rej
 const evIndexPrefix = (wallet, id) => `index/${wallet}/${b64u(id)}/`;
 const reconcileStatus = { enabled: !!(EVENTS_BUCKET && SES_CONFIGURATION_SET), lastRunAt: null, lastOkAt: null, lastError: null, eventsIndexed: 0, reconciled: 0, pendingStale: 0, pendingStaleOldest: null, lastCanaryAt: null };
 const CANARY_WALLET = '0x' + '0'.repeat(40);
+// Authoritative journal: separate from the rollbackable mail bucket.
+if (!!EVENTS_BUCKET !== !!SES_CONFIGURATION_SET || (EVENTS_BUCKET && EVENTS_BUCKET === S3_BUCKET)) throw new Error('Configure a separate events bucket and configuration set together');
+const journalKey = (w, id) => `journal/${w}/${b64u(id)}.json`;
+async function journalGet(w, id) {
+  try { const d = await s3.send(new GetObjectCommand({ Bucket: EVENTS_BUCKET, Key: journalKey(w, id) })); return { rec: JSON.parse(await streamToString(d.Body)), etag: d.ETag }; }
+  catch (e) { if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null; throw e; }
+}
+const journalPut = (r, cond) => s3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: journalKey(r.wallet, r.messageId), Body: JSON.stringify(r), ContentType: 'application/json', ...cond }));
+async function closedResolution(w, id) {
+  for (const o of await evList(`resolutions/${w}/${b64u(id)}/`)) {
+    const r = await evJson(o.Key);
+    if (r && (r.decision === 'undeterminable' || r.newState === 'abandoned')) return r;
+  }
+  return null;
+}
+async function persistOutcome(key, rec) {
+  if (reconcileStatus.enabled) {
+    const j = await journalGet(rec.wallet, rec.messageId);
+    if (j?.rec.state === 'sent' && j.rec.fp === rec.fp && j.rec.sesMessageId === rec.sesMessageId && rec.state === 'sent') {
+      await outboxUpdate(key, j.rec); return; // an event reconciler completed the same outcome
+    }
+    if (!j || j.rec.state !== 'pending' || j.rec.attemptId !== rec.attemptId) throw new Error('Authoritative claim changed; reconcile outcome');
+    await journalPut(rec, { IfMatch: j.etag });
+  }
+  await outboxUpdate(key, rec);
+}
 const evS3 = s3;  // same client; EVENTS_BUCKET is a different bucket
 async function evJson(key) {
   try { const d = await evS3.send(new GetObjectCommand({ Bucket: EVENTS_BUCKET, Key: key })); return JSON.parse(await streamToString(d.Body)); }
@@ -830,12 +856,21 @@ async function markSentFromEvents(wallet, id, evs, by) {
   const acc = evs.find(e => ACCEPTED_EVENTS.has(e.eventType)); if (!acc) return null;
   const key = outboxKey(wallet, id);
   for (let i = 0; i < 3; i++) {
-    const cur = await outboxGet(key);
-    if (cur && (cur.rec.state === 'sent')) return cur.rec;
+    if (await closedResolution(wallet, id)) return null;
+    const j = await journalGet(wallet, id);
+    if (j?.rec.state === 'abandoned') return null;
+    const mirror = await outboxGet(key), cur = j || mirror;
+    if (!cur?.rec.fp) return null;
+    const next = { ...cur.rec, state: 'sent', sesMessageId: acc.sesMessageId, sentAt: cur.rec.sentAt || acc.timestamp, reconciledAt: new Date().toISOString(), reconciledBy: by };
+    if (!j || j.rec.state !== 'sent') {
+      try { await journalPut(next, j ? { IfMatch: j.etag } : { IfNoneMatch: '*' }); }
+      catch (e) { if (condFailed(e)) continue; throw e; }
+    }
+    if (mirror?.rec.state === 'sent' && mirror.rec.fp) return mirror.rec;
     const base = cur ? cur.rec : { messageId: id, wallet, to: acc.destination[0] || null, restoredFromEvents: true };
     const rec = { ...base, state: 'sent', sesMessageId: acc.sesMessageId, sentAt: base.sentAt || acc.timestamp || new Date().toISOString(),
       reconciledAt: new Date().toISOString(), reconciledBy: by, previousState: cur ? cur.rec.state : 'missing' };
-    try { await outboxPut(key, rec, cur ? { IfMatch: cur.etag } : { IfNoneMatch: '*' }); reconcileStatus.reconciled++; audit('outbox_reconciled', wallet, { messageId: id, from: rec.previousState, by, sesMessageId: acc.sesMessageId }); return rec; }
+    try { await outboxPut(key, rec, mirror ? { IfMatch: mirror.etag } : { IfNoneMatch: '*' }); reconcileStatus.reconciled++; audit('outbox_reconciled', wallet, { messageId: id, from: rec.previousState, by, sesMessageId: acc.sesMessageId }); return rec; }
     catch (e) { if (!condFailed(e)) throw e; }
   }
   throw new Error('outbox reconcile conflict');
@@ -915,25 +950,42 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
       timestamp: Date.now(), signature, onChain: false, internal: false, ...extra });
     const writeSent = (entry) => s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${wallet}/${fid}.json`, Body: JSON.stringify(entry), ContentType: 'application/json' }));
 
-    // 0. if SES already accepted this messageId (e.g. the outbox was rolled back by a restore), repair, never resend
+    const claim = { state: 'pending', fp, to: recipientEmail, from: req.emailAddress, wallet, messageId: fid, claimedAt: new Date().toISOString(), attemptId: uuidv4() };
     if (reconcileStatus.enabled) {
+      // Missing events NEVER authorize resending. Claim independently before SES.
       let evs;
       try { evs = await outboxEvents(wallet, fid); }
-      catch (e) { return res.status(503).json({ error: 'Delivery records unavailable, nothing was sent; try again', deliveryMayHaveOccurred: false }); }
-      if (evs.some(e => ACCEPTED_EVENTS.has(e.eventType))) {
+      catch { return res.status(503).json({ error: 'Delivery records unavailable; nothing submitted by this request', deliveryMayHaveOccurred: false }); }
+      if (await closedResolution(wallet, fid)) return res.status(409).json({ error: 'This message was closed; it will never be resent', state: 'abandoned', deliveryMayHaveOccurred: true });
+      let j = await journalGet(wallet, fid), owned = false;
+      if (!j) {
         const cur = await outboxGet(key);
-        const acc = evs.find(e => ACCEPTED_EVENTS.has(e.eventType));
-        const sameMessage = cur ? cur.rec.fp === fp : (acc.destination.map(String).map(x => x.toLowerCase()).includes(String(recipientEmail).toLowerCase()) && (acc.subject === null || acc.subject === subject));
-        if (!sameMessage) return res.status(409).json({ error: 'This messageId was already used for a different message', state: cur?.rec.state || 'sent' });
-        if (cur?.rec.state === 'abandoned') return res.status(409).json({ error: 'An operator closed this messageId as undeterminable; it is never sent again', state: 'abandoned', deliveryMayHaveOccurred: true });
-        const rec = await markSentFromEvents(wallet, fid, evs, 'pre-send-check');
-        try { await writeSent(sentEntry({ timestamp: Date.parse(rec.sentAt) || Date.now(), sesMessageId: rec.sesMessageId })); } catch (err) { console.warn('sent/ repair failed:', err.message); }
-        return res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail, duplicate: true, reconciled: true, sesMessageId: rec.sesMessageId });
+        const accepted = evs.some(e => ACCEPTED_EVENTS.has(e.eventType));
+        if (accepted && !cur?.rec.fp) return res.status(409).json({ error: 'Original fingerprint unavailable; cannot reconstruct history from caller content', state: 'unknown', deliveryMayHaveOccurred: true });
+        if (!cur && (process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM)) return res.status(503).json({ error: 'Restore guard: no authoritative claim; sending blocked', deliveryMayHaveOccurred: true });
+        try { await journalPut(cur ? { ...cur.rec, retryable: false } : claim, { IfNoneMatch: '*' }); owned = !cur; }
+        catch (e) { if (!condFailed(e)) throw e; }
+        j = await journalGet(wallet, fid);
       }
-    }
-
+      if (!j) throw new Error('Send journal unavailable');
+      if (j.rec.fp !== fp) return res.status(409).json({ error: 'This messageId was already used for different content', state: j.rec.state });
+      if (j.rec.state === 'abandoned') return res.status(409).json({ error: 'This message was closed; it will never be resent', state: 'abandoned', deliveryMayHaveOccurred: true });
+      if (evs.some(e => ACCEPTED_EVENTS.has(e.eventType)) && j.rec.state !== 'sent') {
+        await markSentFromEvents(wallet, fid, evs, 'pre-send-check'); j = await journalGet(wallet, fid); owned = false;
+      }
+      if (j.rec.state === 'sent') {
+        await outboxPut(key, j.rec);
+        await writeSent(sentEntry({ timestamp: Date.parse(j.rec.sentAt) || Date.now(), sesMessageId: j.rec.sesMessageId }));
+        return res.json({ sent: true, messageId: fid, duplicate: true, reconciled: true, fromEmail: req.emailAddress, toEmail: recipientEmail, sesMessageId: j.rec.sesMessageId });
+      }
+      if (j.rec.state === 'failed' && j.rec.retryable === true) {
+        try { await journalPut(claim, { IfMatch: j.etag }); owned = true; }
+        catch (e) { if (!condFailed(e)) throw e; }
+      }
+      if (!owned) return res.status(409).json({ error: 'Outcome unknown or another attempt owns this messageId; not resent', state: j.rec.state, deliveryMayHaveOccurred: true });
+      await outboxPut(key, claim);
+    } else {
     // 1. claim the messageId (at most one SES call per messageId)
-    const claim = { state: 'pending', fp, to: recipientEmail, from: req.emailAddress, wallet, messageId: fid, claimedAt: new Date().toISOString() };
     try { await outboxPut(key, claim, { IfNoneMatch: '*' }); }
     catch (e) {
       if (!condFailed(e)) throw e;                                   // storage failure: nothing was sent
@@ -953,6 +1005,8 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
       } else {
         return res.status(409).json({ error: 'The outcome of an earlier attempt with this messageId is unknown; it is not resent automatically', state: r.state, claimedAt: r.claimedAt, deliveryMayHaveOccurred: true });
       }
+    }
+
     }
 
     // 2. send
@@ -975,7 +1029,7 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
       }));
     } catch (e) {
       if (sesDefinitelyRejected(e)) {                                // SES refused it: not sent, the messageId may be retried
-        try { await outboxUpdate(key, { ...claim, state: 'failed', error: String(e.name || e.message).slice(0, 200), failedAt: new Date().toISOString() }); } catch (err) { console.warn('outbox failed-state write failed:', err.message); }
+        try { await persistOutcome(key, { ...claim, state: 'failed', retryable: true, error: String(e.name || e.message).slice(0, 200), failedAt: new Date().toISOString() }); } catch (err) { console.warn('outbox failed-state write failed:', err.message); }
         return res.status(502).json({ error: 'The mail service rejected the message: ' + (e.name || e.message), deliveryMayHaveOccurred: false });
       }
       deliveryMayHaveOccurred = true;                                // ambiguous: stays 'pending', never resent automatically
@@ -986,7 +1040,7 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
 
     // 3. record the outcome
     const sentAt = new Date().toISOString();
-    try { await outboxUpdate(key, { ...claim, state: 'sent', sesMessageId: out?.MessageId || null, sentAt }); }
+    try { await persistOutcome(key, { ...claim, state: 'sent', sesMessageId: out?.MessageId || null, sentAt }); }
     catch (e) {
       console.error('outbox sent-state write failed after SES accepted:', e.message);
       audit('send_external_outbox_unpersisted', req.walletAddress, { messageId: fid, sesMessageId: out?.MessageId || null });
@@ -1011,7 +1065,7 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
 app.get('/api/messages/outbox/:messageId', requireAuth, async (req, res) => {
   try {
     const id = req.params.messageId; if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) return res.status(404).json({ error: 'Not found' });
-    const cur = await outboxGet(outboxKey(req.walletAddress.toLowerCase(), id));
+    const cur = (reconcileStatus.enabled ? await journalGet(req.walletAddress.toLowerCase(), id) : null) || await outboxGet(outboxKey(req.walletAddress.toLowerCase(), id));
     if (!cur) return res.status(404).json({ error: 'Not found' });
     const { state, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy, resolution } = cur.rec;
     let events = null;

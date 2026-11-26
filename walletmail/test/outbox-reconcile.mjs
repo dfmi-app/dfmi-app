@@ -63,11 +63,12 @@ try {
   ops('canary'); await sleep(500);
   ok('the canary\'s own events are indexed', await until(async () => Object.keys(objects()).some((k) => k.startsWith('events/index/0x' + '0'.repeat(40) + '/'))));
   rr = ops('resolve', u.addr, 'q1', '--as', 'not-sent', '--operator', 'test-op', '--reason', 'no SES event; canary before and after');
-  ok('operator: not-sent is accepted with no event for it and canaries before and after → failed', rr.code === 0 && JSON.parse(rr.out).newState === 'failed' && JSON.parse(rr.out).evidence.pipelineCoversClaim === true, rr.out);
-  ok('the resolution is recorded with operator, reason and evidence, also in the events bucket (survives a mail rollback)', Object.keys(objects()).some((k) => k.startsWith(`mail/outbox-resolutions/${u.addr}/`)) && Object.keys(objects()).some((k) => k.startsWith(`events/resolutions/${u.addr}/`)));
-  ok('show reads the resolutions from the events bucket', /"decision": "not-sent"/.test(ops('show', u.addr, 'q1').out));
+  ok('operator: healthy probes still cannot prove nonacceptance', rr.code !== 0 && /refused/.test(rr.out));
+  rr = ops('resolve', u.addr, 'q1', '--as', 'undeterminable', '--operator', 'test-op', '--reason', 'unknown outcome; probes are not proof');
+  ok('unknown outcome is closed as abandoned with audit in both buckets', rr.code === 0 && JSON.parse(rr.out).newState === 'abandoned' && Object.keys(objects()).some(k => k.startsWith(`events/resolutions/${u.addr}/`)));
+  ok('show reads the authoritative disposition', /"decision": "undeterminable"/.test(ops('show', u.addr, 'q1').out));
   r = await send(u.t, 'q1');
-  ok('the user may then retry with the SAME messageId; it is sent once', r.status === 200 && sesCount('q1') === 1);
+  ok('the same messageId cannot be retried after an unknown outcome was closed', r.status === 409 && sesCount('q1') === 0);
   rr = ops('resolve', u.addr, 'q1', '--as', 'not-sent', '--operator', 'x', '--reason', 'y');
   ok('operator: a resolved/sent entry cannot be resolved again', rr.code !== 0 && /only pending/.test(rr.out));
 

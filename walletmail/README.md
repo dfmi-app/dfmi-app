@@ -92,3 +92,70 @@ The fault-injection regression writes disposable data in a unique `durability-*`
 
 `restore.mjs` tests this mechanism. That the operator really performs the step after a real restore can't be checked from
 outside. The status of the most recent restore drill of the payment services is public at <https://dfmi.app/status.json>.
+
+
+## Durable outbox journal (local fixes based on 1fe4632)
+
+Configure `SES_EVENTS_BUCKET` and `SES_CONFIGURATION_SET` together. The events
+bucket must differ from `S3_INCOMING_BUCKET` and must not be rolled back with it.
+Before SES is called, an atomic conditional write reserves the message ID in
+`journal/<wallet>/<base64url-id>.json`, including the original content fingerprint.
+The journal is authoritative; mail-bucket outbox records and sent history are
+repairable copies. Keep journal entries and `resolutions/` for at least as long
+as message IDs can be retried. Deleting or rolling back these records destroys
+that protection. Restrict their write/delete permissions to the mail service
+and authorized operators; enable versioning and retain their recovery evidence.
+
+A retry reads the journal and independently retained closures before sending.
+An empty event index is never proof of nonacceptance. Healthy canary probes do
+not change this: `outbox-ops resolve --as not-sent` is refused. Unknown outcomes
+can be left pending or closed as `undeterminable`/`abandoned`. Only a definite
+SES rejection persisted by the service is retryable. An abandoned closure stays
+in effect even after the mail bucket is restored. Operators must not recreate
+or replace IDs to bypass a closure.
+
+The original fingerprint is retained across restoration. A different body,
+subject, recipient or sender is rejected. A legacy message with only an SES
+event and no trusted fingerprint is blocked instead of inventing sent history
+from the retry payload. Identical retries against a journal-backed restored
+message remain idempotent, including the second and subsequent retries.
+
+### Upgrade and recovery
+
+1. Stop or gate mail submission during upgrade or restore. Preserve the events
+   bucket, journal, resolutions and their permissions independently of mail.
+2. Back up the current mail state before upgrading. Existing outbox records with
+   trusted fingerprints are imported lazily on retry; an old `failed` record is
+   imported as nonretryable because it may have been authorized by the unsafe
+   pre-upgrade operator rule. Events alone cannot reconstruct original bodies.
+3. If restoring a backup made before the journal was introduced, set
+   `OUTBOX_REQUIRE_EXISTING_JOURNAL=1` on every instance before reopening traffic.
+   Setting `OUTBOX_RECONCILE_FROM` also enables this guard. Requests without a
+   known journal or surviving outbox record stay blocked. Do not clear the guard
+   until pre-upgrade send IDs have been independently accounted for; otherwise
+   a lost legacy record cannot be distinguished from a new ID. This conservative
+   guard can prevent new sends as well as unsafe retries.
+4. Grant the service conditional read/write access to `journal/` and read/list
+   access to `resolutions/`, plus the existing event-index permissions. Keep the
+   events bucket outside the restore operation. Run local regressions first;
+   then the owner must validate these permissions and the restore operation on
+   isolated cloud resources before deploying. No cloud resources were changed
+   by this local patch.
+5. Verify that accepted messages, pending messages and abandoned closures still
+   prevent a second submission after restart and rollback. Keep raw commands,
+   job IDs, hashes and counts. A successful SES call is acceptance, not final
+   delivery; delivery-delay and real-cloud evidence remain separate acceptance.
+
+Run from `walletmail/test`:
+
+```sh
+node outbox-journal.mjs ../server.js ../tools/outbox-ops.mjs
+node outbox-reconcile.mjs ../server.js ../tools/outbox-ops.mjs
+node outbox.mjs ../server.js
+node outbox-sdk.mjs ../server.js
+```
+
+All use local fixtures. The journal suite covers the five independently
+reproduced failures plus concurrent claims, failed journal reads/writes,
+accepted outcomes that fail to persist, definite rejections, legacy missing
+fingerprints, retained closures and the legacy-restore guard.

@@ -10,7 +10,7 @@ const err = (name, code) => { const e = new Error(name); e.name = name; e.$metad
 const s3 = require('@aws-sdk/client-s3');
 s3.S3Client.prototype.send = async function (cmd) {
   const n = cmd.constructor.name, i = cmd.input, f = fault(); const k = `${i.Bucket}/${i.Key || ''}`;
-  if (f.s3 && n === f.s3.op && (i.Bucket === (f.s3.bucket || i.Bucket)) && (i.Key || i.Prefix || '').startsWith(f.s3.prefix || '')) throw err('ServiceUnavailable', 503);
+  if (f.s3 && n === f.s3.op && (i.Bucket === (f.s3.bucket || i.Bucket)) && (i.Key || i.Prefix || '').startsWith(f.s3.prefix || '') && (!f.s3.state || JSON.parse(String(i.Body)).state === f.s3.state)) throw err('ServiceUnavailable', 503);
   const o = load();
   if (n === 'PutObjectCommand') {
     const cur = o[k];
