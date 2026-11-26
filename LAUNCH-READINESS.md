@@ -1,6 +1,6 @@
 # Launch-readiness review: response (2026-11-24)
 
-> Local handoff based on a13d016 (26 November): the walletmail fixes in this local branch have passed isolated acceptance and have not been deployed. Historical production claims below describe the baseline, not this new code. See [delivery notes](walletmail/DELIVERY-NOTES.md) for changes, evidence and open launch requirements.
+> **26 November, 10:04 AM: the reviewer's mail-server fixes are live on email.dfmi.me.** They arrived as a patch on a13d016 and are the commit before this one; see [Mail server fixes deployed](#mail-server-fixes-deployed-26-november). The reviewer's [delivery notes](walletmail/DELIVERY-NOTES.md) list the changes, their evidence and what is still open. The notes were written before the deployment, so where they say "not deployed", that describes the patch as it was handed over.
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
@@ -142,6 +142,50 @@ The reviewer re-tested commit `98ec530` in isolation: no change to the live envi
    - Passkey prompts on real phones and laptops. **We ran the checklist on two real devices on 26 November: all steps passed** (see [Passkeys on real devices](#passkeys-on-real-devices-26-november)). This is our own run, not an independent one.
 
 **So the four tested scenarios are closed, but dfmi is not declared production-ready as a whole.** It stays in the small trial until item 3 is independently accepted.
+
+### Mail server fixes deployed, 26 November
+
+The reviewer delivered a patch for the mail and sign-in server (`walletmail/`). We reviewed it, applied it unchanged with `git am`, and deployed it at **10:04 AM**.
+
+**Two of the issues it fixes were exploitable in production until then.** The reviewer's tests reproduce both against the previous code, locally. We did not try them on production.
+- **A self-claimed name gave access to that name's mail.** At sign-in the server accepted a name sent by the client (for example `admin`) without checking it, and the inbox then included mail addressed to that name. Now only an operator-configured mapping, or a name the on-chain resolver confirms, grants a mail alias.
+- **Message details were not checked for ownership.** A signed-in user who knew a message id could read its body from the server's memory. Now details and attachments are read from storage and returned only to the sender or a recipient.
+
+The patch also makes several other changes:
+- passkeys created before a restore can't sign in until re-registered, which applies only once `SESSIONS_NOT_BEFORE` is set;
+- a storage write that fails is reported as an error instead of success;
+- sessions are checked against storage on every request;
+- mailbox listings read every page;
+- attachments can be downloaded with authentication.
+
+**Identity of what runs.**
+
+| | Commit | `server.js` SHA-256 |
+|---|---|---|
+| Published (this repository) | the patch commit, `Fix mail restoration, durable revocation and attachment access` | `47aa1b68d9e45a2e776b939d59aac847f006c35707fbe4dd99f921da8d6bc473`, the same hash the reviewer's delivery notes give for the server they tested |
+| Deployed on email.dfmi.me | — | `73370b02113919144aa9106717363302052c214573db20ac95f4c42f0b54468e` |
+
+The two files differ only in the four configuration defaults described at the top of `walletmail/README.md`: the registry and resolver contract addresses, one address-to-name mapping, and the names checked at startup. The code changes are line-for-line the patch.
+
+**Tests.**
+- Before deploying, in isolation with loopback-only networking:
+  - published build: `mail-restore.mjs` 58/58, `durability.mjs` 49/49;
+  - deployed build, with the production configuration: `run` 14, `passkey` 25, `restore` 11, `tls` 3, `identity-e2e` 12, `durability` 49/49 and `mail-restore` 57/58. The one is a check that configures a test name through `KNOWN_ENS_MAPPINGS`, which the deployed build sets in code instead.
+  - The previous code fails 30 of 58 and 24 of 49 of those checks.
+- After deploying, against production: `verify-auth.mjs` 28/28 and `verify-browser.mjs` 22/22.
+
+**What changes for users.**
+- A mailbox name now needs a confirmed owner, so a name that was only typed in at sign-in no longer brings in that name's mail.
+- If storage is unavailable, the mail pages show an error instead of an incomplete inbox.
+- The mail web page does not show attachments yet. The server provides them, but the page has not been updated.
+
+**Still open**, as listed in the delivery notes:
+- a real cloud restore with its evidence;
+- the restore runbook carried out end to end;
+- attachments in the mail page;
+- independent real-device acceptance;
+- production-scale load;
+- reliable outbound mail (no automatic resend when `deliveryMayHaveOccurred`).
 
 ### Passkeys on real devices, 26 November
 
