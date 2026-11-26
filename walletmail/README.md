@@ -12,6 +12,23 @@ The top of the file says the same.
 
 ## Running the tests
 
+### Outbox retry and persistence regressions
+
+From `walletmail/test`, run `node outbox.mjs ../server.js` and
+`node outbox-sdk.mjs ../server.js`. The latter keeps the real SES SDK middleware
+and replaces only HTTP transport; even `AWS_MAX_ATTEMPTS=5` must not cause a
+second submission after a lost response or 5xx. S3 and SES are local fixtures.
+
+The SES client explicitly uses `maxAttempts: 1`. If SES accepts a message but
+all three attempts to persist its `sent` outbox state fail, the API returns 503
+with `accepted: true`, `deliveryMayHaveOccurred: true`, `persistenceUnknown: true`
+and the message ID, rather than ordinary success. The response state is `unknown`:
+the durable record stays `pending` if writes did not commit, or may be `sent` if
+a storage response was lost. Retries with that ID never submit again, including
+after restart; a saved `sent` result repairs history. Do not generate a new ID and
+resend. Pending outcomes still require reconciliation; this patch does not
+claim eventual delivery or automatic repair of an ambiguous outcome.
+
 Requires Node.js 22 or newer and `openssl`. Everything runs on your machine. AWS S3 and SES are replaced by a local
 file (`test/s3stub.cjs`), and nothing is sent to dfmi's servers.
 
@@ -69,7 +86,7 @@ Everyone signs in again using a wallet signature and re-enrolls passkeys. The fe
 
 Storage writes must finish before a success response or a cache update. Logout returns an error if the persistent delete fails; the caller must not assume the token is revoked until a successful retry. Authentication checks authoritative session and per-address revocation records on every request, including warm sessions on another process. This increases storage reads and needs capacity validation before deployment.
 
-External sending crosses two services and is not an atomic transaction: SES may accept a message before persisting its sent-history object fails. The endpoint returns an error with `deliveryMayHaveOccurred: true` in that case. Do not automatically resend it on the basis of that error. Durable outbox/idempotent delivery is outside this patch; real SES behavior and the recovery runbook still require an isolated cloud drill.
+External sending crosses two services and is not an atomic transaction: SES may accept a message before persisting its outbox outcome or sent-history object fails. The endpoint returns an error with `deliveryMayHaveOccurred: true` in that case. Do not automatically resend it with a new ID. A saved `sent` outbox result allows the same ID to repair sent history without submitting again; a `pending` result stays blocked and requires reconciliation. The SDK's automatic retries are disabled for SES. Real delivery, reconciliation and outbox rollback during recovery still require an isolated cloud drill.
 
 The fault-injection regression writes disposable data in a unique `durability-*` directory. Use no real AWS credentials. The local fixture does not prove AWS versioning, replication, backups, IAM/KMS access, RPO/RTO, or that production operators execute this procedure.
 

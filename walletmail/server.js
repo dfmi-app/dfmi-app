@@ -68,7 +68,9 @@ const RATE_LIMIT_MAX    = 10;
 // certificates; NODE_TLS_REJECT_UNAUTHORIZED=0 used to be set here, which would have accepted any certificate.
 
 // ─── AWS Clients ───
-const ses = new SESv2Client({ region: AWS_REGION });
+// SendEmail has no idempotency token. Retrying inside the SDK after a lost
+// response bypasses the outbox claim and can submit the same message twice.
+const ses = new SESv2Client({ region: AWS_REGION, maxAttempts: 1 });
 const s3  = new S3Client({ region: AWS_REGION });
 
 // ─── dFMI Provider ───
@@ -826,7 +828,15 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
     // 3. record the outcome
     const sentAt = new Date().toISOString();
     try { await outboxUpdate(key, { ...claim, state: 'sent', sesMessageId: out?.MessageId || null, sentAt }); }
-    catch (e) { console.error('outbox sent-state write failed after SES accepted:', e.message); }
+    catch (e) {
+      console.error('outbox sent-state write failed after SES accepted:', e.message);
+      audit('send_external_outbox_unpersisted', req.walletAddress, { messageId: fid, sesMessageId: out?.MessageId || null });
+      return res.status(503).json({
+        error: 'The mail service accepted the message, but its outbox result could not be saved. Do not resend; reconcile this messageId.',
+        messageId: fid, state: 'unknown', accepted: true, persistenceUnknown: true,
+        deliveryMayHaveOccurred: true, sesMessageId: out?.MessageId || null
+      });
+    }
     const entry = sentEntry({ sesMessageId: out?.MessageId || null });
     try { await writeSent(entry); }
     catch (e) { return res.status(500).json({ error: 'Sent, but the sent record could not be saved; retry with the same messageId to repair it', messageId: fid, delivered: true, deliveryMayHaveOccurred: true }); }

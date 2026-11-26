@@ -65,7 +65,33 @@ try {
   fault({ s3: { op: 'PutObjectCommand', prefix: 'outbox/' } }); r = await send(t, 'm7'); fault();
   ok('the outbox cannot be written: nothing is sent', r.status >= 500 && sesCount('m7') === 0 && r.j.deliveryMayHaveOccurred === false);
 
+  const pendingToken = await login(ethers.Wallet.createRandom());
+  fault({ s3: { op: 'PutObjectCommand', prefix: 'outbox/', state: 'sent' } });
+  r = await send(pendingToken, 'm8'); fault();
+  ok('SES accepted but the durable outcome cannot be saved: return an error, not ordinary success',
+    r.status === 503 && !r.j.sent && r.j.accepted === true && r.j.persistenceUnknown === true && r.j.state === 'unknown' && r.j.deliveryMayHaveOccurred === true && r.j.messageId === 'm8' && !!r.j.sesMessageId && sesCount('m8') === 1);
+  ok('the unsaved outcome stays pending and is not presented as a saved sent record',
+    (await outbox(pendingToken, 'm8')).j.state === 'pending' && !(await call('GET', '/api/messages/sent', pendingToken)).j.emails?.some(e => e.id === 'm8'));
+  r = await send(pendingToken, 'm8');
+  ok('retry after the outcome write failed does not send again', r.status === 409 && r.j.deliveryMayHaveOccurred === true && sesCount('m8') === 1);
+
+  t = await login(ethers.Wallet.createRandom());
+  fault({ s3: { op: 'PutObjectCommand', prefix: 'outbox/', state: 'sent', remaining: 2 } });
+  r = await send(t, 'm9'); fault();
+  ok('transient outcome write failures can recover before success is acknowledged', r.status === 200 && r.j.sent && (await outbox(t, 'm9')).j.state === 'sent' && sesCount('m9') === 1);
+  r = await send(t, 'm9');
+  ok('a recovered durable outcome replays successfully without resending', r.status === 200 && r.j.duplicate && sesCount('m9') === 1);
+
+  t = await login(ethers.Wallet.createRandom());
+  fault({ s3: { op: 'PutObjectCommand', prefix: 'outbox/', state: 'sent', commitThenFail: true } });
+  r = await send(t, 'm10'); fault();
+  ok('a committed outcome with lost storage responses is reported as unknown, never falsely pending or ordinary success', r.status === 503 && r.j.persistenceUnknown === true && r.j.state === 'unknown' && r.j.accepted === true && (await outbox(t, 'm10')).j.state === 'sent' && sesCount('m10') === 1);
+  r = await send(t, 'm10');
+  ok('after a committed-but-unacknowledged outcome, retry repairs history without another SES submission', r.status === 200 && r.j.duplicate && sesCount('m10') === 1 && (await call('GET', '/api/messages/sent', t)).j.emails?.some(e => e.id === 'm10'));
+
   await stop(); await start(); const t2 = await login(w);
+  r = await send(pendingToken, 'm8');
+  ok('after restart an unpersisted accepted outcome is still pending and never resent', r.status === 409 && r.j.deliveryMayHaveOccurred === true && sesCount('m8') === 1 && (await outbox(pendingToken, 'm8')).j.state === 'pending');
   r = await send(t2, 'm1');
   ok('after a restart the outbox still prevents a resend', r.status === 200 && r.j.duplicate && sesCount('m1') === 1);
   ok('another wallet cannot read this wallet\'s outbox', (await outbox(await login(ethers.Wallet.createRandom()), 'm1')).status === 404);

@@ -9,13 +9,20 @@ const err = (name, code) => { const e = new Error(name); e.name = name; e.$metad
 const s3 = require('@aws-sdk/client-s3');
 s3.S3Client.prototype.send = async function (cmd) {
   const n = cmd.constructor.name, i = cmd.input, f = fault();
-  if (f.s3 && n === f.s3.op && (i.Key || '').startsWith(f.s3.prefix || '')) throw err('ServiceUnavailable', 503);
+  const failing = f.s3 && n === f.s3.op && (i.Key || '').startsWith(f.s3.prefix || '') &&
+      (!f.s3.state || JSON.parse(String(i.Body)).state === f.s3.state) && f.s3.remaining !== 0;
+  if (failing) {
+    if (f.s3.remaining > 0) { f.s3.remaining--; fs.writeFileSync(control, JSON.stringify(f)); }
+    if (!f.s3.commitThenFail) throw err('ServiceUnavailable', 503);
+  }
   const o = load(), k = i.Key;
   if (n === 'PutObjectCommand') {
     const cur = o[k];
     if (i.IfNoneMatch === '*' && cur) throw err('PreconditionFailed', 412);
     if (i.IfMatch && (!cur || cur.etag !== i.IfMatch)) throw err('PreconditionFailed', 412);
-    const body = Buffer.from(i.Body); o[k] = { body: body.toString('base64'), etag: '"' + crypto.createHash('md5').update(body).digest('hex') + '"' }; save(o); return { ETag: o[k].etag };
+    const body = Buffer.from(i.Body); o[k] = { body: body.toString('base64'), etag: '"' + crypto.createHash('md5').update(body).digest('hex') + '"' }; save(o);
+    if (failing) throw err('ServiceUnavailable', 503); // write committed, response lost
+    return { ETag: o[k].etag };
   }
   if (n === 'GetObjectCommand') { if (!o[k]) throw err('NoSuchKey', 404); return { Body: Readable.from([Buffer.from(o[k].body, 'base64')]), ETag: o[k].etag }; }
   if (n === 'DeleteObjectCommand') { delete o[k]; save(o); return {}; }
