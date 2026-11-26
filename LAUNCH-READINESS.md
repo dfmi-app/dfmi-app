@@ -167,6 +167,13 @@ The patch also makes several other changes:
 
 The two files differ only in the four configuration defaults described at the top of `walletmail/README.md`: the registry and resolver contract addresses, one address-to-name mapping, and the names checked at startup. The code changes are line-for-line the patch.
 
+**Since 26 November, 6:45 PM UTC (10:45 AM PST), production runs the published file byte-for-byte.**
+- The four values above now come from the service's environment file instead of the code.
+- Before the switch, both builds were started locally without outside network, and their startup behaviour was identical.
+- The running process's `server.js` is sha256 `47aa1b68…`, the same as `walletmail/server.js` here. Anyone can recompute that hash from this repository.
+- After the switch: `verify-auth.mjs` 28/28 and `verify-browser.mjs` 22/22 against production.
+- The process and host records behind this remain our own operator records.
+
 **Tests.**
 - Before deploying, in isolation with loopback-only networking:
   - published build: `mail-restore.mjs` 58/58, `durability.mjs` 49/49;
