@@ -201,11 +201,17 @@ The two files differ only in the four configuration defaults described at the to
   - If the outcome is unknown (a timeout, or a 5xx), the message is **not** resent automatically. The answer says `deliveryMayHaveOccurred: true`, and `GET /api/messages/outbox/:messageId` shows the state.
   - The mail page tells the user to check Sent before sending again. If a message was delivered but its Sent record could not be saved, the page repairs the record with the same `messageId`; this sends nothing.
   - `walletmail/test/outbox.mjs`: 18/18. The SES stub counts every message it accepts. The previous code fails 12; for example, 6 concurrent requests with one `messageId` sent 6 emails.
-  - **Two defects found by the reviewer, fixed by their patch (not yet deployed; production still runs `1fc1b788…`).**
+  - **Two defects found by the reviewer, fixed by their patch (deployed 26 November, 12:34 PM PST).**
     - The SES client used the SDK's default automatic retries. After a lost response, the SDK could resubmit the same message without going through the outbox. It now uses `maxAttempts: 1`.
     - If SES accepted a message but its `sent` outcome could not be saved in the outbox, the API still answered with ordinary success. It now answers 503 with `accepted: true`, `persistenceUnknown: true`, `state: "unknown"` and the message ids.
     - With their tests, `outbox.mjs` is 26/26 and `outbox-sdk.mjs` 8/8. The new test keeps the real SDK retry middleware and replaces only the HTTP transport. Our first tests replaced the whole SES client, so they could not see SDK retries. The unpatched code fails 3 and 5 of these checks.
     - Patched `walletmail/server.js` sha256: `20c5bb41320f53339b590606fea61e0882b339e3b0a085f009376f446d8c6a67`.
+    - Production runs this file byte-for-byte since 12:34 PM PST.
+    - After deploying, against production:
+      - `verify-auth.mjs --skip-expiry` 27/27;
+      - `verify-browser.mjs` 22/22;
+      - 0 AWS authorization errors in the server log;
+      - a new wallet's inbox in 0.39–0.80 s.
 - **Inbox cost.** An inbox read lists every message under `raw/` and `content/`, for all users, and keeps the ones addressed to the reader.
   - Before, it read and parsed them one by one, so the time grew with the total mail on the site.
   - Now reads run in parallel (8 at a time), and parsed MIME messages are cached by key, ETag, LastModified and size (64 MB, least recently used evicted).
