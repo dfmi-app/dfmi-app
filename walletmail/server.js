@@ -1,9 +1,9 @@
 /**
  * WalletMail API Server — v2.0
  *
- * Published copy of the server behind email.dfmi.me (25 November 2026). It differs from the deployed file only in
- * configuration defaults: no built-in contract addresses (ENS_REGISTRY, ENS_RESOLVER), no built-in address-to-name
- * mapping (KNOWN_ENS_MAPPINGS), and the names checked at startup come from ENS_BOOTSTRAP_NAMES.
+ * Local remediation based on the published source at 10cc772 (25 November 2026).
+ * This file includes independent-review fixes; it is not evidence of a production deployment.
+ * Configuration defaults omit built-in contract addresses and address-to-name mappings.
  *
  * Rewritten to align with WalletMail-Master-Spec-v1.0:
  *   - Challenge/response authentication (single-use challenges)
@@ -27,6 +27,7 @@
  *   GET  /api/messages/inbox       — fetch inbox
  *   GET  /api/messages/sent        — fetch sent
  *   GET  /api/messages/:messageId  — fetch single message
+ *   GET  /api/messages/:messageId/attachments/:index — authenticated binary download
  *   POST /api/messages/:messageId/read  — mark read
  *   POST /api/messages/:messageId/star  — toggle star
  *   POST /api/resolve-recipient    — resolve wallet / ENS / email
@@ -90,11 +91,16 @@ const sentEmails   = new Map();  // address → []
 const rateLimits   = new Map();
 const auditLog     = [];
 const ensCache     = new Map();
+// Display hints (including login form values and stored mail metadata) are not
+// ownership proofs. Only operator mappings or successful resolver reads grant
+// access through an ENS mail alias.
+const trustedMailNames = new Map();
 
 // Pre-populate known ENS mappings
 const KNOWN_MAPPINGS = (() => { try { return JSON.parse(process.env.KNOWN_ENS_MAPPINGS || '{}'); } catch { return {}; } })(); // { address: name }
 for (const [addr, name] of Object.entries(KNOWN_MAPPINGS)) {
   ensCache.set(addr.toLowerCase(), name);
+  if (typeof name === 'string') trustedMailNames.set(addr.toLowerCase(), name.toLowerCase());
 }
 
 // ─── ENS Helpers ───
@@ -144,6 +150,7 @@ async function resolveNameToAddress(name) {
     console.log(`[ENS] Result for "${full}": ${addr}`);
     if (addr && addr !== ethers.ZeroAddress) {
       ensCache.set(addr.toLowerCase(), full.replace('.dfmi', ''));
+      trustedMailNames.set(addr.toLowerCase(), full.replace('.dfmi', '').toLowerCase());
       return addr.toLowerCase();
     }
   } catch (e) { console.warn(`[ENS] Error resolving "${full}":`, e.message); }
@@ -206,11 +213,9 @@ function eip712Domain() {
 const prepared = new Map();  // messageId → payload
 
 async function persistPrepared(messageId, rec) {
+  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `prepared/${messageId}.json`, Body: JSON.stringify(rec), ContentType: 'application/json' }));
   prepared.set(messageId, rec);
   setTimeout(() => prepared.delete(messageId), PREPARED_TTL);
-  try {
-    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `prepared/${messageId}.json`, Body: JSON.stringify(rec), ContentType: 'application/json' }));
-  } catch (e) { console.warn('S3 prepared persist failed:', e.message); }
 }
 
 async function loadPrepared(messageId) {
@@ -256,23 +261,20 @@ async function checkMessageSignature(walletAddress, messageId, signature) {
 }
 
 // ─── Session Storage ───
-// The in-memory Map is only a cache; S3 holds the record, so a restart does not
-// sign everyone out. A token is read back from S3 at most once per process.
+// S3 is authoritative on every request, including requests to another process.
+// Never trust a cached token after another instance has revoked it.
 function sessionKey(token) { return `sessions/${token}.json`; }
 
 async function persistSession(token, entry) {
-  try {
-    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: sessionKey(token), Body: JSON.stringify(entry), ContentType: 'application/json' }));
-  } catch (e) { console.warn('S3 session persist failed:', e.message); }
+  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: sessionKey(token), Body: JSON.stringify(entry), ContentType: 'application/json' }));
 }
 
 async function dropSession(token) {
+  await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: sessionKey(token) }));
   sessions.delete(token);
-  try { await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: sessionKey(token) })); } catch (e) {}
 }
 
 async function loadSession(token) {
-  if (sessions.has(token)) return sessions.get(token);
   try {
     const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: sessionKey(token) }));
     const entry = JSON.parse(await streamToString(data.Body));
@@ -291,7 +293,6 @@ async function loadSession(token) {
 const revokedBefore = new Map();  // address → ms (0 = none)
 function revokedKey(addr) { return `sessions-revoked/${addr}.json`; }
 async function getRevokedBefore(addr) {
-  if (revokedBefore.has(addr)) return revokedBefore.get(addr);
   let t = 0;
   try {
     const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: revokedKey(addr) }));
@@ -347,10 +348,10 @@ async function issueSession(address, extra = {}) {
   const token = uuidv4();
   const now = Date.now();
   const session = { address, issuedAt: now, expiresAt: now + SESSION_TTL, ...extra };
-  sessions.set(token, session);
   await persistSession(token, session);
+  sessions.set(token, session);
   // Best-effort in-process expiry; loadSession re-checks after a restart.
-  setTimeout(() => { dropSession(token); }, SESSION_TTL + 1000);
+  setTimeout(() => { dropSession(token).catch((e) => console.warn('Expired session cleanup failed:', e.message)); }, SESSION_TTL + 1000);
   return token;
 }
 
@@ -443,6 +444,14 @@ async function s3Json(key) {
 }
 const s3PutJson = (key, obj) => s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: JSON.stringify(obj), ContentType: 'application/json' }));
 async function passkeyIndex(addr) { return (await s3Json(passkeyIdxKey(addr))) || []; }
+// A rollback can restore a credential deleted after the backup. The session fence
+// must therefore cover credentials too, including discoverable sign-in. Never use
+// lastUsedAt/counter as an epoch: using a credential cannot re-enroll it.
+function passkeyAfterRestore(rec) {
+  if (!SESSIONS_NOT_BEFORE) return true;
+  const created = Date.parse(rec.createdAt);
+  return Number.isFinite(created) && created > SESSIONS_NOT_BEFORE;
+}
 function newPasskeyChallenge(entry) {
   if (passkeyChallenges.size > 5000) for (const [k, v] of passkeyChallenges) if (Date.now() > v.expiresAt) passkeyChallenges.delete(k);
   if (passkeyChallenges.size > 5000) return null;
@@ -467,7 +476,7 @@ app.post('/api/auth/passkey/register/options', requireAuth, async (req, res) => 
     if (!rp) return res.status(400).json({ error: 'Passkeys are not enabled for this origin' });
     if (!(await walletSession(req, res))) return;
     if (!checkRateLimit(req.walletAddress)) return res.status(429).json({ error: 'Too many requests' });
-    const existing = (await passkeyIndex(req.walletAddress)).filter((p) => p.rpId === rp.rpId);
+    const existing = (await passkeyIndex(req.walletAddress)).filter((p) => p.rpId === rp.rpId && passkeyAfterRestore(p));
     if (existing.length >= PASSKEY_MAX_PER_ADDRESS) return res.status(409).json({ error: `At most ${PASSKEY_MAX_PER_ADDRESS} passkeys per address` });
     const options = await webauthn.generateRegistrationOptions({
       rpName: 'dfmi', rpID: rp.rpId, userName: req.walletAddress, userDisplayName: req.walletAddress,
@@ -498,7 +507,7 @@ app.post('/api/auth/passkey/register/verify', requireAuth, async (req, res) => {
     if (!v.verified) { audit('passkey_register_failed', ch.address, { reason: 'not verified' }); return res.status(401).json({ error: 'Passkey registration could not be verified' }); }
     const c = v.registrationInfo.credential;
     const prior = await s3Json(passkeyRecKey(c.id));
-    if (prior) return res.status(409).json({ error: 'This passkey is already registered' });
+    if (prior && (prior.address !== ch.address || passkeyAfterRestore(prior))) return res.status(409).json({ error: 'This passkey is already registered' });
     const now = new Date().toISOString();
     const rec = { id: c.id, address: ch.address, rpId: ch.rpId, publicKey: b64u(c.publicKey), counter: c.counter, transports: c.transports || [],
       deviceType: v.registrationInfo.credentialDeviceType, backedUp: v.registrationInfo.credentialBackedUp, createdAt: now, lastUsedAt: null };
@@ -519,7 +528,7 @@ app.post('/api/auth/passkey/login/options', async (req, res) => {
     if (req.body && req.body.address) {
       if (!/^0x[0-9a-fA-F]{40}$/.test(req.body.address)) return res.status(400).json({ error: 'Invalid address' });
       address = req.body.address.toLowerCase();
-      allow = (await passkeyIndex(address)).filter((p) => p.rpId === rp.rpId).map((p) => ({ id: p.id, transports: p.transports }));
+      allow = (await passkeyIndex(address)).filter((p) => p.rpId === rp.rpId && passkeyAfterRestore(p)).map((p) => ({ id: p.id, transports: p.transports }));
       if (!allow.length) return res.status(404).json({ error: 'No passkey is registered for this address' });
     }
     const options = await webauthn.generateAuthenticationOptions({ rpID: rp.rpId, allowCredentials: allow, userVerification: 'preferred', timeout: CHALLENGE_TTL });
@@ -538,6 +547,7 @@ app.post('/api/auth/passkey/login/verify', async (req, res) => {
     const ch = t.ch;
     const rec = await s3Json(passkeyRecKey(response.id));
     if (!rec || rec.id !== response.id || rec.rpId !== ch.rpId) return res.status(401).json({ error: 'Unknown passkey' });
+    if (!passkeyAfterRestore(rec)) return res.status(401).json({ error: 'Passkey predates restore; sign in with your wallet and register it again' });
     if (ch.address && rec.address !== ch.address) return res.status(401).json({ error: 'Passkey belongs to another address' });
     let v;
     try {
@@ -627,9 +637,7 @@ app.post('/api/messages/content', requireAuth, async (req, res) => {
     const contentKey = `content/${messageId}.json`;
     const payload = JSON.stringify({ messageId, subject, body, recipientValue: recipientValue || '', subjectHash, bodyHash, storedAt: Date.now(), sender: req.walletAddress });
 
-    try {
-      await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: contentKey, Body: payload, ContentType: 'application/json' }));
-    } catch (e) { console.warn('S3 content upload failed, using in-memory:', e.message); }
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: contentKey, Body: payload, ContentType: 'application/json' }));
 
     contents.set(messageId, { subject, body, subjectHash, bodyHash, recipientValue: recipientValue || '', sender: req.walletAddress, timestamp: Date.now() });
     audit('content_uploaded', req.walletAddress, { messageId });
@@ -712,13 +720,11 @@ app.post('/api/messages/send-internal', requireAuth, async (req, res) => {
       subject: content.subject, body: content.body, timestamp: Date.now(),
       signature, signatureVerified: sigStatus === 'ok', onChain: !!onChainTxHash, onChainTxHash, internal: true
     };
-    if (!sentEmails.has(req.walletAddress)) sentEmails.set(req.walletAddress, []);
-    sentEmails.get(req.walletAddress).push(sentEntry);
     // Persist to S3
-    try { await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${req.walletAddress.toLowerCase()}/${messageId}.json`, Body: JSON.stringify(sentEntry), ContentType: 'application/json' })); } catch (e) { console.warn('S3 sent persist failed:', e.message); }
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${req.walletAddress.toLowerCase()}/${messageId}.json`, Body: JSON.stringify(sentEntry), ContentType: 'application/json' }));
 
     // Also persist content with recipientValue so inbox scan can find it
-    try {
+    {
       const contentPayload = JSON.stringify({
         messageId, subject: content.subject, body: content.body,
         recipientValue: toWallet.toLowerCase(),
@@ -726,7 +732,9 @@ app.post('/api/messages/send-internal', requireAuth, async (req, res) => {
         storedAt: Date.now(), sender: req.walletAddress
       });
       await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `content/${messageId}.json`, Body: contentPayload, ContentType: 'application/json' }));
-    } catch (e) { console.warn('S3 content re-persist failed:', e.message); }
+    }
+    if (!sentEmails.has(req.walletAddress)) sentEmails.set(req.walletAddress, []);
+    sentEmails.get(req.walletAddress).push(sentEntry);
 
     audit('send_internal', req.walletAddress, { messageId, recipientWallet, onChain: !!onChainTxHash });
     res.json({ sent: true, messageId, internal: true, onChain: !!onChainTxHash });
@@ -734,6 +742,7 @@ app.post('/api/messages/send-internal', requireAuth, async (req, res) => {
 });
 
 app.post('/api/messages/send-external', requireAuth, async (req, res) => {
+  let deliveryMayHaveOccurred = false;
   try {
     const { messageId, recipientEmail, subject, body, signature } = req.body;
     if (!recipientEmail || !subject || !body) return res.status(400).json({ error: 'Missing fields' });
@@ -752,21 +761,73 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
       }},
       EmailTags: [{ Name: 'wallet', Value: req.walletAddress }, { Name: 'messageId', Value: fid.slice(0,64) }]
     }));
+    deliveryMayHaveOccurred = true;
 
     const sentEntry = {
       id: fid, from: req.walletAddress, fromEmail: req.emailAddress,
       to: recipientEmail, toEmail: recipientEmail, subject, body,
       timestamp: Date.now(), signature, onChain: false, internal: false
     };
+    // Persist to S3
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${req.walletAddress.toLowerCase()}/${fid}.json`, Body: JSON.stringify(sentEntry), ContentType: 'application/json' }));
     if (!sentEmails.has(req.walletAddress)) sentEmails.set(req.walletAddress, []);
     sentEmails.get(req.walletAddress).push(sentEntry);
-    // Persist to S3
-    try { await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${req.walletAddress.toLowerCase()}/${fid}.json`, Body: JSON.stringify(sentEntry), ContentType: 'application/json' })); } catch (e) { console.warn('S3 sent persist failed:', e.message); }
 
     audit('send_external', req.walletAddress, { messageId: fid, recipientEmail });
     res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail });
-  } catch (err) { console.error('Send external error:', err); res.status(500).json({ error: err.message }); }
+  } catch (err) { console.error('Send external error:', err); res.status(500).json({ error: err.message, deliveryMayHaveOccurred }); }
 });
+
+// Read all pages before returning a successful mailbox response. A truncated
+// response without a progressing cursor must fail, never masquerade as complete.
+async function listMailObjects(prefix, maxKeys) {
+  const Contents = [], seen = new Set();
+  let token;
+  do {
+    const page = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, MaxKeys: maxKeys,
+      ...(token ? { ContinuationToken: token } : {}) }));
+    Contents.push(...(page.Contents || []));
+    if (!page.IsTruncated) return { Contents };
+    const next = page.NextContinuationToken;
+    if (typeof next !== 'string' || !next || seen.has(next)) throw new Error('Incomplete object listing');
+    seen.add(next); token = next;
+  } while (true);
+}
+
+function mailAliases(req) {
+  const wallet = req.walletAddress.toLowerCase();
+  const aliases = new Set([wallet, `${wallet}@${EMAIL_DOMAIN}`]);
+  const ens = trustedMailNames.get(wallet);
+  // Wallet-shaped local parts are reserved for that wallet, not ENS aliases.
+  if (ens && !/^0x[0-9a-f]{40}$/i.test(ens)) {
+    for (const value of [`${ens}@${EMAIL_DOMAIN}`, ens, `${ens}.dfmi`]) aliases.add(value.toLowerCase());
+  }
+  return aliases;
+}
+
+function mimeVisible(parsed, aliases) {
+  const recipients = [...(parsed.to?.value || []), ...(parsed.cc?.value || [])];
+  return recipients.some(v => aliases.has(v.address?.toLowerCase()));
+}
+
+async function mailBytes(key) {
+  try {
+    const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+    const chunks = []; for await (const chunk of data.Body) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks);
+  } catch (e) {
+    if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null;
+    e.mailStorageFailure = true; throw e;
+  }
+}
+
+function attachmentMetadata(parsed, id) {
+  return (parsed.attachments || []).map((a, index) => ({ index,
+    filename: Array.from(Buffer.from(String(a.filename || `attachment-${index}.bin`)).toString('utf8')
+      .replace(/[\x00-\x1f\x7f/\\]/g, '_')).slice(0, 200).join(''),
+    contentType: a.contentType || 'application/octet-stream', size: a.content.length,
+    downloadUrl: `/api/messages/${encodeURIComponent(id)}/attachments/${index}` }));
+}
 
 app.get('/api/messages/inbox', requireAuth, async (req, res) => {
   try {
@@ -775,31 +836,20 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
     const emails = [];
     const seenIds = new Set();
 
-    // Build strict alias set — only addresses that belong to THIS wallet
-    const aliases = new Set();
-    aliases.add(walletAddr);  // raw wallet address
-    aliases.add(`${walletAddr}@${EMAIL_DOMAIN}`);  // wallet@dfmi.me
-    const ens = ensCache.get(walletAddr);
-    if (ens) {
-      aliases.add(`${ens}@${EMAIL_DOMAIN}`);  // ens@dfmi.me
-      aliases.add(ens);  // bare ens name
-      aliases.add(`${ens}.dfmi`);  // ens.dfmi
-    }
-    // Add the userEmail from auth (addressToEmail result)
-    if (userEmail) aliases.add(userEmail);
+    const aliases = mailAliases(req);
     console.log(`[Inbox] Wallet: ${walletAddr}, aliases:`, [...aliases]);
 
     // Load persisted read/star/deleted state from S3
     const deletedIds = new Set();
     try {
-      const readListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: `state/${walletAddr}/read/`, MaxKeys: 500 }));
+      const readListed = await listMailObjects(`state/${walletAddr}/read/`, 500);
       if (readListed.Contents) {
         for (const obj of readListed.Contents) {
           const eid = obj.Key.split('/').pop();
           readState.set(`${walletAddr}:${eid}`, true);
         }
       }
-      const starListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: `state/${walletAddr}/star/`, MaxKeys: 500 }));
+      const starListed = await listMailObjects(`state/${walletAddr}/star/`, 500);
       if (starListed.Contents) {
         for (const obj of starListed.Contents) {
           const eid = obj.Key.split('/').pop();
@@ -808,27 +858,24 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
           starState.set(`${walletAddr}:${eid}`, val === 'true');
         }
       }
-      const deletedListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: `state/${walletAddr}/deleted/`, MaxKeys: 500 }));
+      const deletedListed = await listMailObjects(`state/${walletAddr}/deleted/`, 500);
       if (deletedListed.Contents) {
         for (const obj of deletedListed.Contents) {
           deletedIds.add(obj.Key.split('/').pop());
         }
       }
-    } catch (e) { console.warn('S3 state load error:', e.message); }
+    } catch (e) { console.warn('S3 state load error:', e.message); throw e; }
 
     // Helper: parse an S3 object into an email entry (always filters by recipient)
     async function parseEmailObject(obj) {
       if (obj.Key.includes('AMAZON_SES_SETUP_NOTIFICATION')) return null;
       try {
-        const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: obj.Key }));
-        const parsed = await simpleParser(await streamToString(data.Body));
+        const bytes = await mailBytes(obj.Key);
+        if (!bytes) return null;
+        const parsed = await simpleParser(bytes);
 
         // Always check that this email is addressed to this wallet owner
-        const allRecipients = [
-          ...(parsed.to?.value||[]).map(v=>v.address?.toLowerCase()),
-          ...(parsed.cc?.value||[]).map(v=>v.address?.toLowerCase())
-        ];
-        if (!allRecipients.some(a => aliases.has(a))) return null;
+        if (!mimeVisible(parsed, aliases)) return null;
 
         // Skip emails sent BY this wallet owner (those belong in Sent)
         const senderAddr = (parsed.from?.value?.[0]?.address || '').toLowerCase();
@@ -852,43 +899,43 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
           timestamp: parsed.date ? parsed.date.getTime() : obj.LastModified.getTime(),
           sentAt: parsed.date ? parsed.date.getTime() : null,
           receivedAt: obj.LastModified ? obj.LastModified.getTime() : null,
-          read: !!readState.get(sk), starred: !!starState.get(sk),
+          read: !!readState.get(sk), starred: !!starState.get(sk), attachments: attachmentMetadata(parsed, eid),
           verified: !!wmId, internal: (parsed.from?.value?.[0]?.address||'').endsWith(`@${EMAIL_DOMAIN}`)
         };
-      } catch (e) { console.warn('Parse error:', obj.Key, e.message); return null; }
+      } catch (e) { if (e.mailStorageFailure) throw e; console.warn('Parse error:', obj.Key, e.message); return null; }
     }
 
     // 1. Scan raw/ prefix (SES direct S3 delivery) — must match recipients
     try {
-      const rawListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: 'raw/', MaxKeys: 100 }));
+      const rawListed = await listMailObjects('raw/', 100);
       if (rawListed.Contents) {
         for (const obj of rawListed.Contents.reverse()) {
           const email = await parseEmailObject(obj);
           if (email) emails.push(email);
         }
       }
-    } catch (e) { console.warn('Raw scan error:', e.message); }
+    } catch (e) { console.warn('Raw scan error:', e.message); throw e; }
 
     // 2. Scan incoming/{wallet}/ prefix (SNS webhook delivery) — already filtered by wallet
     try {
-      const incomingListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: `incoming/${walletAddr}/`, MaxKeys: 100 }));
+      const incomingListed = await listMailObjects(`incoming/${walletAddr}/`, 100);
       if (incomingListed.Contents) {
         for (const obj of incomingListed.Contents.reverse()) {
           const email = await parseEmailObject(obj);
           if (email) emails.push(email);
         }
       }
-    } catch (e) { console.warn('Incoming scan error:', e.message); }
+    } catch (e) { console.warn('Incoming scan error:', e.message); throw e; }
 
     // 3. Scan content/ prefix for WalletMail internal messages sent to this user
     try {
-      const contentListed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: 'content/', MaxKeys: 100 }));
+      const contentListed = await listMailObjects('content/', 100);
       if (contentListed.Contents) {
         for (const obj of contentListed.Contents.reverse()) {
           try {
-            const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: obj.Key }));
-            const raw = await streamToString(data.Body);
-            const msg = JSON.parse(raw);
+            const bytes = await mailBytes(obj.Key);
+            if (!bytes) continue;
+            const msg = JSON.parse(bytes.toString('utf8'));
             // Check if this message was sent to this wallet
             const rv = (msg.recipientValue || '').toLowerCase();
             if (rv !== walletAddr && !aliases.has(rv)) continue;
@@ -915,10 +962,10 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
               read: !!readState.get(sk), starred: !!starState.get(sk),
               verified: true, internal: true
             });
-          } catch (e) { /* skip non-JSON or malformed */ }
+          } catch (e) { if (e.mailStorageFailure) throw e; /* skip non-JSON or malformed */ }
         }
       }
-    } catch (e) { console.warn('Content scan error:', e.message); }
+    } catch (e) { console.warn('Content scan error:', e.message); throw e; }
 
     // Collect unknown wallet addresses and populate cache from stored ENS names
     for (const e of emails) {
@@ -961,8 +1008,7 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
 
     res.json({ emails: filtered, count: filtered.length });
   } catch (err) {
-    if (err.name === 'NoSuchBucket') return res.json({ emails: [], count: 0 });
-    res.status(500).json({ error: err.message });
+    res.status(503).json({ error: 'Could not load complete mailbox' });
   }
 });
 
@@ -972,17 +1018,18 @@ app.get('/api/messages/sent', requireAuth, async (req, res) => {
     // Always load from S3 to ensure we have everything persisted
     const s3Emails = [];
     try {
-      const listed = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: `sent/${wallet}/`, MaxKeys: 200 }));
+      const listed = await listMailObjects(`sent/${wallet}/`, 200);
       if (listed.Contents && listed.Contents.length > 0) {
         for (const obj of listed.Contents) {
           try {
-            const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: obj.Key }));
-            const entry = JSON.parse(await streamToString(data.Body));
+            const bytes = await mailBytes(obj.Key);
+            if (!bytes) continue;
+            const entry = JSON.parse(bytes.toString('utf8'));
             s3Emails.push(entry);
-          } catch (e) { /* skip bad entries */ }
+          } catch (e) { if (e.mailStorageFailure) throw e; /* skip bad entries */ }
         }
       }
-    } catch (e) { console.warn('S3 sent load error:', e.message); }
+    } catch (e) { console.warn('S3 sent load error:', e.message); throw e; }
 
     // Merge: S3 is source of truth, add any in-memory that aren't in S3 yet
     const s3Ids = new Set(s3Emails.map(e => e.id));
@@ -1052,27 +1099,109 @@ app.get('/api/messages/sent', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/messages/:messageId', requireAuth, (req, res) => {
-  const c = contents.get(req.params.messageId);
-  if (!c) return res.status(404).json({ error: 'Not found' });
-  res.json({ messageId: req.params.messageId, subject: c.subject, body: c.body, subjectHash: c.subjectHash, bodyHash: c.bodyHash, sender: c.sender, timestamp: c.timestamp });
+async function mailJson(key) {
+  const bytes = await mailBytes(key);
+  if (!bytes) return null;
+  try { return JSON.parse(bytes.toString('utf8')); } catch { return null; }
+}
+
+async function mailDeleted(wallet, ...ids) {
+  for (const id of ids.filter(Boolean)) {
+    if (await mailBytes(`state/${wallet}/deleted/${id}`)) return true;
+  }
+  return false;
+}
+
+// Resolve details and downloads from the same authoritative source and access
+// checks. Never grant access merely because another wallet warmed a cache.
+async function visibleMessage(req) {
+  const id = req.params.messageId, wallet = req.walletAddress.toLowerCase();
+  if (!id || id.length > 256 || id === '.' || id === '..' || /[/\\\x00-\x1f\x7f]/.test(id)) return null;
+  if (await mailDeleted(wallet, id)) return null;
+  const aliases = mailAliases(req);
+  const content = await mailJson(`content/${id}.json`);
+  if (content && (String(content.sender || '').toLowerCase() === wallet || aliases.has(String(content.recipientValue || '').toLowerCase()))) {
+    return { detail: { messageId: id, subject: content.subject, body: content.body,
+      subjectHash: content.subjectHash, bodyHash: content.bodyHash, sender: content.sender,
+      timestamp: content.storedAt || content.timestamp, attachments: [] }, attachments: [] };
+  }
+  const sent = await mailJson(`sent/${wallet}/${id}.json`);
+  if (sent && String(sent.from || '').toLowerCase() === wallet) {
+    return { detail: { messageId: id, subject: sent.subject, body: sent.body, sender: sent.from,
+      timestamp: sent.timestamp, attachments: [] }, attachments: [] };
+  }
+  const tried = new Set();
+  async function mime(key) {
+    if (tried.has(key)) return null;
+    tried.add(key);
+    const bytes = await mailBytes(key);
+    if (!bytes) return null;
+    let parsed;
+    try { parsed = await simpleParser(bytes); } catch { return null; }
+    const sender = parsed.from?.value?.[0]?.address?.toLowerCase();
+    // Raw incoming From headers can be spoofed. Only recipients may read raw
+    // objects; sender access is granted by its authenticated sent/content record.
+    if (!mimeVisible(parsed, aliases)) return null;
+    const wmId = parsed.headers?.get('x-walletmail-id');
+    if (typeof wmId === 'string' && await mailDeleted(wallet, wmId)) return null;
+    return { detail: { messageId: id, subject: parsed.subject || '(no subject)', body: parsed.text || '',
+      html: parsed.html || '', sender, timestamp: parsed.date?.getTime(), attachments: attachmentMetadata(parsed, id) },
+      attachments: parsed.attachments || [] };
+  }
+  for (const key of [`raw/${id}`, `incoming/${wallet}/${id}`]) {
+    const result = await mime(key); if (result) return result;
+  }
+  // Old SES keys may have nested prefixes; inbox IDs remain their basename.
+  for (const prefix of ['raw/', `incoming/${wallet}/`]) {
+    const listed = await listMailObjects(prefix, 100);
+    for (const obj of listed.Contents) {
+      if (obj.Key.split('/').pop() !== id) continue;
+      const result = await mime(obj.Key); if (result) return result;
+    }
+  }
+  return null;
+}
+
+app.get('/api/messages/:messageId/attachments/:index', requireAuth, async (req, res) => {
+  try {
+    if (!/^(0|[1-9]\d*)$/.test(req.params.index)) return res.status(404).json({ error: 'Not found' });
+    const message = await visibleMessage(req);
+    const index = Number(req.params.index);
+    const attachment = Number.isSafeInteger(index) && message?.attachments[index];
+    if (!attachment) return res.status(404).json({ error: 'Not found' });
+    const name = message.detail.attachments[index].filename;
+    const encoded = encodeURIComponent(name).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+    res.set({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="attachment-${index}.bin"; filename*=UTF-8''${encoded}`,
+      'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; sandbox", 'Cache-Control': 'private, no-store' });
+    res.send(attachment.content);
+  } catch (err) { res.status(503).json({ error: 'Could not load attachment' }); }
+});
+
+app.get('/api/messages/:messageId', requireAuth, async (req, res) => {
+  try {
+    const message = await visibleMessage(req);
+    if (!message) return res.status(404).json({ error: 'Not found' });
+    res.set('Cache-Control', 'private, no-store').json(message.detail);
+  } catch (err) { res.status(503).json({ error: 'Could not load message' }); }
 });
 
 app.post('/api/messages/:messageId/read', requireAuth, async (req, res) => {
-  const k = `${req.walletAddress}:${req.params.messageId}`;
-  readState.set(k, true);
-  // Persist to S3
-  try { await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `state/${req.walletAddress}/read/${req.params.messageId}`, Body: 'true', ContentType: 'text/plain' })); } catch (e) { console.warn('S3 read state persist failed:', e.message); }
-  res.json({ read: true });
+  try {
+    const k = `${req.walletAddress}:${req.params.messageId}`;
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `state/${req.walletAddress}/read/${req.params.messageId}`, Body: 'true', ContentType: 'text/plain' }));
+    readState.set(k, true);
+    res.json({ read: true });
+  } catch (err) { res.status(503).json({ error: 'Could not save read state' }); }
 });
 
 app.post('/api/messages/:messageId/star', requireAuth, async (req, res) => {
-  const k = `${req.walletAddress}:${req.params.messageId}`;
-  const v = !starState.get(k);
-  starState.set(k, v);
-  // Persist to S3
-  try { await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `state/${req.walletAddress}/star/${req.params.messageId}`, Body: v ? 'true' : 'false', ContentType: 'text/plain' })); } catch (e) { console.warn('S3 star state persist failed:', e.message); }
-  res.json({ starred: v });
+  try {
+    const k = `${req.walletAddress}:${req.params.messageId}`;
+    const v = !starState.get(k);
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `state/${req.walletAddress}/star/${req.params.messageId}`, Body: v ? 'true' : 'false', ContentType: 'text/plain' }));
+    starState.set(k, v);
+    res.json({ starred: v });
+  } catch (err) { res.status(503).json({ error: 'Could not save star state' }); }
 });
 
 app.delete('/api/messages/:messageId', requireAuth, async (req, res) => {
@@ -1084,7 +1213,7 @@ app.delete('/api/messages/:messageId', requireAuth, async (req, res) => {
     await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `state/${wallet}/deleted/${messageId}`, Body: 'true', ContentType: 'text/plain' }));
     // If deleting from sent, also remove the sent S3 entry
     if (source === 'sent') {
-      try { await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${wallet}/${messageId}.json` })); } catch (e) {}
+      await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${wallet}/${messageId}.json` }));
       const mem = sentEmails.get(wallet);
       if (mem) sentEmails.set(wallet, mem.filter(e => e.id !== messageId));
     }
@@ -1197,26 +1326,27 @@ app.get('/api/contacts', requireAuth, async (req, res) => {
 });
 
 app.put('/api/contacts', requireAuth, async (req, res) => {
-  const body = req.body || {};
-  const incoming = Array.isArray(body) ? body : (Array.isArray(body.contacts) ? body.contacts : null);
-  if (!incoming) return res.status(400).json({ error: 'Expected { contacts: [] }' });
-  const wallet = req.walletAddress.toLowerCase();
-  const list = sanitizeContacts(incoming);
-  contactBooks.set(wallet, list);
-  // Persist to S3
   try {
+    const body = req.body || {};
+    const incoming = Array.isArray(body) ? body : (Array.isArray(body.contacts) ? body.contacts : null);
+    if (!incoming) return res.status(400).json({ error: 'Expected { contacts: [] }' });
+    const wallet = req.walletAddress.toLowerCase();
+    const list = sanitizeContacts(incoming);
     await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `contacts/${wallet}.json`, Body: JSON.stringify({ v: 1, address: wallet, updatedAt: Date.now(), contacts: list }), ContentType: 'application/json' }));
-  } catch (e) { console.warn('S3 contacts persist failed:', e.message); }
-  audit('contacts_saved', wallet, { count: list.length });
-  res.json({ saved: true, count: list.length });
+    contactBooks.set(wallet, list);
+    audit('contacts_saved', wallet, { count: list.length });
+    res.json({ saved: true, count: list.length });
+  } catch (err) { res.status(503).json({ error: 'Could not save contacts' }); }
 });
 
 // ─── Utility Routes ───
 // Sign out: this session only.
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
-  await dropSession(req.sessionToken);
-  audit('logout', req.walletAddress);
-  res.json({ ok: true });
+  try {
+    await dropSession(req.sessionToken);
+    audit('logout', req.walletAddress);
+    res.json({ ok: true });
+  } catch (err) { res.status(503).json({ error: 'Could not revoke session, try again' }); }
 });
 
 // Sign out on all devices: every session of this address issued until now.
