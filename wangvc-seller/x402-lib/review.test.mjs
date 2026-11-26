@@ -96,7 +96,7 @@ test('P5 an automatic refund whose tx is not visible is NEVER discarded and re-p
   const orders = fresh(); orders.create(order()); orders.update('ord_1', { status: 'refund_due', refund_due_at: new Date().toISOString() });
   let prepares = 0; const broadcasts = [];
   const gate = makeGate({ orders, fac: null,
-    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'unknown transaction' }), accountNonce: async () => 0, findTransfer: async () => null },
+    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'unknown transaction' }), accountNonce: async () => 0, findRefund: async () => ({ untagged: [] }), findTransfer: async () => null },
     refunder: { address: A, prepare: async () => { const n = prepares++; return { tx: '0x' + String(n).padStart(64, '0'), raw: 'signed' + n, nonce: n }; }, broadcast: async (raw) => broadcasts.push(raw) } });
   for (let i = 0; i < 3; i++) await gate.sweep({ produceFor: () => null });
   assert.equal(prepares, 1, 'one refund prepared');
@@ -109,7 +109,7 @@ test('P5 nonce consumed by ANOTHER tx and no matching transfer on chain → only
   const orders = fresh(); orders.create(order()); orders.update('ord_1', { status: 'refund_due', refund_due_at: new Date().toISOString() });
   let prepares = 0;
   const gate = makeGate({ orders, fac: null,
-    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'unknown transaction' }), accountNonce: async () => 5, findTransfer: async () => null },
+    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'unknown transaction' }), accountNonce: async () => 5, findRefund: async () => ({ untagged: [] }), findTransfer: async () => null },
     refunder: { address: A, prepare: async () => { const n = prepares++; return { tx: '0x' + String(n).padStart(64, '0'), raw: 'signed' + n, nonce: n }; }, broadcast: async () => {} } });
   await gate.sweep({ produceFor: () => null });        // prepare #0
   await gate.sweep({ produceFor: () => null });        // nonce 0 used elsewhere, no transfer → abandon #0
@@ -119,7 +119,7 @@ test('P5 nonce consumed by ANOTHER tx and no matching transfer on chain → only
   const o2 = fresh(); o2.create(order()); o2.update('ord_1', { status: 'refund_due', refund_due_at: new Date().toISOString() });
   let p2 = 0;
   const g2 = makeGate({ orders: o2, fac: null,
-    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'x' }), accountNonce: async () => 5, findTransfer: async () => ({ tx: H, block: 9 }) },
+    chain: { verifyRefund: async () => ({ ok: false, unknown: true, reason: 'x' }), accountNonce: async () => 5, findRefund: async () => ({ untagged: [] }), findTransfer: async () => ({ tx: H, block: 9 }) },
     refunder: { address: A, prepare: async () => ({ tx: '0x' + String(p2++).padStart(64, '0'), raw: 'r', nonce: 0 }), broadcast: async () => {} } });
   await g2.sweep({ produceFor: () => null }); await g2.sweep({ produceFor: () => null }); await g2.sweep({ produceFor: () => null });
   assert.equal(o2.get('ord_1').status, 'refunded'); assert.equal(o2.get('ord_1').refund_tx, H); assert.equal(p2, 1, 'never a second refund');
@@ -130,7 +130,7 @@ test('P5/D2 one automatic refund in flight at a time (the hot wallet nonce is ne
   const orders = fresh();
   for (const id of ['ord_1', 'ord_2', 'ord_3']) { orders.create(order(id)); orders.update(id, { status: 'refund_due', refund_due_at: new Date().toISOString() }); }
   let prepares = 0;
-  const gate = makeGate({ orders, fac: null, chain: { verifyRefund: async () => ({ ok: false, pending: true }), accountNonce: async () => 0, findTransfer: async () => null },
+  const gate = makeGate({ orders, fac: null, chain: { verifyRefund: async () => ({ ok: false, pending: true }), accountNonce: async () => 0, findRefund: async () => ({ untagged: [] }), findTransfer: async () => null },
     refunder: { address: A, prepare: async () => ({ tx: '0x' + String(prepares++).padStart(64, '0'), raw: 'r' + prepares, nonce: 0 }), broadcast: async () => {} } });
   await gate.sweep({ produceFor: () => null });
   assert.equal(prepares, 1);
@@ -157,7 +157,7 @@ test('P7 two writers on one order: a status transition is applied once (conditio
   // an operator claim and the automatic refunder cannot both take one refund
   orders.update('ord_1', { status: 'refund_due', refund_due_at: new Date().toISOString() });
   let prepares = 0;
-  const auto = makeGate({ orders, fac: null, chain: { verifyRefund: async () => ({ ok: false, pending: true }), accountNonce: async () => 0 }, refunder: { address: A, prepare: async () => ({ tx: '0x' + String(++prepares).padStart(64, '0'), raw: 'r', nonce: 0 }), broadcast: async () => {} } });
+  const auto = makeGate({ orders, fac: null, chain: { verifyRefund: async () => ({ ok: false, pending: true }), accountNonce: async () => 0, findRefund: async () => ({ untagged: [] }) }, refunder: { address: A, prepare: async () => ({ tx: '0x' + String(++prepares).padStart(64, '0'), raw: 'r', nonce: 0 }), broadcast: async () => {} } });
   await gates[0].claimRefund('ord_1');
   await auto.sweep({ produceFor: () => null });
   assert.equal(prepares, 0, 'the automatic refunder skips a claimed refund');
@@ -198,4 +198,18 @@ test('P10 safeFetch never reaches loopback / metadata through IPv6 spellings of 
   try {
     for (const host of ['[::ffff:127.0.0.1]', '[::ffff:7f00:1]', '[::127.0.0.1]']) await assert.rejects(safeFetch(`http://${host}:${server.address().port}/`), /blocked/, host);
   } finally { await new Promise((r) => server.close(r)); }
+});
+
+test('P11 an automatic refund is paid only after the chain has answered "not refunded yet": if the lookup fails, nothing is paid', async () => {
+  const orders = openOrders(':memory:'); const A = '0x' + 'a'.repeat(40);
+  orders.create({ id: 'ord_' + '1'.repeat(32), payment_key: 'k11', payload_hash: 'h11', resource: 'r', payer: A, amount: '20', scheme: 'exact', payment: JSON.stringify({ paymentPayload: { scheme: 'exact', payload: { authorization: { from: A } } }, paymentRequirements: {} }) });
+  orders.update('ord_' + '1'.repeat(32), { status: 'refund_due', refund_to: A, refund_due_at: new Date().toISOString() });
+  let prepares = 0;
+  for (const findRefund of [async () => { throw new Error('RPC down'); }, undefined]) {
+    const gate = makeGate({ orders, fac: null, chain: { verifyRefund: async () => ({ ok: false, pending: true }), accountNonce: async () => 0, ...(findRefund ? { findRefund } : {}) },
+      refunder: { address: A, prepare: async () => ({ tx: '0x' + String(++prepares).padStart(64, '0'), raw: 'r', nonce: 0 }), broadcast: async () => {} } });
+    await gate.sweep({ produceFor: () => null });
+  }
+  assert.equal(prepares, 0, 'no refund prepared while the chain cannot say whether it was already paid');
+  assert.equal(orders.get('ord_' + '1'.repeat(32)).status, 'refund_due', 'the debt is kept');
 });

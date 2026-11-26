@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)). That afternoon we added tools for the four remaining scenarios, found and fixed two problems, and deployed the fixes at 1:05 PM ([The four scenarios](#the-four-scenarios-25-november-afternoon)). At 4:39 PM the reviewer's second, isolated acceptance run found four more problems, including a refund paid twice after restoring an old backup. They are fixed in the seller library and drilled, and the fixed library has been live on every seller since 5:55 PM ([Deployment](#deployment-25-november-540555-pm)). One earlier claim of ours was overstated and is corrected below ([Second independent acceptance](#second-independent-acceptance-25-november-evening)).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)). That afternoon we added tools for the four remaining scenarios, found and fixed two problems, and deployed the fixes at 1:05 PM ([The four scenarios](#the-four-scenarios-25-november-afternoon)). At 4:39 PM the reviewer's second, isolated acceptance run found four more problems, including a refund paid twice after restoring an old backup. They are fixed in the seller library and drilled, and the fixed library has been live on every seller since 5:55 PM ([Deployment](#deployment-25-november-540555-pm)). One earlier claim of ours was overstated and is corrected below ([Second independent acceptance](#second-independent-acceptance-25-november-evening)). The reviewer's third check closed the four tested scenarios. It does not make the whole site production-ready ([Where this leaves us](#where-this-leaves-us)).
 
 | # | Issue | Status |
 |---|---|---|
@@ -117,6 +117,28 @@ They found four problems. All four are now fixed in the seller library ([`wangvc
 - Our own production restore program, which needs server access.
 
 Until those are covered and the deployed fixes are independently accepted, dfmi stays in the small trial.
+
+### Where this leaves us
+
+The reviewer re-tested commit `98ec530` in isolation: no change to the live environment, and no operator account or asset used. **They closed the four tested scenarios.** These are payment failures and refunds, concurrency on the paid path, the restore of the payment services, and the browser wallet. They also stated what that does **not** cover. We agree, and record it here:
+
+1. **Test maintenance (done).** Three older regression tests in [`wangvc-seller/x402-lib/review.test.mjs`](wangvc-seller/x402-lib/review.test.mjs) used mock chains without the new refund lookup (`findRefund`).
+   - The library treats a missing lookup as "cannot tell", and so pays nothing. That is correct, but it made those tests fail.
+   - The mocks now include `findRefund`, and a new test, P11, pins down that rule: if the lookup fails or is missing, no refund is prepared and the debt is kept. P11 fails against the library at `c9b60b7`.
+   - 16 of 16 pass.
+2. **Scope of the guarantees.** That production runs these fixes is **our report**, not something the reviewer observed. And the guarantees reach only as far as the configuration:
+
+   | Guarantee | Applies to | Not to |
+   |---|---|---|
+   | A restored database never pays a refund twice | the market report seller, the only one with automatic refunds | the others: they pay no refunds at all, and an owed refund there is alerted and paid by hand |
+   | Orders missing after a restore are rebuilt from the chain | the market report seller (`recover` is on) | the storefront, the wrapper, the summarizer and wangvc.dfmi.app: recovery is off there. An order lost by a restore comes back only when the buyer resends the same payment (no second charge) |
+   | One delivery callback per order; 429/503 + `Retry-After` | every seller | — |
+
+3. **Still not independently accepted.**
+   - Recovery of mail and sessions (`SESSIONS_NOT_BEFORE`): the mail server's code is not public.
+   - Passkey prompts on real phones and laptops: this needs a person with the devices, using the checklist in [`verify/README.md`](verify/README.md).
+
+**So the four tested scenarios are closed, but dfmi is not declared production-ready as a whole.** It stays in the small trial until item 3 is covered.
 
 ### Deployment, 25 November, 5:40–5:55 PM
 
