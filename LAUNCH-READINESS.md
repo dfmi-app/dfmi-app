@@ -177,12 +177,17 @@ The two files differ only in the four configuration defaults described at the to
 **What changes for users.**
 - A mailbox name now needs a confirmed owner, so a name that was only typed in at sign-in no longer brings in that name's mail.
 - If storage is unavailable, the mail pages show an error instead of an incomplete inbox.
-- The mail web page does not show attachments yet. The server provides them, but the page has not been updated.
+- **Attachments are in the mail page since 10:13 AM.** A message's attachments are listed under its body, each with name, size, type and a download button.
+  - The page fetches the file with the session token in the `Authorization` header, never in a URL.
+  - It sends that request only to the API's own attachment route, so a tampered download link gets no request and no token.
+  - The file always comes back as a download, never rendered in the page, so an HTML attachment can't run in the mail site.
+  - Our end-to-end test, with the real page (jsdom) against this server, passes 12 of 12: exact bytes (SHA-256), a hostile filename shown as text, the token only in the header, and a tampered link refused. Against the previous page it fails 4.
+  - The deployed page's SHA-256 is `1ab733382645628fa6d1c56a78683ea6246a0a609bf6523c9ddeee52ce869b72`; anyone can compare it with `curl -s https://email.dfmi.me/ | sha256sum`.
+  - Sending attachments is not supported.
 
 **Still open**, as listed in the delivery notes:
 - a real cloud restore with its evidence;
 - the restore runbook carried out end to end;
-- attachments in the mail page;
 - independent real-device acceptance;
 - production-scale load;
 - reliable outbound mail (no automatic resend when `deliveryMayHaveOccurred`).
