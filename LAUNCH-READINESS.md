@@ -2,7 +2,7 @@
 
 On 2026-11-24 an external reviewer read the public pages of dfmi.app read-only and listed five issues to fix before a production launch. Their conclusion was to keep dfmi.app in a small experimental trial. We agree with that conclusion: dfmi is a research demo and stays one.
 
-This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)). That afternoon we added tools for the four remaining scenarios, found and fixed two problems, and deployed the fixes at 1:05 PM ([The four scenarios](#the-four-scenarios-25-november-afternoon)). At 4:39 PM the reviewer's second, isolated acceptance run found four more problems, including a refund paid twice after restoring an old backup. They are fixed in the seller library and drilled, but **not yet deployed**. One earlier claim of ours was overstated and is corrected below ([Second independent acceptance](#second-independent-acceptance-25-november-evening)).
+This page records what changed for each issue, how it was tested, and what was checked on the live site afterwards. All of it is live on dfmi.app and its subdomains. Times are US Pacific. Last updated the same evening, after a follow-up review at 7:08 PM; see [Follow-up review](#follow-up-review-708-pm). At 7:58 PM the mail server also started verifying TLS certificates again (item 3). At 9:29 PM automatic refunds went live for the market-report seller (item 5), and a nonce bug in the wallet app's Send page was fixed (item 4). On 25 November at 8:05 AM passkeys became server-verified (item 3), and at 8:41 AM a public monitor status and a verification kit were added, so that these claims can be checked independently ([Verify it yourself](#verify-it-yourself)). On 25 November between 10:19 and 10:22 AM the reviewer ran the kit against production: 51 of 51 checks passed ([Independent acceptance](#independent-acceptance-25-november)). That afternoon we added tools for the four remaining scenarios, found and fixed two problems, and deployed the fixes at 1:05 PM ([The four scenarios](#the-four-scenarios-25-november-afternoon)). At 4:39 PM the reviewer's second, isolated acceptance run found four more problems, including a refund paid twice after restoring an old backup. They are fixed in the seller library and drilled, and the fixed library has been live on every seller since 5:55 PM ([Deployment](#deployment-25-november-540555-pm)). One earlier claim of ours was overstated and is corrected below ([Second independent acceptance](#second-independent-acceptance-25-november-evening)).
 
 | # | Issue | Status |
 |---|---|---|
@@ -92,7 +92,7 @@ The reviewer tested commit `c9b60b7` in an isolated environment. It had no conne
 
 **Capacity, measured locally.** 16 independent wallets took part. A 60-second sustained ramp completed 537 purchases with 0 timeouts. Together with the earlier phases there were 554 orders, and each was charged exactly once. Throughput was about 8.8 purchases per second, and p95 time to first delivery was 612 ms. This used a local chain, a test settlement service and a simulated report, so **it is not a production capacity commitment.**
 
-They found four problems. All four are now fixed in the seller library ([`wangvc-seller/x402-lib`](wangvc-seller/x402-lib/)) and covered by drills 9–13 in [`verify/drills/payment-faults.mjs`](verify/drills/payment-faults.mjs). The fixes are **not yet deployed**.
+They found four problems. All four are now fixed in the seller library ([`wangvc-seller/x402-lib`](wangvc-seller/x402-lib/)) and covered by drills 9–13 in [`verify/drills/payment-faults.mjs`](verify/drills/payment-faults.mjs). The fixes are live on every seller; see [Deployment](#deployment-25-november-540555-pm).
 
 | # | Problem found | Cause | Fix |
 |---|---|---|---|
@@ -116,7 +116,34 @@ They found four problems. All four are now fixed in the seller library ([`wangvc
 - Passkey prompts on real devices.
 - Our own production restore program, which needs server access.
 
-Until those are covered and the fixes are deployed and accepted, dfmi stays in the small trial.
+Until those are covered and the deployed fixes are independently accepted, dfmi stays in the small trial.
+
+### Deployment, 25 November, 5:40–5:55 PM
+
+Every seller now runs the fixed library as published in commit `98ec530`. The deployed copy differs from it only in one code comment.
+
+| Seller | Live from | What changed |
+|---|---|---|
+| Market report (producer.dfmi.app) | 5:40 PM | The library, and recovery of missing orders is switched on (`recover`, mode `deliver`). This is the only seller with automatic refunds, so the refund fix (problem 1) matters here. Its payment address is used by no other seller. |
+| Wrapper (wrap.dfmi.app) | 5:54 PM | The library only. It uses the delivery callback, so problem 4 applied to it. |
+| Storefront (shop.dfmi.app), summarizer (summarize.dfmi.app), wangvc.dfmi.app | 5:55 PM | The library only. None of them pays refunds. |
+
+Recovery stays off for the other sellers. The summarizer and the wrapper share one payment address, and wangvc.dfmi.app sells three resources on one address. A payment found on chain could therefore belong to a different seller, or match more than one product.
+
+**How it was deployed.**
+- Before each seller, we checked that its running library was byte-for-byte the version the reviewer tested.
+- Its order database and library were backed up first.
+- After the restart, the old version can be put back from that backup.
+
+**Checked afterwards.**
+- All sellers are online with clean logs.
+- `verify-payments.mjs` (read-only) against production: all 6 paid endpoints answer `402` with complete payment requirements, and the monitor and backup checks pass (12 of 12; the rate-limit burst was skipped on that run, after a full run of 13 of 13 right after the market report seller was deployed).
+- On the market report seller, the first recovery pass started from its newest order. It scanned up to the current block and rebuilt nothing: all of its orders were already known, and no older payment was touched.
+
+**Not shown on production yet.**
+- No order has been refunded since the deployment, so the new "look on chain before refunding" step has run only in the drills.
+- No order has been missing, so recovery has rebuilt nothing on production.
+- Both are covered by drills 9–12 and by the reviewer's restore script.
 
 ## Follow-up review, 7:08 PM
 
