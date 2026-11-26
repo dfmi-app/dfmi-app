@@ -18,7 +18,12 @@ export const PREFLIGHT = { ...CORS, 'access-control-allow-methods': 'GET, POST, 
 // Env: ORDER_SWEEP_MS (60000), ORDER_SWEEP_OLDER_MS (30000), ORDER_RECON_AFTER_MS (120000), REFUND_ALERT_MS (3600000),
 //      REFUND_PRIVATE_KEY (optional hot wallet holding dUSD, used by THIS process only: refunds are paid automatically, one at a
 //      time, and verified on chain), REFUND_SOURCES (comma-separated senders a manual refund must come from; empty = any).
-export function makeSellerKit({ name, dbFile, facilitator, facAuth = '', env = {}, limits = {}, chain: chainCfg = null, sweepMs = 60_000, log = (...a) => console.log(`[${name}]`, ...a) }) {
+// recover: [{ requirements, mode }] — the seller's offers. With a chain config, the sweeper then rebuilds orders that are paid
+//      on chain but missing from the database (e.g. made after the backup it was restored from). mode 'deliver' (default:
+//      the product needs no buyer inputs) produces them; 'refund' waits ORDER_RECOVER_GRACE_MS (24 h) for the buyer to send
+//      the same X-PAYMENT again, then refunds. Each offer's payTo must be used by this seller only.
+//      Env: ORDER_RECOVER_GRACE_MS, ORDER_RECOVER_MIN_AGE_MS (120000: younger payments belong to a request in progress).
+export function makeSellerKit({ name, dbFile, facilitator, facAuth = '', env = {}, limits = {}, chain: chainCfg = null, sweepMs = 60_000, recover = [], log = (...a) => console.log(`[${name}]`, ...a) }) {
   const E = (k, d) => env[k] ?? process.env[k] ?? d;
   sweepMs = Number(E('ORDER_SWEEP_MS', sweepMs));
   const orders = openOrders(dbFile, { maxAttempts: Number(env.ORDER_MAX_ATTEMPTS ?? process.env.ORDER_MAX_ATTEMPTS ?? 5), maxAgeMs: Number(env.ORDER_MAX_AGE_MS ?? process.env.ORDER_MAX_AGE_MS ?? 24 * 3600_000) });
@@ -30,7 +35,9 @@ export function makeSellerKit({ name, dbFile, facilitator, facAuth = '', env = {
   const chain = chainCfg?.rpc && chainCfg?.token ? makeChain({ rpc: chainCfg.rpc, token: chainCfg.token, insecure: !!chainCfg.insecure }) : null;
   if (!chain) log('note: no chain config — orders with an unknown settlement outcome are kept but cannot be reconciled on chain');
   const refundSources = String(E('REFUND_SOURCES', '')).split(',').map((s) => s.trim()).filter(Boolean); // allowed senders of manual refunds
-  const gate = makeGate({ orders, fac, log, chain, reconAfterMs: Number(E('ORDER_RECON_AFTER_MS', 120_000)), refundAlertMs: Number(E('REFUND_ALERT_MS', 3600_000)), refundSources });
+  const gate = makeGate({ orders, fac, log, chain, reconAfterMs: Number(E('ORDER_RECON_AFTER_MS', 120_000)), refundAlertMs: Number(E('REFUND_ALERT_MS', 3600_000)), refundSources,
+    recoverOffers: recover, recoverGraceMs: Number(E('ORDER_RECOVER_GRACE_MS', 24 * 3600_000)), recoverMinAgeMs: Number(E('ORDER_RECOVER_MIN_AGE_MS', 120_000)) });
+  if (recover.length && !chain) log('note: recover is set but there is no chain config — orders missing from the database cannot be recovered');
   const refundKey = E('REFUND_PRIVATE_KEY', '');
   const refunderReady = refundKey && chain
     ? makeRefunder({ chain, privateKey: refundKey, token: chainCfg.token, chainId: Number(chainCfg.chainId), gasPriceGwei: chainCfg.gasPriceGwei ?? 1 })

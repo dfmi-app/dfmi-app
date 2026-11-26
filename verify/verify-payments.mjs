@@ -18,8 +18,9 @@
 //   - the SAME payment sent N times at once: one order, one settlement, one charge on chain;
 //   - M different purchases at once: each delivered exactly once, M charges, no lost or doubled payment;
 //   - a sustained run (default 60 s): success rate, latency percentiles, timeouts;
-//   - requests over the per-client limits get 429 with Retry-After (never a 5xx, never a hang); the script waits and
-//     retries them, as a client should.
+//   - overload is answered with 429 (this client is over its limits) or 503 (the seller is at its global limit, or the
+//     delivery is not finished yet), ALWAYS with Retry-After; both mean "not done, send the same request again". The
+//     script waits and retries them, as a client should. Any other error, a 5xx without Retry-After, or a hang fails.
 // dUSD is a points unit with no monetary value.
 //
 //   npm install && node verify-payments.mjs           # read-only
@@ -90,7 +91,7 @@ async function paymentHeader(buyer, offer, token, payTo) {
   const signature = await buyer.signTypedData({ name: offer.extra?.name || 'DFMI Dollar', version: offer.extra?.version || '1', chainId, verifyingContract: token }, EIP3009, authorization);
   return { nonce: authorization.nonce, header: Buffer.from(JSON.stringify({ x402Version: 1, scheme: 'exact', network: offer.network, payload: { signature, authorization } })).toString('base64') };
 }
-/** one paid request; a 429 is waited out (Retry-After) and retried, as a client should. Records every answer. */
+/** one paid request; 429 and 503 with Retry-After are waited out and retried, as a client should. Records every answer. */
 async function paidRequest(header, log = []) {
   const t0 = Date.now();
   for (let attempt = 0; attempt < 40; attempt++) {
@@ -99,11 +100,12 @@ async function paidRequest(header, log = []) {
     catch (e) { log.push({ status: e.name === 'TimeoutError' ? 'timeout' : 'error', error: e.message }); return { status: 'timeout', ms: Date.now() - t0, attempts: attempt + 1, log }; }
     const text = await r.text();
     log.push({ status: r.status, retryAfter: r.headers.get('retry-after') });
-    if (r.status === 429) { await new Promise((res) => setTimeout(res, 1000 * Math.min(10, Number(r.headers.get('retry-after')) || 1) + Math.random() * 300)); continue; }
+    if ((r.status === 429 || r.status === 503) && r.headers.get('retry-after')) { await new Promise((res) => setTimeout(res, 1000 * Math.min(10, Number(r.headers.get('retry-after')) || 1) + Math.random() * 300)); continue; }
     return { status: r.status, ms: Date.now() - t0, attempts: attempt + 1, body: text, order: r.headers.get('x-order-id'), settle: settleHdr(r), statusUrl: r.headers.get('x-order-status-url'), redelivery: !!r.headers.get('x-redelivery'), log };
   }
   return { status: 'gave-up', ms: Date.now() - t0, attempts: 40, log };
 }
+const backpressure = (l) => l.status === 200 || ((l.status === 429 || l.status === 503) && !!l.retryAfter);
 async function fundedBuyer() {
   const buyer = KEY ? new Wallet(KEY) : Wallet.createRandom();
   console.log(`      throwaway buyer ${buyer.address}`);
@@ -128,10 +130,10 @@ async function transfersFrom(token, who, fromBlock) {
 }
 const pct = (xs, p) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.ceil((p / 100) * s.length) - 1)]; };
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
-async function deliveredStatus(r) {   // the status URL shares the seller's per-client limits: wait out a 429
+async function deliveredStatus(r) {   // the status URL shares the seller's limits: wait out a 429 / 503
   for (let i = 0; i < 20; i++) {
     const res = await get(new URL(r.statusUrl || '', RESOURCE).toString());
-    if (res.status === 429) { await res.arrayBuffer(); await new Promise((ok) => setTimeout(ok, 1000 * (Number(res.headers.get('retry-after')) || 1))); continue; }
+    if (res.status === 429 || res.status === 503) { await res.arrayBuffer(); await new Promise((ok) => setTimeout(ok, 1000 * (Number(res.headers.get('retry-after')) || 1))); continue; }
     const os = await res.json().catch(() => ({}));
     return os.status === 'delivered' && os.transaction === r.settle?.transaction;
   }
@@ -199,7 +201,7 @@ if (LOAD) {
   check(`the same payment sent ${SAME} times at once: every request ends with the report`, rs1.every((r) => r.status === 200), rs1.map((r) => r.status).join(' '));
   check('…all with one order and one settlement transaction', new Set(rs1.map((r) => r.order)).size === 1 && new Set(rs1.map((r) => r.settle?.transaction)).size === 1,
     `${new Set(rs1.map((r) => r.order)).size} order(s), ${new Set(rs1.map((r) => r.settle?.transaction)).size} transaction(s)`);
-  check('…over-limit requests got 429 with Retry-After, never a 5xx', rs1.every((r) => r.log.every((l) => l.status === 200 || (l.status === 429 && l.retryAfter))), summary(rs1));
+  check('…every refusal on the way was 429 or 503 with Retry-After (no other error)', rs1.every((r) => r.log.every(backpressure)), summary(rs1));
 
   // 2. M different purchases at once
   const hs = await Promise.all(Array.from({ length: MANY }, () => paymentHeader(buyer, offer, token, payTo)));
@@ -210,7 +212,7 @@ if (LOAD) {
   console.log(`      ${MANY} different purchases at once: answers ${summary(rs2)}; all done in ${secs(Date.now() - t2)}; per purchase p50 ${secs(pct(ms2, 50))}, max ${secs(Math.max(...ms2))}`);
   check(`${MANY} different purchases at once: each delivers its report`, rs2.every((r) => r.status === 200), rs2.map((r) => r.status).join(' '));
   check(`…${MANY} distinct orders and ${MANY} distinct settlement transactions`, new Set(rs2.map((r) => r.order)).size === MANY && new Set(rs2.map((r) => r.settle?.transaction)).size === MANY);
-  check('…over-limit requests got 429 with Retry-After, never a 5xx', rs2.every((r) => r.log.every((l) => l.status === 200 || (l.status === 429 && l.retryAfter))), summary(rs2));
+  check('…every refusal on the way was 429 or 503 with Retry-After (no other error)', rs2.every((r) => r.log.every(backpressure)), summary(rs2));
 
   // 3. sustained: one new purchase every SOAK_EVERY_MS for SOAK_S seconds (each also retried once, as after a lost answer)
   const t3 = Date.now(); const rs3 = []; const running = [];
@@ -227,6 +229,7 @@ if (LOAD) {
   const timeouts = rs3.filter((r) => r.status === 'timeout' || r.status === 'gave-up').length;
   console.log(`      sustained ${SOAK_S} s, one purchase every ${secs(SOAK_EVERY_MS)}: ${ok3.length}/${rs3.length} delivered; latency p50 ${secs(pct(ms3, 50))}, p95 ${secs(pct(ms3, 95))}, p99 ${secs(pct(ms3, 99))}, max ${secs(Math.max(0, ...ms3))}; ${timeouts} timeout(s) (limit ${secs(REQ_TIMEOUT_MS)}); answers ${summary(rs3)}`);
   check(`sustained run: every purchase delivered, no timeouts`, rs3.length > 0 && ok3.length === rs3.length && timeouts === 0, `${ok3.length}/${rs3.length}`);
+  check('…every refusal on the way was 429 or 503 with Retry-After (no other error)', rs3.every((r) => r.log.every(backpressure)), summary(rs3));
   check('…every purchase, retried, returns the same order and transaction', ok3.every((r) => r.retryOk));
 
   // money side, on chain, for the whole run

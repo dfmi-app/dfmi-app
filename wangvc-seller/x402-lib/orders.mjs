@@ -24,6 +24,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomBytes } from 'node:crypto';
 import { decodePaymentHeader, HttpError } from './limits.mjs';
+import { refundTag } from './chain-recon.mjs';
 
 // reasons an already-settled payment reports on re-verification; such a payment may be ours → ask /settle (idempotent)
 export const CONSUMED_HINT = /already used|replay|bad nonce|revoked|expired|deadline|stale generation/i;
@@ -69,8 +70,20 @@ export function openOrders(file, { maxAttempts = 5, maxAgeMs = 24 * 3600_000 } =
   db.exec(`DROP INDEX IF EXISTS orders_refund_tx;
     UPDATE orders SET refund_tx = lower(refund_tx) WHERE refund_tx IS NOT NULL AND refund_tx <> lower(refund_tx);
     CREATE UNIQUE INDEX IF NOT EXISTS orders_refund_tx_lc ON orders(lower(refund_tx)) WHERE refund_tx IS NOT NULL;`);
+  // order ids by which a recovered order can also be found (a buyer's client may have encoded the same payment slightly
+  // differently from the rebuilt one), and small persistent state such as the chain-recovery cursor. Both live in the
+  // same database, so a restored backup brings back the matching cursor and the recovery rescans what the backup lacks.
+  db.exec(`CREATE TABLE IF NOT EXISTS order_alias (alias TEXT PRIMARY KEY, id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+    CREATE INDEX IF NOT EXISTS orders_tx_lc ON orders(lower(tx)) WHERE tx IS NOT NULL;`);
   const q = {
     byId: db.prepare('SELECT * FROM orders WHERE id = ?'),
+    byTx: db.prepare('SELECT * FROM orders WHERE lower(tx) = lower(?)'),
+    byRefundTx: db.prepare('SELECT id FROM orders WHERE lower(refund_tx) = lower(?)'),
+    byAlias: db.prepare('SELECT o.* FROM order_alias a JOIN orders o ON o.id = a.id WHERE a.alias = ?'),
+    addAlias: db.prepare('INSERT OR IGNORE INTO order_alias (alias, id) VALUES (?, ?)'),
+    kvGet: db.prepare('SELECT v FROM kv WHERE k = ?'), kvSet: db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v'),
+    maxBlock: db.prepare('SELECT max(block) AS b FROM orders WHERE block IS NOT NULL'),
     byKey: db.prepare('SELECT * FROM orders WHERE payment_key = ?'),
     insert: db.prepare(`INSERT OR IGNORE INTO orders (id, payment_key, payload_hash, resource, inputs, payer, amount, scheme, status, goods, payment)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'settling', ?, ?)`),
@@ -84,7 +97,10 @@ export function openOrders(file, { maxAttempts = 5, maxAgeMs = 24 * 3600_000 } =
   const transition = (id, from, fields) => { const cols = Object.keys(fields); const r = stmt(cols, true).run(...cols.map((c) => fields[c]), id, from); return r.changes ? q.byId.get(id) : null; };
   return {
     db, maxAttempts, maxAgeMs,
-    get: (id) => q.byId.get(id), byKey: (k) => q.byKey.get(k),
+    get: (id) => q.byId.get(id) || q.byAlias.get(id), byKey: (k) => q.byKey.get(k), byTx: (tx) => q.byTx.get(tx),
+    isRefundTx: (tx) => !!q.byRefundTx.get(tx), addAlias: (alias, id) => q.addAlias.run(alias, id),
+    kv: (k, v) => { if (v === undefined) return q.kvGet.get(k)?.v ?? null; q.kvSet.run(k, String(v)); return v; },
+    maxBlock: () => q.maxBlock.get()?.b ?? null,
     create: (o) => { q.insert.run(o.id, o.payment_key, o.payload_hash, o.resource, o.inputs ?? null, o.payer ?? null, o.amount ?? null, o.scheme ?? null, o.goods ?? null, o.payment ?? null); return q.byKey.get(o.payment_key); },
     update, transition, list: (status, limit = 100) => q.byStatus.all(status, limit),
     close: () => db.close(),
@@ -120,8 +136,64 @@ export function receipt(o) {
  *   refundSources: allowed senders of a manual refund (empty = any sender, still one matching transfer after the obligation).
  */
 export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/', chain = null, refunder: refunder0 = null,
-  reconAfterMs = 120_000, refundAlertMs = 3600_000, refundSources = [], alert = (m) => log(`ALERT ${m}`) }) {
+  reconAfterMs = 120_000, refundAlertMs = 3600_000, refundSources = [], alert = (m) => log(`ALERT ${m}`),
+  recoverOffers = [], recoverGraceMs = 24 * 3600_000, recoverMinAgeMs = 120_000, recoverMaxBlocks = 50_000 }) {
   let refunder = refunder0;
+  const isRecovered = (o) => !!(o.aux && JSON.parse(o.aux).recovered);
+  function adoptPayment(o, pp, requirements, inputs, hash) {
+    log(`order ${o.id}: recovered from chain; the buyer's X-PAYMENT replaces the rebuilt copy`);
+    return orders.update(o.id, { payload_hash: hash, payment_key: paymentKey(pp, requirements), payment: JSON.stringify({ paymentPayload: pp, paymentRequirements: requirements }),
+      ...(o.goods ? {} : { resource: requirements.resource }), ...(inputs && !o.inputs ? { inputs: JSON.stringify(inputs) } : {}) });
+  }
+
+  /**
+   * Orders the database does not have (e.g. made after the backup it was restored from), rebuilt from the chain: every
+   * payment to an offer's payTo since the recovery cursor that no order records becomes a 'paid' order with the original
+   * transaction, findable under each id the buyer's client may have computed. Offers with mode 'deliver' (the product
+   * needs no buyer inputs) are then produced by the sweep as usual; mode 'refund' waits recoverGraceMs for the buyer to
+   * send the same X-PAYMENT again (which supplies the inputs and delivers), then it is refunded. Each payTo must belong
+   * to this seller only. Payments younger than recoverMinAgeMs are left to the request that is settling them.
+   */
+  async function recoverFromChain() {
+    if (!chain || !recoverOffers.length) return;
+    const { n: head, ts: headTs } = await chain.head();
+    const byPayTo = new Map();
+    for (const off of recoverOffers) { const k = String(off.requirements.payTo).toLowerCase(); if (!byPayTo.has(k)) byPayTo.set(k, []); byPayTo.get(k).push(off); }
+    for (const [payTo, offers] of byPayTo) {
+      const ck = `recover_block:${payTo}`;
+      let from = Number(orders.kv(ck) ?? (orders.maxBlock() ?? head));
+      const to = Math.min(head, from + recoverMaxBlocks);
+      if (to < from) continue;
+      const found = await chain.scanPayments({ payTo, network: offers[0].requirements.network, fromBlock: Math.max(0, from - 20), toBlock: to });
+      let safeTo = to;
+      for (const p of found) {
+        if (orders.byTx(p.tx)) continue;
+        const reqs = offers.map((x) => x.requirements);
+        if (p.candidates.some((pp) => orders.byKey(paymentKey(pp, reqs[0])) || orders.get(orderIdFor(pp)))) continue;    // a live request owns it
+        const ts = await blockTsOf(p.block);
+        if (headTs - ts < recoverMinAgeMs / 1000) { safeTo = Math.min(safeTo, p.block - 1); continue; }                    // look again next sweep
+        const matches = offers.filter((x) => BigInt(x.requirements.maxAmountRequired) === BigInt(p.amount));
+        const off = matches.length === 1 ? matches[0] : null;
+        const req = off ? off.requirements : { ...reqs[0], resource: 'unknown (recovered from chain: no single offer has this price)' };
+        const pp = p.candidates[0];
+        const id = orderIdFor(pp);
+        const o0 = orders.create({ id, payment_key: paymentKey(pp, req), payload_hash: payloadHash(pp), resource: req.resource, inputs: null, payer: p.payer, amount: p.amount, scheme: pp.scheme,
+          payment: JSON.stringify({ paymentPayload: pp, paymentRequirements: req }) });
+        if (!o0 || o0.id !== id) continue;
+        for (const c of p.candidates) orders.addAlias(orderIdFor(c), id);
+        const mode = off ? (off.mode || 'deliver') : 'refund';
+        const o = orders.transition(id, 'settling', { status: 'paid', tx: p.tx, block: p.block, paid_at: new Date(ts * 1000).toISOString(),
+          settle: JSON.stringify({ success: true, transaction: p.tx, blockNumber: p.block, network: req.network, payer: p.payer, recovered: 'chain' }),
+          aux: JSON.stringify({ recovered: { at: now(), mode, tx: p.tx } }), recon: JSON.stringify({ at: now(), why: 'no order for a payment on chain', result: 'recovered', tx: p.tx }) });
+        log(`order ${id}: recovered from chain (tx ${p.tx}, block ${p.block}, ${mode})`);
+        if (o && mode === 'refund') alertOnce(id, `RECOVERED ORDER ${id}: paid on chain (tx ${p.tx}) but not in the database; delivered if the buyer retries within ${Math.round(recoverGraceMs / 3600_000)} h, refunded otherwise`);
+      }
+      orders.kv(ck, safeTo);
+    }
+  }
+  const tsCache = new Map();
+  async function blockTsOf(n) { if (!tsCache.has(n)) { const b = await chain.call('eth_getBlockByNumber', ['0x' + n.toString(16), false]); tsCache.set(n, Number(BigInt(b.timestamp))); } return tsCache.get(n); }
+
   const locks = new Map(); // order id → promise (one resume at a time per order in this process)
   const withLock = async (id, fn) => {
     while (locks.has(id)) { try { await locks.get(id); } catch {} }
@@ -185,14 +257,22 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
     return { o: orders.transition(o.id, 'settling', { status: 'refused', last_error: reason }) || orders.get(o.id), refused: reason };
   }
 
-  async function produceOrder(o, produce) {
+  // Only the writer that commits paid -> delivered owns this best-effort callback.
+  // Returning an already delivered row (including a concurrent winner's row) must not repeat it.
+  function completeDelivery(o, fields, onDelivered) {
+    const delivered = orders.transition(o.id, 'paid', { status: 'delivered', ...fields });
+    if (delivered && onDelivered) { try { onDelivered(delivered); } catch (e) { log(`onDelivered: ${e.message}`); } }
+    return delivered || orders.get(o.id);
+  }
+
+  async function produceOrder(o, produce, onDelivered) {
     const aux = o.aux ? JSON.parse(o.aux) : {};
     const ctx = { order: o, aux, saveAux: (x) => { Object.assign(aux, x); orders.update(o.id, { aux: JSON.stringify(aux) }); } };
     try {
       const goods = await produce(ctx);
       if (goods === undefined || goods === null) throw new Error('producer returned no goods');
       if (typeof goods === 'object' && Object.prototype.hasOwnProperty.call(goods, 'error')) throw new Error(`producer returned an error instead of goods: ${String(goods.error).slice(0, 200)}`); // never store an error as delivered
-      return orders.transition(o.id, 'paid', { status: 'delivered', goods: JSON.stringify(goods), delivered_at: now(), attempts: o.attempts + 1, last_error: null }) || orders.get(o.id);
+      return completeDelivery(o, { goods: JSON.stringify(goods), delivered_at: now(), attempts: o.attempts + 1, last_error: null }, onDelivered);
     } catch (e) {
       const attempts = o.attempts + 1;
       const old = Date.now() - Date.parse(o.paid_at || o.created_at) > orders.maxAgeMs;
@@ -216,9 +296,9 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       const r = await settleOrder(o, body, opts);
       o = r.o;
       if (r.refused || r.transient || r.voided) return o;
-      if (produceFirst && o.goods && o.status === 'paid') return orders.transition(o.id, 'paid', { status: 'delivered', delivered_at: now() }) || orders.get(o.id);
+      if (produceFirst && o.goods && o.status === 'paid') return completeDelivery(o, { delivered_at: now() }, opts.onDelivered);
     }
-    if (o.status === 'paid') o = await produceOrder(o, produce);
+    if (o.status === 'paid') o = await produceOrder(o, produce, opts.onDelivered);
     return o;
   }
 
@@ -230,7 +310,18 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       if (refunder && chain) {
         // one automatic refund in flight at a time: the hot wallet's nonces are never raced
         if (orders.list('refund_sent', 500).some((x) => x.refund_raw)) return o;
-        const p = await refunder.prepare(to, o.amount);
+        // a restored or stale row may owe a refund that was in fact paid after the backup: ask the chain first
+        const tag = refundTag(o.id);
+        const prior = await chain.findRefund({ froms: [refunder.address, ...refundSources], to, minAmount: o.amount, sinceTs: notBefore, tag, isKnownRefund: (tx) => orders.isRefundTx(tx) });
+        const found = prior.tagged || prior.untagged[0];
+        if (found) {
+          const how = prior.tagged ? 'found-on-chain' : 'found-untagged-on-chain';
+          if (!prior.tagged) alertOnce(o.id, `REFUND ASSUMED PAID order ${o.id}: an untagged transfer ${found.tx} of at least ${o.amount} to ${to} after the obligation is taken as its refund (nothing paid); check it`);
+          log(`order ${o.id}: refund already on chain (tx ${found.tx}, block ${found.block}, ${how}) — not paying again`);
+          return orders.transition(o.id, 'refund_due', { status: 'refunded', refund_to: to, refund_tx: found.tx, refund_block: found.block, refund_from: found.from, refund_at: now(), refunded_at: now(), refund_by: `chain:${how}`, last_error: null,
+            refund_history: history(o, { event: how, tx: found.tx, block: found.block }) }) || orders.get(o.id);
+        }
+        const p = await refunder.prepare(to, o.amount, 0, tag);
         const n = orders.transition(o.id, 'refund_due', { status: 'refund_sent', refund_to: to, refund_tx: p.tx, refund_raw: p.raw, refund_nonce: p.nonce, refund_at: now(), refund_by: `auto:${refunder.address}`, last_error: null,
           refund_history: history(o, { event: 'prepared', tx: p.tx, nonce: p.nonce }) });
         if (!n) return orders.get(o.id);                // someone else (an operator claim) moved it first
@@ -288,10 +379,14 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
       const key = paymentKey(pp, requirements), hash = payloadHash(pp), id = orderIdFor(pp);
       const body = { paymentPayload: pp, paymentRequirements: requirements };
 
-      let o = orders.byKey(key);
+      let o = orders.byKey(key) || orders.get(id);
+      // an order rebuilt from the chain after a restore: the buyer's own X-PAYMENT is the authoritative copy of it
+      if (o && o.payload_hash !== hash && isRecovered(o) && (o.payment_key === key || orders.get(id)?.id === o.id)) o = adoptPayment(o, pp, requirements, inputs, hash);
       // a refused (never executed) attempt does not own its nonce: a corrected payment with the same nonce replaces it
       if (o && (o.status === 'refused' || o.status === 'failed') && o.payload_hash !== hash) { orders.db.prepare('DELETE FROM orders WHERE id = ? AND status = ?').run(o.id, o.status); o = null; }
       if (o && o.payload_hash !== hash) return send(409, { x402Version: 1, error: 'this authorization (nonce) already belongs to a different payment', accepts: [requirements] });
+      if (o && isRecovered(o) && o.resource !== requirements.resource && !o.goods) o = orders.update(o.id, { resource: requirements.resource });
+      if (o && isRecovered(o) && !o.inputs && inputs) o = orders.update(o.id, { inputs: JSON.stringify(inputs) });
       if (o && o.resource !== requirements.resource) return send(409, { error: 'this payment was made for a different resource', order: receipt(o) }, hdrs(o));
       // the buyer sends a refused payment again (e.g. after a top-up): evaluate it once more
       if (o && (o.status === 'refused' || o.status === 'failed')) o = orders.transition(o.id, o.status, { status: 'settling' }) || orders.get(o.id);
@@ -312,9 +407,13 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
         if (o.payload_hash !== hash) return send(409, { x402Version: 1, error: 'this authorization (nonce) already belongs to a different payment', accepts: [requirements] });
         if (usedButMaybeOurs) log(`order ${o.id}: verify says "${v.invalidReason}" — asking the facilitator whether it settled this exact payment`);
       }
-      const redelivery = o.status === 'delivered';
-      o = await withLock(o.id, async () => advance(orders.get(o.id), body, produce, produceFirst));
-      if (o.status === 'delivered') { log(`order ${o.id} ${redelivery ? 're-delivered' : 'delivered'} (tx ${o.tx})`); if (!redelivery && onDelivered) { try { onDelivered(o); } catch (e) { log(`onDelivered: ${e.message}`); } } }
+      let redelivery = false;
+      o = await withLock(o.id, async () => {
+        const current = orders.get(o.id);
+        redelivery = current.status === 'delivered';
+        return advance(current, body, produce, produceFirst, { onDelivered });
+      });
+      if (o.status === 'delivered') log(`order ${o.id} ${redelivery ? 're-delivered' : 'delivered'} (tx ${o.tx})`);
       return respond(o, send, redelivery ? { 'X-REDELIVERY': 'true' } : {});
     },
 
@@ -328,10 +427,19 @@ export function makeGate({ orders, fac, log = () => {}, statusBase = '/orders/',
 
     /** Background work: resume abandoned orders, reconcile unproven outcomes, watch refused ones, drive refunds. */
     async sweep({ produceFor, olderThanMs = 30_000 }) {
+      try { await recoverFromChain(); } catch (e) { log(`recovery from chain: ${e.message} (will retry)`); }
       for (const st of ['settling', 'paid']) {
         for (const row of orders.list(st, 50)) {
-          if (Date.now() - Date.parse(row.updated_at) < olderThanMs) continue;
           if (!row.payment) continue;
+          const rec = row.aux ? JSON.parse(row.aux).recovered : null;
+          if (st === 'paid' && rec && rec.mode === 'refund' && !row.inputs) {
+            if (Date.now() - Date.parse(rec.at) > recoverGraceMs) await withLock(row.id, async () => {
+              log(`order ${row.id}: recovered from chain, the buyer did not come back within the grace period → refund_due`);
+              orders.transition(row.id, 'paid', { status: 'refund_due', refund_to: refundTarget(row), refund_due_at: now(), last_error: 'recovered from chain; what was bought is unknown' });
+            });
+            continue;
+          }
+          if (!rec && Date.now() - Date.parse(row.updated_at) < olderThanMs) continue;
           const produce = produceFor(row);
           if (!produce && st === 'paid') continue;
           await withLock(row.id, async () => {

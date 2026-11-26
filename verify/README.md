@@ -8,7 +8,7 @@ have to take our word for anything in `LAUNCH-READINESS.md`.
 | `verify-auth.mjs` | production | server-side sign-in, sessions, passkeys |
 | `verify-payments.mjs` | production | catalog, monitor status, rate limits; with `--buy` one purchase and its retry; with `--load` the paid path under concurrency |
 | `verify-browser.mjs` | production, in a real browser | what the wallet pages keep in browser storage; passkeys through the browser's own WebAuthn |
-| `drills/payment-faults.mjs` | your machine only | payment failures we cannot cause on the live system: crashes, a facilitator that lost its records, refunds interrupted half way |
+| `drills/payment-faults.mjs` | your machine only | payment failures we cannot cause on the live system: crashes, a facilitator that lost its records, refunds interrupted half way, restores of an old database |
 
 Requirements: Node.js 22 or newer (the drills use `node:sqlite` through the seller library).
 
@@ -72,10 +72,16 @@ dUSD is a points unit with no monetary value. The faucet gives each address one 
    (limit 90 s), each one retried and answered with the same order; latency p50/p95/p99 is printed;
 4. on chain, for the whole run: the wallet was charged exactly once per purchase, one transfer each, all to the seller.
 
-Requests over the per-client limits get `429` with `Retry-After`; the script waits and retries them, as a client
-should, and fails on any `5xx` or hang. The limits are per IP address: 60 requests a minute (burst 20) and 2 requests
-in flight per seller, 8 in flight per seller in total. From one machine you therefore measure one client's share; the
-printed latencies are what a client sees at that share.
+**Overload contract.** Overload is answered in one of two ways, both carrying `Retry-After`:
+- `429`: this client is over its limits, per IP address: 60 requests a minute (burst 20), or more than 2 requests in flight to one seller;
+- `503`: the seller is at its global limit of 8 requests in flight, or the paid order is recorded but its delivery is not finished yet.
+
+Both mean the same to a client: the request was not done, so send the **same** request again after `Retry-After`. A
+retried payment is never charged twice. The script does exactly that. It fails on any other error, any `5xx` without
+`Retry-After`, or a hang. (Until 25 November this README said "429 only, never a 5xx". That was wrong: a 503 under
+global overload has always been part of the seller library.)
+
+From one machine you measure one client's share; the printed latencies are what a client sees at that share.
 
 ## Browser wallets: `verify-browser.mjs`
 
@@ -126,9 +132,25 @@ money side is checked on the chain, not from the seller's records.
 | 6 | The seller crashes after signing a refund, before broadcasting it | After a restart the **same** signed refund is broadcast. Exactly one refund. |
 | 7 | The seller crashes right after broadcasting a refund | After a restart it finds the refund on chain. Exactly one refund, never two. |
 | 8 | No refund wallet | The debt is never dropped: `refund_due`, the status URL says who is owed how much, an overdue alert, and it survives a restart. |
+| 9 | A database backup is restored in which an order still owes a refund, but that refund was paid after the backup | The seller finds the refund on chain (the calldata of every automatic refund carries a tag naming its order) and pays nothing. Exactly one refund. |
+| 10 | Same, but the refund on chain has no tag (paid before tagging existed, or by hand) | It is taken as the refund, nothing is paid, and the seller raises an alert to check it. |
+| 11 | A backup from before four purchases is restored; the facilitator is down, and no buyer comes back | The seller rebuilds the four orders from the chain by itself. Their status URLs say delivered, with the original transactions. A later retry returns the same order. Nobody is charged twice. |
+| 12 | Same, for a product that needs the buyer's inputs | The rebuilt order waits for its buyer. A buyer who comes back is delivered. A buyer who doesn't is refunded automatically after the grace period, once. |
+| 13 | The same payment sent 8 times at once, all admitted | One order, one charge, and the seller's `onDelivered` callback runs once. |
+
+**Recovering orders missing after a restore (drills 11 and 12).** A seller enables this by declaring its offers:
+`makeSellerKit({ …, recover: [{ requirements, mode: 'deliver' | 'refund' }] })`. The sweeper then scans the chain for
+payments to the offer's `payTo` that no order records, from the recovery cursor stored in the same database. A restored
+database brings back an older cursor, so the gap is rescanned.
+- `transferWithAuthorization` and session-wallet `pay()` calls are rebuilt into the payment the buyer sent. A session
+  payment's `generation` is not in the calldata, so the order can be found under each id a client may have computed.
+- Payments younger than `ORDER_RECOVER_MIN_AGE_MS` (default 2 minutes) are left to the request that is settling them.
+- Each `payTo` must be used by that seller only.
 
 To see that the drill catches real bugs, point it at an older seller library: `X402_LIB_DIR=/path/to/lib node
-drills/payment-faults.mjs`. With the first version (before on-chain reconciliation and automatic refunds) 11 checks fail.
+drills/payment-faults.mjs`. With the first version (before on-chain reconciliation and automatic refunds) 11 checks fail. With the version tested in
+the second independent acceptance on 25 November, 11 checks fail as well, in drills 9–13: the restored refund is paid a
+second time, the missing orders stay unknown, and `onDelivered` runs 8 times.
 
 ## Options
 

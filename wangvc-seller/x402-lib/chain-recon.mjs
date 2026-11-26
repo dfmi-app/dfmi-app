@@ -17,6 +17,8 @@
 //   • every RPC failure, null or malformed answer is an error, never a default.
 // Plain JSON-RPC over fetch (no ethers: not every seller ships it). eth_getLogs in chunks (prod caps ranges at 10,000 blocks).
 
+import { createHash } from 'node:crypto';
+
 export const TOPIC = {
   PAID_V1: '0x26c4308021cef5cdbc618fee8b61faf9de6b8f7e4e49fac43869dc1a26756408',          // Paid(address,address,uint256,uint256)
   PAID_INTENT: '0x0c079195cbb1a7b3942e131f7ec160662a02811eb1217a8f04696682d8c3790f',      // Paid(address,address,uint256,uint256,uint8)
@@ -43,8 +45,12 @@ function decodePay(input) {
 function decodeTwa(input) {
   const d = strip(input); if (!d.startsWith(SEL.twa)) return null;
   const a = d.slice(8);
-  return { from: addrWord(a, 0), to: addrWord(a, 1), value: word(a, 2), validAfter: word(a, 3), validBefore: word(a, 4), nonce: '0x' + a.slice(5 * 64, 6 * 64) };
+  return { from: addrWord(a, 0), to: addrWord(a, 1), value: word(a, 2), validAfter: word(a, 3), validBefore: word(a, 4), nonce: '0x' + a.slice(5 * 64, 6 * 64),
+    v: Number(word(a, 6)), r: a.slice(7 * 64, 8 * 64), s: a.slice(8 * 64, 9 * 64) };
 }
+
+/** The tag an automatic refund carries after its calldata: 32 bytes that name the order it pays (dUSD ignores them). */
+export const refundTag = (orderId) => createHash('sha256').update(`dfmi-refund:${orderId}`).digest('hex');
 
 export function makeChain({ rpc, token, chunk = 9000, timeoutMs = 15_000, insecure = false } = {}) {
   if (!rpc || !token) throw new Error('chain-recon: rpc and token are required');
@@ -175,9 +181,75 @@ export function makeChain({ rpc, token, chunk = 9000, timeoutMs = 15_000, insecu
     return null;
   }
 
+  /**
+   * Has this order already been refunded on chain? Looked up BEFORE an automatic refund is paid, so that a restored or
+   * stale 'refund_due' row can never pay a second time. Scans dUSD transfers to the payer from the given senders since
+   * sinceTs: a transfer whose calldata carries this order's tag → { tagged }; transfers without any tag (refunds paid
+   * before tagging, or by an operator) that no other order has recorded → { untagged: [...] }. Throws when the chain
+   * cannot be read: the caller then pays nothing.
+   */
+  async function findRefund({ froms, to, minAmount, sinceTs, tag, isKnownRefund = () => false }) {
+    const latest = await blockNumber();
+    const start = await blockAtOrBefore(sinceTs - 900, latest);
+    const untagged = [];
+    for (const from of froms) {
+      for (const l of await logs({ address: token, topics: [TOPIC.TRANSFER, pad(from), pad(to)] }, start, latest)) {
+        if (word(l.data, 0) < BigInt(minAmount)) continue;
+        const txh = lc(l.transactionHash);
+        const tx = await call('eth_getTransactionByHash', [txh]);
+        if (!tx) throw new Error(`refund lookup: tx ${txh} not available`);
+        const input = strip(tx.input);
+        const extra = input.startsWith('a9059cbb') ? input.slice(8 + 128) : '';
+        const found = { tx: txh, block: hexNum(l.blockNumber, 'log block'), from: '0x' + strip(l.topics[1]).slice(24) };
+        if (extra === tag) return { tagged: found };
+        if (!extra && !isKnownRefund(txh)) untagged.push(found);
+      }
+    }
+    return { untagged };
+  }
+
+  /**
+   * Payments to `payTo` on chain in [fromBlock, toBlock], each rebuilt into the x402 payment payload(s) the buyer may
+   * have sent. Used after a restore to recover orders the backup does not have. Only direct transferWithAuthorization
+   * calls on the token and direct pay() calls on a session wallet are recognised; anything else is skipped.
+   * A session payload's 'generation' is not in the calldata, so both forms are returned (with the generation the
+   * wallet reports, and without the field): callers index the order under every candidate.
+   */
+  async function scanPayments({ payTo, network, fromBlock, toBlock }) {
+    const out = [], seen = new Set();
+    for (const l of await logs({ address: token, topics: [TOPIC.TRANSFER, null, pad(payTo)] }, fromBlock, toBlock)) {
+      const txh = lc(l.transactionHash); if (seen.has(txh)) continue; seen.add(txh);
+      const tx = await call('eth_getTransactionByHash', [txh]);
+      if (!tx) throw new Error(`payment scan: tx ${txh} not available`);
+      const rc = await call('eth_getTransactionReceipt', [txh]);
+      if (!receiptOk(rc)) continue;
+      const block = hexNum(l.blockNumber, 'log block');
+      const t = sameAddr(tx.to, token) ? decodeTwa(tx.input) : null;
+      if (t && sameAddr(t.to, payTo)) {
+        const authorization = { from: t.from, to: t.to, value: String(t.value), validAfter: String(t.validAfter), validBefore: String(t.validBefore), nonce: t.nonce };
+        const signature = '0x' + t.r + t.s + t.v.toString(16).padStart(2, '0');
+        out.push({ tx: txh, block, payer: t.from, amount: String(t.value), candidates: [{ x402Version: 1, scheme: 'exact', network, payload: { signature, authorization } }] });
+        continue;
+      }
+      const d = decodePay(tx.input);
+      if (d && sameAddr(d.to, payTo)) {
+        const wallet = lc(tx.to);
+        const auth = { to: d.to, amount: String(d.amount), nonce: String(d.nonce), deadline: String(d.deadline) };
+        const base = { wallet, sessionKey: d.sessionKey, signature: '0x' + d.signature };
+        const candidates = [];
+        let gen = null;
+        try { gen = await ethCall(wallet, SEL.sessionGeneration + strip(d.sessionKey).padStart(64, '0')); } catch {}
+        if (gen !== null) candidates.push({ x402Version: 1, scheme: 'dfmi-session', network, payload: { ...base, authorization: { ...auth, generation: String(gen) } } });
+        candidates.push({ x402Version: 1, scheme: 'dfmi-session', network, payload: { ...base, authorization: auth } });
+        out.push({ tx: txh, block, payer: wallet, amount: String(d.amount), candidates });
+      }
+    }
+    return out;
+  }
+
   const accountNonce = async (addr, tag = 'latest') => hexNum(await call('eth_getTransactionCount', [addr, tag]), 'account nonce');
   const sendRaw = (raw) => call('eth_sendRawTransaction', [raw]);
-  return { call, reconcile, verifyRefund, findTransfer, accountNonce, sendRaw, blockNumber, blockAtOrBefore, head };
+  return { call, reconcile, verifyRefund, findTransfer, findRefund, scanPayments, accountNonce, sendRaw, blockNumber, blockAtOrBefore, head };
 }
 
 /**
@@ -191,9 +263,11 @@ export async function makeRefunder({ chain, privateKey, token, chainId, gasPrice
   const w = new Wallet(privateKey); const iface = new Interface(['function transfer(address to, uint256 amount) returns (bool)']);
   return {
     address: w.address,
-    async prepare(to, amount, minNonce = 0) {
+    /** tag (refundTag(orderId)) is appended to the calldata, so the chain itself shows which order a refund paid */
+    async prepare(to, amount, minNonce = 0, tag = '') {
       const nonce = Math.max(await chain.accountNonce(w.address, 'pending'), minNonce);
-      const raw = await w.signTransaction({ type: 0, chainId, nonce, to: token, data: iface.encodeFunctionData('transfer', [to, BigInt(amount)]), gasLimit: 100_000n, gasPrice: BigInt(Math.round(gasPriceGwei * 1e9)), value: 0n });
+      if (tag && !/^[0-9a-f]{64}$/.test(tag)) throw new Error('refund tag must be 32 bytes of hex');
+      const raw = await w.signTransaction({ type: 0, chainId, nonce, to: token, data: iface.encodeFunctionData('transfer', [to, BigInt(amount)]) + tag, gasLimit: 100_000n, gasPrice: BigInt(Math.round(gasPriceGwei * 1e9)), value: 0n });
       return { tx: keccak256(raw).toLowerCase(), raw, nonce };
     },
     async broadcast(raw) { try { return await chain.sendRaw(raw); } catch (e) { if (/already known|known transaction|nonce too low|already imported/i.test(e.message)) return null; throw e; } },

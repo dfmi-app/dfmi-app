@@ -23,6 +23,16 @@
 //      refund on chain; exactly one refund
 //   8  no refund wallet → the debt is never dropped: the order stays refund_due, the status URL says it is owed, and
 //      the seller logs REFUND OVERDUE
+//   9  restore of an old database in which an order still owes a refund that was in fact paid after the backup → the
+//      seller finds that refund on chain (its calldata names the order) and pays nothing; exactly one refund
+//  10  same, but the refund on chain is an old-style one without the order tag (or paid by hand) → it is taken as the
+//      refund, nothing is paid, and the seller raises an alert to check it
+//  11  restore of a database from before four purchases → the seller rebuilds those orders from the chain by itself
+//      (the facilitator is down, no buyer comes back): their status URLs say delivered, with the original transactions;
+//      a later retry returns the same order; nobody is charged twice
+//  12  same, for a product that needs the buyer's inputs → the rebuilt order waits for the buyer: one who comes back is
+//      delivered, one who does not is refunded automatically after the grace period
+//  13  the same payment sent 8 times at once → one order, one charge, and the seller's onDelivered callback runs once
 //
 //   npm install && node drills/payment-faults.mjs        # about a minute
 // Exit code 0 = every check passed.
@@ -31,7 +41,7 @@ import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, existsSync, cpSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, cpSync, copyFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -142,9 +152,9 @@ const seller = {
       TOKEN, CHAIN_ID: String(CHAIN_ID), PAY_TO, PRICE: String(PRICE), ORDER_SWEEP_MS: '300', ORDER_SWEEP_OLDER_MS: '100', ORDER_RECON_AFTER_MS: '800',
       ORDER_MAX_ATTEMPTS: '2', REFUND_ALERT_MS: '300', SELLER_RATE_PER_MIN: '100000', SELLER_BURST: '100000', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     this.child.stdout.on('data', (d) => (this.out += d)); this.child.stderr.on('data', (d) => (this.out += d));
-    await until(async () => { try { return (await fetch(URL_)).status === 402; } catch { return false; } }, 15_000, 'the seller to start');
+    await until(async () => { try { return (await fetch(URL_, { signal: AbortSignal.timeout(2000) })).status === 402; } catch { return false; } }, 15_000, 'the seller to start');
   },
-  async kill() { const c = this.child; if (c && c.exitCode === null) { c.kill('SIGKILL'); await new Promise((r) => c.once('exit', r)); } },
+  async kill() { const c = this.child; if (c && c.exitCode === null && c.signalCode === null) { c.kill('SIGKILL'); await new Promise((r) => c.once('exit', r)); } },
   async restart(env = this.env) { await this.kill(); await this.start(env); },
 };
 
@@ -164,7 +174,7 @@ async function pay(b) {
     return { status: r.status, j, order: r.headers.get('x-order-id'), tx: s?.transaction };
   } catch (e) { return { status: 0, error: e.message }; }
 }
-const orderStatus = async (id) => { try { return await (await fetch(`http://127.0.0.1:${PORT}/orders/${id}`)).json(); } catch { return {}; } };
+const orderStatus = async (id) => { try { return await (await fetch(`http://127.0.0.1:${PORT}/orders/${id}`, { signal: AbortSignal.timeout(5000) })).json(); } catch { return {}; } };
 async function oneCharge(b, tx) {
   const t = await transfers(b.address, PAY_TO, b.block0);
   return { ok: t.length === 1 && (!tx || t[0].tx === tx) && t[0].value === PRICE, n: t.length, tx: t[0]?.tx };
@@ -292,6 +302,99 @@ try {
     check('the seller raises an overdue alert in its log', await until(async () => /REFUND OVERDUE/.test(seller.out), 10_000, 'the alert').catch(() => false));
     await seller.restart({ DRILL_PRODUCE: 'fail' }); await sleep(1000);
     check('…and the debt survives a restart', (await orderStatus(b.orderId)).status === 'refund_due');
+  }
+
+  // ---- database backup / restore, as an operator would do it (seller stopped; the WAL files travel with the db) ----
+  const DB = join(DIR, 'orders.db'), DBFILES = ['', '-wal', '-shm'];
+  async function backupDb(name) { await seller.kill(); for (const x of DBFILES) if (existsSync(DB + x)) copyFileSync(DB + x, join(DIR, name + x)); }
+  async function restoreDb(name) { await seller.kill(); for (const x of DBFILES) { rmSync(DB + x, { force: true }); if (existsSync(join(DIR, name + x))) copyFileSync(join(DIR, name + x), DB + x); } }
+  const refundDueThenBackup = async (name) => {
+    await seller.restart({ DRILL_PRODUCE: 'fail' });
+    const { b } = await chargedUndeliverable();
+    await until(async () => (await orderStatus(b.orderId)).status === 'refund_due', 20_000, 'refund_due');
+    await backupDb(name);
+    return b;
+  };
+
+  console.log('\n-- 9. restore of an old database: a refund it still owes was paid after the backup --');
+  {
+    const b = await refundDueThenBackup('bk9');
+    await seller.start(REFUND_ENV);
+    await until(async () => (await orderStatus(b.orderId)).status === 'refunded', 30_000, 'refunded');
+    check('before the disaster the owed refund is paid once', (await refundsTo(b)).length === 1 && await balance(b.address) === b.start);
+    await restoreDb('bk9'); await seller.start(REFUND_ENV);
+    const st = await until(async () => { const s = await orderStatus(b.orderId); return s.status === 'refunded' && s; }, 20_000, 'refunded').catch(async () => orderStatus(b.orderId));
+    await sleep(2000);   // more sweeps: a second refund would show up now
+    const ins = await refundsTo(b);
+    check('after the restore the stale refund_due order is resolved from the chain', st.status === 'refunded' && st.compensation?.refund_tx === ins[0]?.tx?.toLowerCase(), st.status);
+    check('…exactly one refund on chain: the refund is not paid again', ins.length === 1, `${ins.length} refund(s)`);
+    check('…the buyer has their money back once, not twice', await balance(b.address) === b.start, `${await balance(b.address)} vs ${b.start}`);
+  }
+
+  console.log('\n-- 10. same, the refund on chain carries no order tag (old-style or paid by hand) --');
+  {
+    const b = await refundDueThenBackup('bk10');
+    await (await token.connect(refundW).transfer(b.address, PRICE)).wait();       // a plain transfer, no tag
+    await restoreDb('bk10'); await seller.start(REFUND_ENV);
+    const st = await until(async () => { const s = await orderStatus(b.orderId); return s.status === 'refunded' && s; }, 20_000, 'refunded').catch(async () => orderStatus(b.orderId));
+    await sleep(2000);
+    const ins = await refundsTo(b);
+    check('the untagged transfer is taken as the refund; nothing is paid', st.status === 'refunded' && ins.length === 1 && await balance(b.address) === b.start, `${st.status}, ${ins.length} refund(s)`);
+    check('…and the seller raises an alert to check it', /REFUND ASSUMED PAID/.test(seller.out));
+  }
+
+  console.log('\n-- 11. restore of a database from before four purchases: the orders are rebuilt from the chain --');
+  {
+    const REC = { DRILL_RECOVER: 'deliver', ORDER_RECOVER_MIN_AGE_MS: '0' };
+    await seller.restart(REC); await sleep(800);          // the recovery cursor is now at the chain head
+    await backupDb('bk11'); await seller.start(REC);
+    const bs = [];
+    for (let i = 0; i < 4; i++) { const b = await buyer(); const r = await pay(b); bs.push({ b, r }); }
+    check('four purchases after the backup are delivered', bs.every((x) => x.r.status === 200 && x.r.tx));
+    await restoreDb('bk11');
+    F.mode = 'down';                                      // nothing to ask but the chain; no buyer comes back
+    await seller.start(REC);
+    const sts = await until(async () => { const a = await Promise.all(bs.map((x) => orderStatus(x.b.orderId))); return a.every((s) => s.status === 'delivered') && a; }, 30_000, 'recovered orders')
+      .catch(async () => Promise.all(bs.map((x) => orderStatus(x.b.orderId))));
+    check('without any buyer retry, every status URL says delivered', sts.every((s) => s.status === 'delivered'), sts.map((s) => s.status || s.error).join(','));
+    check('…with the original transactions', sts.every((s, i) => String(s.transaction).toLowerCase() === String(bs[i].r.tx).toLowerCase()));
+    F.mode = 'pass';
+    const again = []; for (const x of bs) again.push(await pay(x.b));
+    check('a later retry by the buyer returns the same order and transaction', again.every((r, i) => r.status === 200 && r.order === bs[i].b.orderId && String(r.tx).toLowerCase() === String(bs[i].r.tx).toLowerCase()), again.map((r) => r.status).join(','));
+    const charges = await Promise.all(bs.map((x) => oneCharge(x.b, null)));
+    check('…nobody is charged twice', charges.every((c) => c.ok), charges.map((c) => c.n).join(','));
+  }
+
+  console.log('\n-- 12. same, for a product that needs the buyer\'s inputs: wait for the buyer, otherwise refund --');
+  {
+    const REC = { DRILL_RECOVER: 'refund', ORDER_RECOVER_MIN_AGE_MS: '0', ORDER_RECOVER_GRACE_MS: '4000', REFUND_PRIVATE_KEY: refundW.privateKey };
+    await seller.restart(REC); await sleep(800);
+    await backupDb('bk12'); await seller.start(REC);
+    const back = await buyer(), gone = await buyer();
+    const r1 = await pay(back), r2 = await pay(gone);
+    await restoreDb('bk12'); await seller.start(REC);
+    const s0 = await until(async () => { const a = [await orderStatus(back.orderId), await orderStatus(gone.orderId)]; return a.every((s) => s.status === 'paid') && a; }, 20_000, 'recovered').catch(() => []);
+    check('both purchases are rebuilt from the chain and wait for their buyer (paid, not delivered)', s0.length === 2);
+    const rr = await pay(back);
+    check('the buyer who comes back is delivered, same order and transaction', rr.status === 200 && rr.order === back.orderId && String(rr.tx).toLowerCase() === String(r1.tx).toLowerCase(), `HTTP ${rr.status}`);
+    const st = await until(async () => { const s = await orderStatus(gone.orderId); return s.status === 'refunded' && s; }, 30_000, 'refunded').catch(async () => orderStatus(gone.orderId));
+    await sleep(1500);
+    check('the buyer who does not come back is refunded after the grace period, once', st.status === 'refunded' && (await refundsTo(gone)).length === 1 && await balance(gone.address) === gone.start, st.status);
+    check('…and the buyer who came back is not refunded', (await refundsTo(back)).length === 0 && (await oneCharge(back, null)).ok);
+    void r2;
+  }
+
+  console.log('\n-- 13. the same payment sent 8 times at once --');
+  {
+    const FILE = join(DIR, 'delivered.log'); writeFileSync(FILE, '');
+    await seller.restart({ DRILL_DELIVERED_FILE: FILE, SELLER_MAX_CONCURRENT: '16', SELLER_MAX_CONCURRENT_PER_IP: '16' });   // all 8 reach the order code at once
+    const b = await buyer();
+    const rs = await Promise.all(Array.from({ length: 8 }, () => pay(b)));
+    const ok = rs.filter((r) => r.status === 200);
+    const calls = readFileSync(FILE, 'utf8').split('\n').filter(Boolean);
+    check('every copy reaches the order code and is answered with the same order', ok.length === 8 && ok.every((r) => r.order === b.orderId), rs.map((r) => r.status).join(','));
+    check('…one charge on chain', (await oneCharge(b, null)).ok);
+    check('…and onDelivered ran exactly once', calls.length === 1 && calls[0] === b.orderId, `${calls.length} call(s)`);
   }
 } catch (e) { check('the drills ran to the end', false, e.message); console.log(seller.out.slice(-2000)); }
 finally {
