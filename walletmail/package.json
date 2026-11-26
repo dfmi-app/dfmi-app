@@ -1,0 +1,25 @@
+{
+  "name": "walletmail-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "The dfmi wallet-mail API (email.dfmi.me): wallet and passkey sign-in, sessions, mail. Published for independent verification.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.400.0",
+    "@aws-sdk/client-ses": "^3.400.0",
+    "@aws-sdk/client-sesv2": "^3.400.0",
+    "@simplewebauthn/server": "14.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.1",
+    "ethers": "^6.7.1",
+    "express": "^4.18.2",
+    "mailparser": "^3.6.5",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

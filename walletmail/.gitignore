@@ -1,0 +1,7 @@
+node_modules
+package-lock.json
+test/rpc.key
+test/rpc.crt
+test/s3store*.json
+test/identity.html
+test/keylogin.js

@@ -23,7 +23,8 @@ The rest of this page states what we changed and tested, but a reader can't see 
 | `verify-payments.mjs --buy` | One purchase, then the **same payment sent again**: the same order and transaction come back, and the chain shows exactly one charge. The order is reported delivered. | 0.02 dUSD from the free faucet claim |
 | `verify-payments.mjs --load` | The same payment sent concurrently, many buyers at once, and a sustained run: one order and one charge per purchase, `429` instead of errors when over the limit, no timeouts | test dUSD from the faucet, about 0.02 per purchase |
 | `verify-browser.mjs` (22 checks) | In a real browser: private keys are stored only encrypted, never in plain form in any browser storage; sign out leaves nothing that still works; passkeys are created and verified for real | none |
-| `drills/payment-faults.mjs` (31 checks) | On a local chain: crashes, outages and refunds in the payment path; every order is delivered or refunded exactly once | none (local) |
+| `walletmail/test/*.mjs` (65 checks) | The mail and sign-in server, run locally: session revocation across a restore (`SESSIONS_NOT_BEFORE`), sign out everywhere, server-verified passkeys, TLS to the chain RPC, the live identity page end to end | none (local) |
+| `drills/payment-faults.mjs` (49 checks) | On a local chain: crashes, outages, refunds and restores of an old database in the payment path; every order is delivered or refunded exactly once | none (local) |
 
 **Monitor status.** The status of our health monitor is published at <https://dfmi.app/status.json>.
 - It is rewritten after every 5-minute run, so a stale `generatedAt` means the monitor stopped.
@@ -135,10 +136,22 @@ The reviewer re-tested commit `98ec530` in isolation: no change to the live envi
    | One delivery callback per order; 429/503 + `Retry-After` | every seller | — |
 
 3. **Still not independently accepted.**
-   - Recovery of mail and sessions (`SESSIONS_NOT_BEFORE`): the mail server's code is not public.
+   - Recovery of mail and sessions (`SESSIONS_NOT_BEFORE`). Since this update, the mail server's code and its tests are public in [`walletmail/`](walletmail/), so this can now be checked; see [Mail and session recovery](#mail-and-session-recovery-now-public).
    - Passkey prompts on real phones and laptops: this needs a person with the devices, using the checklist in [`verify/README.md`](verify/README.md).
 
 **So the four tested scenarios are closed, but dfmi is not declared production-ready as a whole.** It stays in the small trial until item 3 is covered.
+
+### Mail and session recovery, now public
+
+[`walletmail/`](walletmail/) holds the server behind email.dfmi.me, which also handles sign-in for identity.dfmi.app, together with its tests. Everything runs locally, with AWS replaced by a local file; see [`walletmail/README.md`](walletmail/README.md).
+- **The published `server.js` is the deployed file, with only configuration defaults changed.** It has no built-in contract addresses, no built-in address-to-name mapping, and the names checked at startup are configurable. The file's header says so. Nothing about sign-in, sessions, passkeys or mail differs.
+- **Our run of the published copy:**
+  - `restore.mjs` 11 of 11: a rebuilt server keeps revocations. A rolled-back store brings signed-out sessions back unless `SESSIONS_NOT_BEFORE` is set, and with it set every older session is refused.
+  - `run.mjs` 14 of 14.
+  - `passkey.mjs` 25 of 25.
+  - `tls.mjs` 3 of 3.
+  - `identity-e2e.mjs` 12 of 12, against the live identity page.
+- **What still can't be checked from outside:** that after a real restore the operator actually sets `SESSIONS_NOT_BEFORE`. It is a written step of our restore procedure. The mail data itself is versioned, replicated to a second region and backed up daily. A test restore of that backup brought back every object unchanged.
 
 ### Deployment, 25 November, 5:40–5:55 PM
 
