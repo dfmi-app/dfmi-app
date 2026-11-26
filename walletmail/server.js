@@ -741,41 +741,112 @@ app.post('/api/messages/send-internal', requireAuth, async (req, res) => {
   } catch (err) { console.error('Send internal error:', err); res.status(500).json({ error: err.message }); }
 });
 
+// ─── Outbound mail: outbox + idempotency (2026-11-26) ───
+// SES has no idempotency key, so the server keeps one: outbox/<wallet>/<messageId>.json, created with a conditional
+// write (If-None-Match) BEFORE SES is called. One messageId can therefore reach SES at most once:
+//   pending  claimed, SES call in progress or its outcome unknown (timeout, network, 5xx) -> never resent automatically
+//   sent     SES accepted it (sesMessageId kept) -> a retry returns the original result and repairs the sent/ record
+//   failed   SES rejected it with a 4xx (definitely not sent) -> the same messageId may be retried
+// The same messageId with different content is refused.
+const outboxKey = (wallet, id) => `outbox/${wallet}/${id}.json`;
+const condFailed = (e) => e && (e.name === 'PreconditionFailed' || e.name === 'ConditionalRequestConflict' || e.$metadata?.httpStatusCode === 412 || e.$metadata?.httpStatusCode === 409);
+async function outboxGet(key) {
+  try { const d = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key })); return { rec: JSON.parse(await streamToString(d.Body)), etag: d.ETag }; }
+  catch (e) { if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null; throw e; }
+}
+const outboxPut = (key, rec, cond) => s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: JSON.stringify(rec), ContentType: 'application/json', ...cond }));
+async function outboxUpdate(key, rec) { // retried: once SES has accepted, losing this write would leave the message "unknown"
+  let last; for (let i = 0; i < 3; i++) { try { return await outboxPut(key, rec); } catch (e) { last = e; await new Promise((r) => setTimeout(r, 200 * (i + 1))); } } throw last;
+}
+const sesDefinitelyRejected = (e) => { const c = e?.$metadata?.httpStatusCode; return typeof c === 'number' && c >= 400 && c < 500 && c !== 408 && c !== 429; };
+
 app.post('/api/messages/send-external', requireAuth, async (req, res) => {
   let deliveryMayHaveOccurred = false;
   try {
     const { messageId, recipientEmail, subject, body, signature } = req.body;
     if (!recipientEmail || !subject || !body) return res.status(400).json({ error: 'Missing fields' });
+    if (messageId !== undefined && (typeof messageId !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(messageId))) return res.status(400).json({ error: 'Invalid messageId' });
     if (!checkRateLimit(req.walletAddress)) return res.status(429).json({ error: 'Rate limit exceeded' });
 
+    const wallet = req.walletAddress.toLowerCase();
     const fid = messageId || `ext-${uuidv4()}`;
-    await ses.send(new SendEmailCommand({
-      FromEmailAddress: req.emailAddress,
-      Destination: { ToAddresses: [recipientEmail] },
-      Content: { Simple: {
-        Subject: { Data: subject },
-        Body: {
-          Text: { Data: body },
-          Html: { Data: `<div style="font-family:-apple-system,sans-serif;max-width:600px;margin:0 auto"><div style="padding:20px">${body.replace(/\n/g,'<br>')}</div><hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0"><div style="padding:0 20px 20px;font-size:12px;color:#94a3b8"><p>Sent via WalletMail from ${req.walletAddress}</p>${signature?`<p>Sig: ${signature.slice(0,20)}…</p>`:''}</div></div>` }
-        }
-      }},
-      EmailTags: [{ Name: 'wallet', Value: req.walletAddress }, { Name: 'messageId', Value: fid.slice(0,64) }]
-    }));
+    const key = outboxKey(wallet, fid);
+    const fp = crypto.createHash('sha256').update(JSON.stringify([recipientEmail, subject, body, req.emailAddress])).digest('hex');
+    const sentEntry = (extra = {}) => ({ id: fid, from: req.walletAddress, fromEmail: req.emailAddress, to: recipientEmail, toEmail: recipientEmail, subject, body,
+      timestamp: Date.now(), signature, onChain: false, internal: false, ...extra });
+    const writeSent = (entry) => s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${wallet}/${fid}.json`, Body: JSON.stringify(entry), ContentType: 'application/json' }));
+
+    // 1. claim the messageId (at most one SES call per messageId)
+    const claim = { state: 'pending', fp, to: recipientEmail, from: req.emailAddress, wallet, messageId: fid, claimedAt: new Date().toISOString() };
+    try { await outboxPut(key, claim, { IfNoneMatch: '*' }); }
+    catch (e) {
+      if (!condFailed(e)) throw e;                                   // storage failure: nothing was sent
+      const cur = await outboxGet(key);
+      if (!cur) return res.status(503).json({ error: 'Outbox state unavailable, try again', deliveryMayHaveOccurred: false });
+      const r = cur.rec;
+      if (r.fp !== fp) return res.status(409).json({ error: 'This messageId was already used for a different message', state: r.state });
+      if (r.state === 'sent') {                                      // idempotent replay; repair the sent/ record if it was lost
+        try { await writeSent(sentEntry({ timestamp: Date.parse(r.sentAt) || Date.now(), sesMessageId: r.sesMessageId })); } catch (err) { console.warn('sent/ repair failed:', err.message); }
+        return res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail, duplicate: true, sesMessageId: r.sesMessageId });
+      }
+      if (r.state === 'failed') {                                    // a definite earlier rejection: re-claim, conditional on that exact record
+        try { await outboxPut(key, { ...claim, previous: { state: 'failed', error: r.error, at: r.failedAt } }, { IfMatch: cur.etag }); }
+        catch (e2) { if (condFailed(e2)) return res.status(409).json({ error: 'Another attempt for this messageId is in progress', state: 'pending', deliveryMayHaveOccurred: true }); throw e2; }
+      } else {
+        return res.status(409).json({ error: 'The outcome of an earlier attempt with this messageId is unknown; it is not resent automatically', state: r.state, claimedAt: r.claimedAt, deliveryMayHaveOccurred: true });
+      }
+    }
+
+    // 2. send
+    let out;
+    try {
+      out = await ses.send(new SendEmailCommand({
+        FromEmailAddress: req.emailAddress,
+        Destination: { ToAddresses: [recipientEmail] },
+        Content: { Simple: {
+          Subject: { Data: subject },
+          Body: {
+            Text: { Data: body },
+            Html: { Data: `<div style="font-family:-apple-system,sans-serif;max-width:600px;margin:0 auto"><div style="padding:20px">${body.replace(/\n/g,'<br>')}</div><hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0"><div style="padding:0 20px 20px;font-size:12px;color:#94a3b8"><p>Sent via WalletMail from ${req.walletAddress}</p>${signature?`<p>Sig: ${signature.slice(0,20)}…</p>`:''}</div></div>` }
+          }
+        }},
+        EmailTags: [{ Name: 'wallet', Value: req.walletAddress }, { Name: 'messageId', Value: fid.slice(0,64) }]
+      }));
+    } catch (e) {
+      if (sesDefinitelyRejected(e)) {                                // SES refused it: not sent, the messageId may be retried
+        try { await outboxUpdate(key, { ...claim, state: 'failed', error: String(e.name || e.message).slice(0, 200), failedAt: new Date().toISOString() }); } catch (err) { console.warn('outbox failed-state write failed:', err.message); }
+        return res.status(502).json({ error: 'The mail service rejected the message: ' + (e.name || e.message), deliveryMayHaveOccurred: false });
+      }
+      deliveryMayHaveOccurred = true;                                // ambiguous: stays 'pending', never resent automatically
+      audit('send_external_unknown', req.walletAddress, { messageId: fid, reason: String(e.name || e.message).slice(0, 120) });
+      return res.status(502).json({ error: 'Delivery outcome unknown; it will not be resent automatically', messageId: fid, deliveryMayHaveOccurred: true });
+    }
     deliveryMayHaveOccurred = true;
 
-    const sentEntry = {
-      id: fid, from: req.walletAddress, fromEmail: req.emailAddress,
-      to: recipientEmail, toEmail: recipientEmail, subject, body,
-      timestamp: Date.now(), signature, onChain: false, internal: false
-    };
-    // Persist to S3
-    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${req.walletAddress.toLowerCase()}/${fid}.json`, Body: JSON.stringify(sentEntry), ContentType: 'application/json' }));
+    // 3. record the outcome
+    const sentAt = new Date().toISOString();
+    try { await outboxUpdate(key, { ...claim, state: 'sent', sesMessageId: out?.MessageId || null, sentAt }); }
+    catch (e) { console.error('outbox sent-state write failed after SES accepted:', e.message); }
+    const entry = sentEntry({ sesMessageId: out?.MessageId || null });
+    try { await writeSent(entry); }
+    catch (e) { return res.status(500).json({ error: 'Sent, but the sent record could not be saved; retry with the same messageId to repair it', messageId: fid, delivered: true, deliveryMayHaveOccurred: true }); }
     if (!sentEmails.has(req.walletAddress)) sentEmails.set(req.walletAddress, []);
-    sentEmails.get(req.walletAddress).push(sentEntry);
+    sentEmails.get(req.walletAddress).push(entry);
 
-    audit('send_external', req.walletAddress, { messageId: fid, recipientEmail });
-    res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail });
+    audit('send_external', req.walletAddress, { messageId: fid, recipientEmail, sesMessageId: out?.MessageId || null });
+    res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail, sesMessageId: out?.MessageId || null });
   } catch (err) { console.error('Send external error:', err); res.status(500).json({ error: err.message, deliveryMayHaveOccurred }); }
+});
+
+// Outbox state of one of your own external messages (for a client that got an unclear answer)
+app.get('/api/messages/outbox/:messageId', requireAuth, async (req, res) => {
+  try {
+    const id = req.params.messageId; if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) return res.status(404).json({ error: 'Not found' });
+    const cur = await outboxGet(outboxKey(req.walletAddress.toLowerCase(), id));
+    if (!cur) return res.status(404).json({ error: 'Not found' });
+    const { state, claimedAt, sentAt, failedAt, sesMessageId, error } = cur.rec;
+    res.set('Cache-Control', 'private, no-store').json({ messageId: id, state, claimedAt, sentAt, failedAt, sesMessageId, error });
+  } catch (err) { res.status(503).json({ error: 'Could not load outbox state' }); }
 });
 
 // Read all pages before returning a successful mailbox response. A truncated
@@ -829,6 +900,60 @@ function attachmentMetadata(parsed, id) {
     downloadUrl: `/api/messages/${encodeURIComponent(id)}/attachments/${index}` }));
 }
 
+// ─── Inbox scan cost (2026-11-26 capacity test) ───
+// The inbox reads every object under raw/ and content/ (all users) and keeps the ones addressed to the caller. MIME
+// objects are written once, so the parsed result of each is cached by key + ETag/LastModified/Size (bounded by bytes,
+// least recently used evicted); the listing is still read live on every request. Reads are done with limited parallelism. Who may see a message is still decided
+// per request from the caller's aliases; a storage failure still fails the whole request.
+const MAIL_CACHE_MAX = Number(process.env.MAIL_CACHE_BYTES) || 64 * 1024 * 1024;
+const MAIL_FETCH_PARALLEL = Number(process.env.MAIL_FETCH_PARALLEL) || 8;
+const mailSummaryCache = new Map(); let mailSummaryBytes = 0;
+async function cachedSummary(obj, build) {
+  const ver = `${obj.ETag || ''}:${obj.LastModified ? new Date(obj.LastModified).getTime() : ''}:${obj.Size ?? ''}`;
+  const hit = mailSummaryCache.get(obj.Key);
+  if (hit && hit.ver === ver) { mailSummaryCache.delete(obj.Key); mailSummaryCache.set(obj.Key, hit); return hit.val; }
+  const val = await build();
+  if (val === undefined) return null;                  // object missing right now: do not remember that
+  const size = (val ? JSON.stringify(val).length : 0) + obj.Key.length + 64;
+  if (hit) { mailSummaryCache.delete(obj.Key); mailSummaryBytes -= hit.size; }
+  if (size <= MAIL_CACHE_MAX / 4) {
+    mailSummaryCache.set(obj.Key, { ver, val, size }); mailSummaryBytes += size;
+    for (const [k, v] of mailSummaryCache) { if (mailSummaryBytes <= MAIL_CACHE_MAX) break; mailSummaryCache.delete(k); mailSummaryBytes -= v.size; }
+  }
+  return val;
+}
+async function mapLimit(items, n, fn) {
+  const out = new Array(items.length); let next = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i]); } }));
+  return out;
+}
+// Parsed MIME message without its attachment bodies (null = unreadable, never shown)
+function mimeSummary(obj) {
+  if (obj.Key.includes('AMAZON_SES_SETUP_NOTIFICATION')) return null;
+  return cachedSummary(obj, async () => {
+    const bytes = await mailBytes(obj.Key);              // throws (mailStorageFailure) if storage fails
+    if (!bytes) return undefined;
+    try {
+      const parsed = await simpleParser(bytes);
+      const eid = obj.Key.split('/').pop();
+      const fromAddr = parsed.from?.value?.[0]?.address;
+      return {
+        recipients: [...(parsed.to?.value || []), ...(parsed.cc?.value || [])].map(v => v.address?.toLowerCase()).filter(Boolean),
+        fromAddr: fromAddr || null, fromName: parsed.from?.value?.[0]?.name || '', toAddr: parsed.to?.value?.[0]?.address || null,
+        wmId: parsed.headers?.get('x-walletmail-id') || null, subject: parsed.subject || null,
+        text: parsed.text || '', html: parsed.html || '', date: parsed.date ? parsed.date.getTime() : null,
+        attachments: attachmentMetadata(parsed, eid),
+      };
+    } catch (e) { console.warn('Parse error:', obj.Key, e.message); return null; }
+  });
+}
+// content/ records are small JSON: read every time (in parallel), not cached, so a read failure still fails the request
+async function contentRecord(obj) {
+  const bytes = await mailBytes(obj.Key);
+  if (!bytes) return null;
+  try { return JSON.parse(bytes.toString('utf8')); } catch { return null; }
+}
+
 app.get('/api/messages/inbox', requireAuth, async (req, res) => {
   try {
     const userEmail = req.emailAddress.toLowerCase();
@@ -866,76 +991,61 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
       }
     } catch (e) { console.warn('S3 state load error:', e.message); throw e; }
 
-    // Helper: parse an S3 object into an email entry (always filters by recipient)
-    async function parseEmailObject(obj) {
-      if (obj.Key.includes('AMAZON_SES_SETUP_NOTIFICATION')) return null;
-      try {
-        const bytes = await mailBytes(obj.Key);
-        if (!bytes) return null;
-        const parsed = await simpleParser(bytes);
-
-        // Always check that this email is addressed to this wallet owner
-        if (!mimeVisible(parsed, aliases)) return null;
-
-        // Skip emails sent BY this wallet owner (those belong in Sent)
-        const senderAddr = (parsed.from?.value?.[0]?.address || '').toLowerCase();
-        if (aliases.has(senderAddr)) return null;
-
-        const eid = obj.Key.split('/').pop();
-        const wmId = parsed.headers?.get('x-walletmail-id');
-        if (wmId && seenIds.has(wmId)) return null;
-        if (wmId) seenIds.add(wmId);
-        if (seenIds.has(eid)) return null;
-        seenIds.add(eid);
-
-        const sk = `${walletAddr}:${eid}`;
-        return {
-          id: eid, messageId: wmId || null,
-          from: parsed.from?.value?.[0]?.address || 'unknown',
-          fromName: parsed.from?.value?.[0]?.name || '',
-          to: parsed.to?.value?.[0]?.address || userEmail,
-          subject: parsed.subject || '(no subject)',
-          body: parsed.text || '', html: parsed.html || '',
-          timestamp: parsed.date ? parsed.date.getTime() : obj.LastModified.getTime(),
-          sentAt: parsed.date ? parsed.date.getTime() : null,
-          receivedAt: obj.LastModified ? obj.LastModified.getTime() : null,
-          read: !!readState.get(sk), starred: !!starState.get(sk), attachments: attachmentMetadata(parsed, eid),
-          verified: !!wmId, internal: (parsed.from?.value?.[0]?.address||'').endsWith(`@${EMAIL_DOMAIN}`)
-        };
-      } catch (e) { if (e.mailStorageFailure) throw e; console.warn('Parse error:', obj.Key, e.message); return null; }
+    // Helper: an email entry from a parsed message (always filters by recipient)
+    function emailFromSummary(obj, m) {
+      if (!m) return null;
+      // Always check that this email is addressed to this wallet owner
+      if (!m.recipients.some(a => aliases.has(a))) return null;
+      // Skip emails sent BY this wallet owner (those belong in Sent)
+      if (aliases.has((m.fromAddr || '').toLowerCase())) return null;
+      const eid = obj.Key.split('/').pop();
+      const wmId = m.wmId;
+      if (wmId && seenIds.has(wmId)) return null;
+      if (wmId) seenIds.add(wmId);
+      if (seenIds.has(eid)) return null;
+      seenIds.add(eid);
+      const sk = `${walletAddr}:${eid}`;
+      return {
+        id: eid, messageId: wmId || null,
+        from: m.fromAddr || 'unknown',
+        fromName: m.fromName,
+        to: m.toAddr || userEmail,
+        subject: m.subject || '(no subject)',
+        body: m.text, html: m.html,
+        timestamp: m.date ?? obj.LastModified.getTime(),
+        sentAt: m.date ?? null,
+        receivedAt: obj.LastModified ? obj.LastModified.getTime() : null,
+        read: !!readState.get(sk), starred: !!starState.get(sk), attachments: m.attachments.map(a => ({ ...a })),
+        verified: !!wmId, internal: (m.fromAddr || '').endsWith(`@${EMAIL_DOMAIN}`)
+      };
+    }
+    async function scanMime(objects) {
+      const summaries = await mapLimit(objects, MAIL_FETCH_PARALLEL, mimeSummary);
+      objects.forEach((obj, i) => { const email = emailFromSummary(obj, summaries[i]); if (email) emails.push(email); });
     }
 
     // 1. Scan raw/ prefix (SES direct S3 delivery) — must match recipients
     try {
       const rawListed = await listMailObjects('raw/', 100);
-      if (rawListed.Contents) {
-        for (const obj of rawListed.Contents.reverse()) {
-          const email = await parseEmailObject(obj);
-          if (email) emails.push(email);
-        }
-      }
+      if (rawListed.Contents) await scanMime(rawListed.Contents.reverse());
     } catch (e) { console.warn('Raw scan error:', e.message); throw e; }
 
     // 2. Scan incoming/{wallet}/ prefix (SNS webhook delivery) — already filtered by wallet
     try {
       const incomingListed = await listMailObjects(`incoming/${walletAddr}/`, 100);
-      if (incomingListed.Contents) {
-        for (const obj of incomingListed.Contents.reverse()) {
-          const email = await parseEmailObject(obj);
-          if (email) emails.push(email);
-        }
-      }
+      if (incomingListed.Contents) await scanMime(incomingListed.Contents.reverse());
     } catch (e) { console.warn('Incoming scan error:', e.message); throw e; }
 
     // 3. Scan content/ prefix for WalletMail internal messages sent to this user
     try {
       const contentListed = await listMailObjects('content/', 100);
       if (contentListed.Contents) {
-        for (const obj of contentListed.Contents.reverse()) {
+        const objects = contentListed.Contents.reverse();
+        const msgs = await mapLimit(objects, MAIL_FETCH_PARALLEL, contentRecord);
+        for (const [i, obj] of objects.entries()) {
           try {
-            const bytes = await mailBytes(obj.Key);
-            if (!bytes) continue;
-            const msg = JSON.parse(bytes.toString('utf8'));
+            const msg = msgs[i];
+            if (!msg) continue;
             // Check if this message was sent to this wallet
             const rv = (msg.recipientValue || '').toLowerCase();
             if (rv !== walletAddr && !aliases.has(rv)) continue;

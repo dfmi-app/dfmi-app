@@ -190,6 +190,42 @@ The two files differ only in the four configuration defaults described at the to
   - The file always comes back as a download, never rendered in the page, so an HTML attachment can't run in the mail site.
   - Our end-to-end test, with the real page (jsdom) against this server, passes 12 of 12: exact bytes (SHA-256), a hostile filename shown as text, the token only in the header, and a tampered link refused. Against the previous page it fails 4.
   - The deployed page's SHA-256 is `1ab733382645628fa6d1c56a78683ea6246a0a609bf6523c9ddeee52ce869b72`; anyone can compare it with `curl -s https://email.dfmi.me/ | sha256sum`.
+
+**Outgoing mail is sent at most once, and the inbox no longer slows down with total mail (deployed 26 November, 11:46 AM PST).**
+- Production again runs the published file byte-for-byte. The `server.js` here and on the server is sha256 `1fc1b7885c6cc08aac892c009a356f6f7103ca3a08b603da14abab655d84ebbe`. The mail page is sha256 `cc8cf9f2cf465861b92c12fefa2ca7f774b02f65e17347a8cbd7c5eecb9ae485`.
+- **Outbox.** SES has no idempotency key, so the server keeps one.
+  - Before calling SES, it creates `outbox/<wallet>/<messageId>.json` with a conditional write. One `messageId` therefore reaches SES at most once.
+  - A retry of a sent message returns the original result.
+  - The same `messageId` with different content is refused.
+  - If SES rejects a message (a 4xx), it is marked failed, and the same `messageId` may be retried.
+  - If the outcome is unknown (a timeout, or a 5xx), the message is **not** resent automatically. The answer says `deliveryMayHaveOccurred: true`, and `GET /api/messages/outbox/:messageId` shows the state.
+  - The mail page tells the user to check Sent before sending again. If a message was delivered but its Sent record could not be saved, the page repairs the record with the same `messageId`; this sends nothing.
+  - `walletmail/test/outbox.mjs`: 18/18. The SES stub counts every message it accepts. The previous code fails 12; for example, 6 concurrent requests with one `messageId` sent 6 emails.
+- **Inbox cost.** An inbox read lists every message under `raw/` and `content/`, for all users, and keeps the ones addressed to the reader.
+  - Before, it read and parsed them one by one, so the time grew with the total mail on the site.
+  - Now reads run in parallel (8 at a time), and parsed MIME messages are cached by key, ETag, LastModified and size (64 MB, least recently used evicted).
+  - The listing is still read live every time, and who may see a message is still decided per request.
+  - `content/` records are small and are not cached, so a storage failure still fails the request instead of giving a partial inbox.
+  - `walletmail/test/inbox-equivalence.mjs` gives the previous and the new server the same store. Every user's inbox is byte-identical (4 users). It is still identical with a tiny cache that evicts constantly, after a message is overwritten, and after a message is re-addressed: 15/15.
+- **Regression tests on the deployed build:**
+
+  | Test | Passed |
+  |---|---|
+  | `run` | 14 |
+  | `passkey` | 25 |
+  | `restore` | 11 |
+  | `tls` | 3 |
+  | `identity-e2e` | 12 |
+  | `mail-restore` | 58/58 |
+  | `durability` | 49/49 |
+  | attachments page test | 12 |
+  | `outbox` | 18 |
+
+- **Against production after deploying:**
+  - `verify-auth.mjs --skip-expiry`: 27/27. This run skipped the 2-minute expiry wait, which is the 28th check.
+  - `verify-browser.mjs`: 22/22.
+  - The server log shows 0 AWS authorization errors.
+  - A new wallet's inbox took 2.5–3.4 s before (35 messages under `raw/`). After: 0.79 s for the first read, then 0.38–0.40 s.
   - Sending attachments is not supported.
 
 **Still open**, as listed in the delivery notes:
@@ -515,6 +551,33 @@ The host's load average afterwards was 0.10.
 | Production limiter, one abusive IP | — | — | — | — | 19 × `402`, then every request `429` |
 
 Throughput is the same in both phases, so the limiter adds no measurable cost.
+
+**Mail server capacity (isolated, 26 November).**
+- Setup:
+  - One Node process on loopback.
+  - The object store is in memory, with S3-like latency added (GET 20 ms, LIST 40 ms, PUT 30 ms, ±30%). SES is a stub.
+  - Each message is 5.3 KB, the production median.
+  - `N` is the number of messages under `raw/`. Production had 35.
+  - Run it with `walletmail/test/capacity.mjs`.
+- Inbox load times:
+
+  | N | one inbox, before | one inbox, after (cold cache) | 10 users at once, before | 10 users at once, after (warm cache) |
+  |---|---|---|---|---|
+  | 35 | 1.1 s | 0.5 s | 1.1 s | 0.3 s |
+  | 300 | 6.7 s | 1.3 s | 6.5 s | 0.4 s |
+  | 1,000 | 21.0 s | 3.3 s | 20.9 s | 0.7 s |
+  | 3,000 | 62.5 s | 9.1 s | 61.6 s | 1.5 s |
+
+- Other results:
+  - A cold inbox still reads every message once, so after a restart the first read grows with total mail. A per-recipient index would remove that; it is not built.
+  - At every N:
+    - session checks ran at about 1,240 requests per second (p99 52 ms, 0 errors);
+    - 100 concurrent external sends all succeeded, with exactly 100 SES calls.
+- **Known limit: attachments are held in memory.**
+  - 10 concurrent downloads of a 10 MB attachment raised the process from about 0.2–0.3 GB to 0.7–0.8 GB.
+  - The mail host has 0.9 GB of RAM, so large attachments under concurrency are the first thing that would fail.
+  - Streaming attachments is not built.
+- Production measurement: a real S3 read costs about 2.5× the model per message, so these numbers are a lower bound.
 
 **Not load-tested:** the paid path, which settles on chain. A load test of it would make real charges on the production chain. It needs a separate test chain with a funded test buyer. Concurrency and retries of settlement are exercised by the integration suite on a local EVM.
 
