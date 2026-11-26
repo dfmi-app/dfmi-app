@@ -137,9 +137,25 @@ The reviewer re-tested commit `98ec530` in isolation: no change to the live envi
 
 3. **Still not independently accepted.**
    - Recovery of mail and sessions (`SESSIONS_NOT_BEFORE`). Since this update, the mail server's code and its tests are public in [`walletmail/`](walletmail/), so this can now be checked; see [Mail and session recovery](#mail-and-session-recovery-now-public).
-   - Passkey prompts on real phones and laptops: this needs a person with the devices, using the checklist in [`verify/README.md`](verify/README.md).
+   - Passkey prompts on real phones and laptops. **We ran the checklist on two real devices on 26 November: all steps passed** (see [Passkeys on real devices](#passkeys-on-real-devices-26-november)). This is our own run, not an independent one.
 
-**So the four tested scenarios are closed, but dfmi is not declared production-ready as a whole.** It stays in the small trial until item 3 is covered.
+**So the four tested scenarios are closed, but dfmi is not declared production-ready as a whole.** It stays in the small trial until item 3 is independently accepted.
+
+### Passkeys on real devices, 26 November
+
+On the morning of 26 November, a person ran the manual checklist from [`verify/README.md`](verify/README.md#browser-wallets-verify-browsermjs) on identity.dfmi.app, on two devices. Each used a throwaway key, not a real wallet, and spent nothing.
+
+| Step | iPhone, Safari | Windows laptop, Chrome (Windows Hello) |
+|---|---|---|
+| 1. Sign in with an ephemeral key, sign the message | passed | passed |
+| 2. Register a passkey: the system prompt names identity.dfmi.app; the page says the server verified it | passed | passed |
+| 3. Sign out, then sign in with the passkey: the page says the server verified it | passed (all six checks on the page ticked) | passed |
+| 4. Cancel the system prompt once: the page says "Cancelled." and no session is created | passed | passed |
+| 5. Remove the passkey: signing in with it is then refused | passed | passed |
+
+The prompt cannot be triggered by automation. When a browser is driven by an automation extension, Chrome shows no Windows Hello prompt at all, and the page reports "Cancelled.". On the laptop, every step was therefore clicked and confirmed by the person at the device. This is the "user present" property the check is about.
+
+These are our own results. The reviewer can repeat the checklist on their own devices.
 
 ### Mail and session recovery, now public
 
