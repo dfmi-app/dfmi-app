@@ -262,6 +262,28 @@ These are our own results. The reviewer can repeat the checklist on their own de
   - `tls.mjs` 3 of 3.
   - `identity-e2e.mjs` 12 of 12, against the live identity page.
 - **What still can't be checked from outside:** that after a real restore the operator actually sets `SESSIONS_NOT_BEFORE`. It is a written step of our restore procedure. The mail data itself is versioned, replicated to a second region and backed up daily. A test restore of that backup brought back every object unchanged.
+- **A real backup restore, tied to the application (26 November, 11:24 AM – 12:02 PM PST).**
+  - **Setup.**
+    - A throwaway wallet was created in production, with two sessions (A and B) and two software passkeys (A and B). No real user's data was used.
+    - An on-demand AWS Backup of the mail storage was taken.
+  - **After the backup**, in production: passkey B was deleted and session B was signed out. Production then refused both, and session A still worked.
+  - **The restore.**
+    - The recovery point was restored into a new, private bucket.
+    - The restored copy still held session B and passkey B. Production no longer did. Only object names were checked, not contents.
+  - **Two isolated instances.**
+    - Both ran the deployed `server.js` (sha256 `1fc1b788…`, the file in [`walletmail/`](walletmail/)).
+    - Each listened on loopback only and read the restored bucket.
+    - `SESSIONS_NOT_BEFORE` was set to the time the restore completed.
+    - Their AWS key could read only the restored bucket. A listing of the production bucket with that key was refused (`AccessDenied`).
+  - **First run, 17 of 17:**
+    - sessions A and B and passkey B were all refused;
+    - passkey A was refused until the owner signed in with the wallet and registered it again, and then worked on both instances;
+    - a passkey session could not re-register the deleted passkey B;
+    - new sessions worked on both instances.
+  - **A run we do not count.** Our second run was meant to follow a restart. The drill's control script stopped the wrapper shell instead of the server, so the old processes kept answering. Its 12 passes are not counted.
+  - **After the script was fixed** and both instances were really restarted (new processes, no listener in between), the run passed **12 of 12**.
+  - **Cleanup.** Afterwards the instances, the drill's AWS user, the restored bucket and the production test passkey and sessions were all removed.
+  - These are our own results, from our operator records; the drill needs our AWS account and servers.
 
 ### Deployment, 25 November, 5:40–5:55 PM
 
