@@ -262,7 +262,45 @@ The prompt cannot be triggered by automation. When a browser is driven by an aut
 
 These are our own results. The reviewer can repeat the checklist on their own devices.
 
-### Mail and session recovery, now public
+### Outbox: production runtime, pending reconciliation, real delivery, rollback (26 November, 12:54–1:45 PM PST)
+
+These answer the reviewer's remaining items. Raw records are in our evidence set 8, sent to the reviewer. These are our own runs.
+
+- **Production runs this repository's `walletmail/server.js` (sha256 `5a1c33ebda4a3c3b9333f248fcaecfea16f8ff8725ea47b97dc8d6c85409b495`).**
+  - It was deployed at 12:54 PM PST.
+  - The running process (its PID, InvocationID and start time) was recorded. The hash was read through that process's `/proc/<pid>/cwd/server.js`.
+  - Also recorded: Node v24.14.1, the resolved `@aws-sdk/client-sesv2` 3.1026.0 and the lock file hash.
+  - `verify-auth.mjs` (28/28, including the expiry wait) and `verify-browser.mjs` (22/22) ran against that same unchanged process, with exit code 0.
+- **Pending reconciliation.**
+  - SES publishes every external message's events through Amazon Data Firehose to a separate bucket. That bucket is not restored with the mail bucket.
+  - The server indexes the events. It turns a `pending` entry into `sent` only on SES acceptance evidence, and never sends anything itself.
+  - Before every send, it checks the index. A message SES already accepted is repaired, not resent. If the index cannot be read, nothing is sent.
+  - A pending entry with no evidence after 15 minutes is reported in `/api/health` and alerted by our monitor. So are a stopped reconciler and a stale hourly canary. The canary is a probe sent to the SES mailbox simulator to prove the pipeline.
+  - An operator resolves an entry with [`walletmail/tools/outbox-ops.mjs`](walletmail/tools/outbox-ops.mjs):
+
+    | Decision | Allowed only when | Result |
+    |---|---|---|
+    | `sent` | SES recorded an acceptance | entry becomes `sent` |
+    | `not-sent` | there is no event at all and canaries before and after the claim prove the pipeline worked | entry becomes `failed`; the user may retry with the **same** messageId |
+    | `undeterminable` | otherwise | entry becomes `abandoned`; it is never sent again, and the user is told to check with the recipient |
+
+  - Every decision is recorded with operator, reason and evidence, including in the events bucket. A new messageId is never generated.
+  - `walletmail/test/outbox-reconcile.mjs`: 29/29.
+- **Real delivery (production, one-off wallets): 4/4.**
+  - Messages went to the SES mailbox simulator's `success@`, `bounce@` and `complaint@` addresses, and to a one-off `@dfmi.me` inbox through the real inbound path.
+  - Each linked its messageId to one SES message id and to the expected events (Send, Delivery, Bounce, Complaint). The test inbox received its message.
+  - A retry of each was not a second submission.
+  - Not covered: delivery-delay notices. The simulator cannot produce them.
+  - Run it with `walletmail/test/delivery-drill.mjs`.
+- **Outbox after a cloud rollback (isolated): 7/7.**
+  - **Setup.** A temporary instance ran the deployed server on loopback with a temporary bucket. Its AWS user could send only to the SES simulator. The real SES and the real event pipeline were used, with every real SES submission counted.
+  - **Before an AWS Backup:** one message sent; one pending after SES accepted it; one whose `sent` state was saved but whose answer was lost; one pending that SES never received.
+  - **After the backup:** one new message was sent. One pending message was answered from SES's events. The never-sent one was resolved `not-sent` by an operator, and then sent with the same messageId.
+  - **After restoring the backup** (new message missing, two messages `pending` again), retries of all five submitted **nothing** to SES. The total stayed at 5. Outbox entries and Sent history were rebuilt, and the operator's resolution was still readable.
+  - **Limit.** Sent history needs the message body, which SES events do not carry. It is rebuilt when the client retries with the same messageId.
+  - **Not counted.** A first run is recorded but not counted: our fault switch was quoted wrongly, and no fault took effect.
+- **Backups (owner's decision, 26 November).** AWS Backup of the mail bucket now runs weekly (Sunday 3 AM PT) and keeps each copy 7 days, so one copy is kept. The bucket's versioning (30 days) and cross-region replica are unchanged.
+
 
 [`walletmail/`](walletmail/) holds the server behind email.dfmi.me, which also handles sign-in for identity.dfmi.app, together with its tests. Everything runs locally, with AWS replaced by a local file; see [`walletmail/README.md`](walletmail/README.md).
 - **The published `server.js` is the deployed file, with only configuration defaults changed.** It has no built-in contract addresses, no built-in address-to-name mapping, and the names checked at startup are configurable. The file's header says so. Nothing about sign-in, sessions, passkeys or mail differs.

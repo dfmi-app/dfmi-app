@@ -762,6 +762,143 @@ async function outboxUpdate(key, rec) { // retried: once SES has accepted, losin
 }
 const sesDefinitelyRejected = (e) => { const c = e?.$metadata?.httpStatusCode; return typeof c === 'number' && c >= 400 && c < 500 && c !== 408 && c !== 429; };
 
+// ─── SES delivery events and pending reconciliation (2026-11-26) ───
+// SES publishes an event for every message sent with SES_CONFIGURATION_SET (Send = accepted by SES, then Delivery /
+// Bounce / Complaint / Reject / DeliveryDelay / RenderingFailure). Amazon Data Firehose writes them to raw/ in
+// SES_EVENTS_BUCKET, a bucket that is NOT restored with the mail bucket, so the evidence survives a rollback.
+// Each message carries the tags obw (wallet) and obid (base64url of its messageId), so an event names its outbox entry.
+//  - The reconciler indexes every event under index/<wallet>/<obid>/ and turns a 'pending' entry into 'sent' when SES
+//    shows it was accepted. It never sends anything.
+//  - Before every send, the index is checked: if SES already accepted this messageId (for example the outbox was rolled
+//    back by a restore), the outbox is repaired and nothing is sent again.
+//  - Pending entries without evidence after OUTBOX_PENDING_ALERT_MS are reported (health + outbox-alerts/) for an
+//    operator, who resolves them with tools/outbox-ops.mjs; every resolution is recorded under outbox-resolutions/.
+const SES_CONFIGURATION_SET = process.env.SES_CONFIGURATION_SET || '';
+const EVENTS_BUCKET = process.env.SES_EVENTS_BUCKET || '';
+const RECONCILE_MS = Number(process.env.OUTBOX_RECONCILE_MS) || 30000;
+const PENDING_ALERT_MS = Number(process.env.OUTBOX_PENDING_ALERT_MS) || 15 * 60000;
+const RECONCILE_LOOKBACK_MS = Number(process.env.OUTBOX_RECONCILE_LOOKBACK_MS) || 3 * 3600000;
+const ACCEPTED_EVENTS = new Set(['Send', 'Delivery', 'Bounce', 'Complaint', 'Reject', 'DeliveryDelay']);
+const evIndexPrefix = (wallet, id) => `index/${wallet}/${b64u(id)}/`;
+const reconcileStatus = { enabled: !!(EVENTS_BUCKET && SES_CONFIGURATION_SET), lastRunAt: null, lastOkAt: null, lastError: null, eventsIndexed: 0, reconciled: 0, pendingStale: 0, pendingStaleOldest: null, lastCanaryAt: null };
+const CANARY_WALLET = '0x' + '0'.repeat(40);
+const evS3 = s3;  // same client; EVENTS_BUCKET is a different bucket
+async function evJson(key) {
+  try { const d = await evS3.send(new GetObjectCommand({ Bucket: EVENTS_BUCKET, Key: key })); return JSON.parse(await streamToString(d.Body)); }
+  catch (e) { if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null; throw e; }
+}
+async function evList(prefix, startAfter) {
+  const out = []; let token;
+  do {
+    const r = await evS3.send(new ListObjectsV2Command({ Bucket: EVENTS_BUCKET, Prefix: prefix, ...(startAfter && !token ? { StartAfter: startAfter } : {}), ...(token ? { ContinuationToken: token } : {}) }));
+    out.push(...(r.Contents || [])); token = r.IsTruncated ? r.NextContinuationToken : null;
+  } while (token);
+  return out;
+}
+// Events SES recorded for one outbox entry (newest last). Throws if the index cannot be read.
+async function outboxEvents(wallet, id) {
+  if (!EVENTS_BUCKET) return [];
+  const objs = await evList(evIndexPrefix(wallet, id));
+  const evs = [];
+  for (const o of objs) { const e = await evJson(o.Key); if (e) evs.push(e); }
+  return evs.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+}
+// Firehose concatenates records; split a file into JSON objects
+function splitJsonRecords(text) {
+  const out = []; let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true; else if (c === '{') { if (depth++ === 0) start = i; } else if (c === '}' && --depth === 0) { try { out.push(JSON.parse(text.slice(start, i + 1))); } catch {} }
+  }
+  return out;
+}
+function compactEvent(ev) {
+  const type = ev.eventType || ev.notificationType; const mail = ev.mail || {}; const tags = mail.tags || {};
+  const wallet = (tags.obw && tags.obw[0] || '').toLowerCase(); let id = null;
+  try { id = tags.obid && tags.obid[0] ? Buffer.from(tags.obid[0], 'base64url').toString() : null; } catch {}
+  if (!type || !/^0x[0-9a-f]{40}$/.test(wallet) || !id || !/^[A-Za-z0-9._:-]{1,128}$/.test(id)) return null;
+  const detail = ev.bounce ? { bounceType: ev.bounce.bounceType, bounceSubType: ev.bounce.bounceSubType, recipients: (ev.bounce.bouncedRecipients || []).map(r => r.emailAddress) }
+    : ev.complaint ? { complaintType: ev.complaint.complaintFeedbackType || null, recipients: (ev.complaint.complainedRecipients || []).map(r => r.emailAddress) }
+    : ev.delivery ? { recipients: ev.delivery.recipients, smtpResponse: ev.delivery.smtpResponse, processingTimeMillis: ev.delivery.processingTimeMillis }
+    : ev.deliveryDelay ? { delayType: ev.deliveryDelay.delayType, expirationTime: ev.deliveryDelay.expirationTime }
+    : ev.reject ? { reason: ev.reject.reason } : ev.failure ? { errorMessage: ev.failure.errorMessage } : {};
+  return { wallet, messageId: id, eventType: type, sesMessageId: mail.messageId || null, timestamp: (ev.delivery || ev.bounce || ev.complaint || ev.deliveryDelay || {}).timestamp || mail.timestamp || null,
+    destination: mail.destination || [], subject: mail.commonHeaders?.subject ?? null, detail };
+}
+async function markSentFromEvents(wallet, id, evs, by) {
+  const acc = evs.find(e => ACCEPTED_EVENTS.has(e.eventType)); if (!acc) return null;
+  const key = outboxKey(wallet, id);
+  for (let i = 0; i < 3; i++) {
+    const cur = await outboxGet(key);
+    if (cur && (cur.rec.state === 'sent')) return cur.rec;
+    const base = cur ? cur.rec : { messageId: id, wallet, to: acc.destination[0] || null, restoredFromEvents: true };
+    const rec = { ...base, state: 'sent', sesMessageId: acc.sesMessageId, sentAt: base.sentAt || acc.timestamp || new Date().toISOString(),
+      reconciledAt: new Date().toISOString(), reconciledBy: by, previousState: cur ? cur.rec.state : 'missing' };
+    try { await outboxPut(key, rec, cur ? { IfMatch: cur.etag } : { IfNoneMatch: '*' }); reconcileStatus.reconciled++; audit('outbox_reconciled', wallet, { messageId: id, from: rec.previousState, by, sesMessageId: acc.sesMessageId }); return rec; }
+    catch (e) { if (!condFailed(e)) throw e; }
+  }
+  throw new Error('outbox reconcile conflict');
+}
+let reconcileRunning = false, lastStaleSweep = 0;
+async function reconcileOnce({ fromMs } = {}) {
+  if (!reconcileStatus.enabled || reconcileRunning) return;
+  reconcileRunning = true; reconcileStatus.lastRunAt = new Date().toISOString();
+  try {
+    // 1. index new event files (hour folders in the look-back window; already processed files are skipped)
+    const cursor = (await evJson('reconcile/cursor.json')) || { processed: {} };
+    if (cursor.lastCanaryAt && (!reconcileStatus.lastCanaryAt || cursor.lastCanaryAt > reconcileStatus.lastCanaryAt)) reconcileStatus.lastCanaryAt = cursor.lastCanaryAt;
+    const now = Date.now(), since = fromMs ?? (now - RECONCILE_LOOKBACK_MS);
+    const touched = new Map();
+    for (let t = since - (since % 3600000); t <= now; t += 3600000) {
+      const d = new Date(t), hour = `raw/${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCHours()).padStart(2, '0')}/`;
+      for (const o of await evList(hour)) {
+        if (cursor.processed[o.Key]) continue;
+        const d2 = await evS3.send(new GetObjectCommand({ Bucket: EVENTS_BUCKET, Key: o.Key }));
+        for (const raw of splitJsonRecords(await streamToString(d2.Body))) {
+          const ev = compactEvent(raw); if (!ev) continue;
+          const k = `${evIndexPrefix(ev.wallet, ev.messageId)}${ev.eventType}-${ev.sesMessageId}-${String(ev.timestamp).replace(/[^0-9TZ]/g, '')}.json`;
+          await evS3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: k, Body: JSON.stringify(ev), ContentType: 'application/json' }));
+          reconcileStatus.eventsIndexed++;
+          if (ev.wallet === CANARY_WALLET) { if (ev.eventType === 'Send' && (!reconcileStatus.lastCanaryAt || ev.timestamp > reconcileStatus.lastCanaryAt)) reconcileStatus.lastCanaryAt = ev.timestamp; continue; }
+          touched.set(`${ev.wallet}\n${ev.messageId}`, true);
+        }
+        cursor.processed[o.Key] = now;
+      }
+    }
+    for (const k of Object.keys(cursor.processed)) if (cursor.processed[k] < now - 2 * RECONCILE_LOOKBACK_MS) delete cursor.processed[k];
+    // 2. promote pending entries that SES accepted
+    for (const wk of touched.keys()) {
+      const [wallet, id] = wk.split('\n'); const cur = await outboxGet(outboxKey(wallet, id));
+      if (cur && cur.rec.state !== 'sent' && cur.rec.state !== 'abandoned') await markSentFromEvents(wallet, id, await outboxEvents(wallet, id), 'reconciler');
+    }
+    await evS3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: 'reconcile/cursor.json', Body: JSON.stringify({ ...cursor, lastOkAt: new Date().toISOString(), lastCanaryAt: reconcileStatus.lastCanaryAt }), ContentType: 'application/json' }));
+    // 3. stale pending sweep (every 5 reconcile periods)
+    if (now - lastStaleSweep >= 5 * RECONCILE_MS) {
+      lastStaleSweep = now; let stale = 0, oldest = null;
+      for (const o of await listMailObjects('outbox/', 1000).then(r => r.Contents || [])) {
+        const cur = await outboxGet(o.Key); if (!cur || cur.rec.state !== 'pending') continue;
+        const age = now - Date.parse(cur.rec.claimedAt || 0); if (age < PENDING_ALERT_MS) continue;
+        const evs = await outboxEvents(cur.rec.wallet, cur.rec.messageId);
+        if (evs.some(e => ACCEPTED_EVENTS.has(e.eventType))) { await markSentFromEvents(cur.rec.wallet, cur.rec.messageId, evs, 'reconciler-sweep'); continue; }
+        stale++; if (!oldest || cur.rec.claimedAt < oldest) oldest = cur.rec.claimedAt;
+        const ak = `outbox-alerts/${cur.rec.wallet}/${b64u(cur.rec.messageId)}.json`;
+        try { await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: ak, Body: JSON.stringify({ wallet: cur.rec.wallet, messageId: cur.rec.messageId, claimedAt: cur.rec.claimedAt, firstAlertAt: new Date().toISOString() }), ContentType: 'application/json', IfNoneMatch: '*' }));
+          audit('outbox_pending_alert', cur.rec.wallet, { messageId: cur.rec.messageId, claimedAt: cur.rec.claimedAt }); }
+        catch (e) { if (!condFailed(e)) throw e; }
+      }
+      reconcileStatus.pendingStale = stale; reconcileStatus.pendingStaleOldest = oldest;
+    }
+    reconcileStatus.lastOkAt = new Date().toISOString(); reconcileStatus.lastError = null;
+  } catch (e) { reconcileStatus.lastError = String(e.name || e.message).slice(0, 120); console.error('outbox reconcile failed:', e.message); }
+  finally { reconcileRunning = false; }
+}
+if (reconcileStatus.enabled) {
+  const from = process.env.OUTBOX_RECONCILE_FROM ? Date.parse(process.env.OUTBOX_RECONCILE_FROM) : undefined;   // after a restore: replay events since the backup
+  setTimeout(() => reconcileOnce(Number.isFinite(from) ? { fromMs: from } : {}), 1000).unref?.();
+  setInterval(() => reconcileOnce(), RECONCILE_MS).unref?.();
+}
+
 app.post('/api/messages/send-external', requireAuth, async (req, res) => {
   let deliveryMayHaveOccurred = false;
   try {
@@ -777,6 +914,23 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
     const sentEntry = (extra = {}) => ({ id: fid, from: req.walletAddress, fromEmail: req.emailAddress, to: recipientEmail, toEmail: recipientEmail, subject, body,
       timestamp: Date.now(), signature, onChain: false, internal: false, ...extra });
     const writeSent = (entry) => s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: `sent/${wallet}/${fid}.json`, Body: JSON.stringify(entry), ContentType: 'application/json' }));
+
+    // 0. if SES already accepted this messageId (e.g. the outbox was rolled back by a restore), repair, never resend
+    if (reconcileStatus.enabled) {
+      let evs;
+      try { evs = await outboxEvents(wallet, fid); }
+      catch (e) { return res.status(503).json({ error: 'Delivery records unavailable, nothing was sent; try again', deliveryMayHaveOccurred: false }); }
+      if (evs.some(e => ACCEPTED_EVENTS.has(e.eventType))) {
+        const cur = await outboxGet(key);
+        const acc = evs.find(e => ACCEPTED_EVENTS.has(e.eventType));
+        const sameMessage = cur ? cur.rec.fp === fp : (acc.destination.map(String).map(x => x.toLowerCase()).includes(String(recipientEmail).toLowerCase()) && (acc.subject === null || acc.subject === subject));
+        if (!sameMessage) return res.status(409).json({ error: 'This messageId was already used for a different message', state: cur?.rec.state || 'sent' });
+        if (cur?.rec.state === 'abandoned') return res.status(409).json({ error: 'An operator closed this messageId as undeterminable; it is never sent again', state: 'abandoned', deliveryMayHaveOccurred: true });
+        const rec = await markSentFromEvents(wallet, fid, evs, 'pre-send-check');
+        try { await writeSent(sentEntry({ timestamp: Date.parse(rec.sentAt) || Date.now(), sesMessageId: rec.sesMessageId })); } catch (err) { console.warn('sent/ repair failed:', err.message); }
+        return res.json({ sent: true, messageId: fid, fromEmail: req.emailAddress, toEmail: recipientEmail, duplicate: true, reconciled: true, sesMessageId: rec.sesMessageId });
+      }
+    }
 
     // 1. claim the messageId (at most one SES call per messageId)
     const claim = { state: 'pending', fp, to: recipientEmail, from: req.emailAddress, wallet, messageId: fid, claimedAt: new Date().toISOString() };
@@ -794,6 +948,8 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
       if (r.state === 'failed') {                                    // a definite earlier rejection: re-claim, conditional on that exact record
         try { await outboxPut(key, { ...claim, previous: { state: 'failed', error: r.error, at: r.failedAt } }, { IfMatch: cur.etag }); }
         catch (e2) { if (condFailed(e2)) return res.status(409).json({ error: 'Another attempt for this messageId is in progress', state: 'pending', deliveryMayHaveOccurred: true }); throw e2; }
+      } else if (r.state === 'abandoned') {
+        return res.status(409).json({ error: 'An operator closed this messageId as undeterminable; it is never sent again. Check with the recipient before writing a new message.', state: 'abandoned', deliveryMayHaveOccurred: true });
       } else {
         return res.status(409).json({ error: 'The outcome of an earlier attempt with this messageId is unknown; it is not resent automatically', state: r.state, claimedAt: r.claimedAt, deliveryMayHaveOccurred: true });
       }
@@ -812,7 +968,10 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
             Html: { Data: `<div style="font-family:-apple-system,sans-serif;max-width:600px;margin:0 auto"><div style="padding:20px">${body.replace(/\n/g,'<br>')}</div><hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0"><div style="padding:0 20px 20px;font-size:12px;color:#94a3b8"><p>Sent via WalletMail from ${req.walletAddress}</p>${signature?`<p>Sig: ${signature.slice(0,20)}…</p>`:''}</div></div>` }
           }
         }},
-        EmailTags: [{ Name: 'wallet', Value: req.walletAddress }, { Name: 'messageId', Value: fid.slice(0,64) }]
+        // tag values may only contain A-Z a-z 0-9 _ -: obid carries the exact messageId (base64url), messageId a readable form
+        EmailTags: [{ Name: 'wallet', Value: req.walletAddress }, { Name: 'messageId', Value: fid.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) },
+          { Name: 'obw', Value: wallet }, { Name: 'obid', Value: b64u(fid) }],
+        ...(SES_CONFIGURATION_SET ? { ConfigurationSetName: SES_CONFIGURATION_SET } : {})
       }));
     } catch (e) {
       if (sesDefinitelyRejected(e)) {                                // SES refused it: not sent, the messageId may be retried
@@ -854,8 +1013,11 @@ app.get('/api/messages/outbox/:messageId', requireAuth, async (req, res) => {
     const id = req.params.messageId; if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) return res.status(404).json({ error: 'Not found' });
     const cur = await outboxGet(outboxKey(req.walletAddress.toLowerCase(), id));
     if (!cur) return res.status(404).json({ error: 'Not found' });
-    const { state, claimedAt, sentAt, failedAt, sesMessageId, error } = cur.rec;
-    res.set('Cache-Control', 'private, no-store').json({ messageId: id, state, claimedAt, sentAt, failedAt, sesMessageId, error });
+    const { state, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy, resolution } = cur.rec;
+    let events = null;
+    try { events = (await outboxEvents(req.walletAddress.toLowerCase(), id)).map(e => ({ eventType: e.eventType, timestamp: e.timestamp, sesMessageId: e.sesMessageId, detail: e.detail })); } catch { events = null; }
+    res.set('Cache-Control', 'private, no-store').json({ messageId: id, state, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy,
+      resolution: resolution ? { state: resolution.state, at: resolution.at, reason: resolution.reason } : undefined, events });
   } catch (err) { res.status(503).json({ error: 'Could not load outbox state' }); }
 });
 
@@ -1480,7 +1642,9 @@ app.post('/api/auth/logout-all', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.0.0', spec: 'Master-Spec-v1.0', domain: EMAIL_DOMAIN, mailbox: MAILBOX_ADDR || 'not configured', time: new Date().toISOString() });
+  const { enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt } = reconcileStatus;
+  res.json({ status: 'ok', version: '2.0.0', spec: 'Master-Spec-v1.0', domain: EMAIL_DOMAIN, mailbox: MAILBOX_ADDR || 'not configured', time: new Date().toISOString(),
+    outbox: { reconcile: enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt } });
 });
 
 // Cheap session check — the client uses this to restore a reload without
