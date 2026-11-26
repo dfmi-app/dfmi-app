@@ -262,7 +262,48 @@ The prompt cannot be triggered by automation. When a browser is driven by an aut
 
 These are our own results. The reviewer can repeat the checklist on their own devices.
 
-### Outbox: production runtime, pending reconciliation, real delivery, rollback (26 November, 12:54–1:45 PM PST)
+### Send journal: the reviewer's patch, an isolated cloud drill, deployed (26 November, 2:05–2:58 PM PST)
+
+- **The reviewer's patch is applied unchanged** (commit `6624bee`: `1fe4632-journal-fix.patch`, `server.js` sha256 `57c3dfad…`).
+  - It adds an authoritative send journal in the events bucket. That bucket is not restored with the mail bucket.
+  - The journal is claimed atomically before SES is called.
+  - "Not sent" can no longer be inferred from missing events; only a definite SES rejection persisted by the service allows a same-id retry.
+  - Closed (`abandoned`) messages stay closed after a mail rollback.
+  - The original content fingerprint is kept, so a changed body, subject, recipient or sender is refused.
+  - Restored messages stay idempotent on every retry.
+- **Our addition on top (next commit): a durable restore guard.**
+  - The marker is `journal/_restore-guard/<mail bucket>.json` in the events bucket.
+  - While it is on, every instance applies the legacy-restore guard, whatever its environment says. A forgotten `OUTBOX_REQUIRE_EXISTING_JOURNAL` therefore cannot reopen sending.
+  - Switch it with `tools/outbox-ops.mjs guard on|off --operator --reason`. Every change is recorded. An unreadable marker counts as on.
+  - Production `server.js` sha256: `48099fdca3c428366b3c609ffb1350a2956982d6b93edb3058bddcaa29aaae69`.
+- **Tests.**
+  - Locally, 264/264 (the reviewer's 252, plus `identity-e2e`).
+  - On the mail host with the production `node_modules` and lock file, Node 24.14.1 and SES SDK 3.1026.0, in a network namespace with only loopback: 238/238.
+  - The unpatched code fails 10 journal checks.
+- **Isolated cloud drill.**
+  - **Setup.** A temporary bucket and IAM user that could send only to the SES simulator and was explicitly denied the production guard. The real SES and the real events bucket and journal were used. Every real submission was counted.
+  - **Before an AWS Backup**, on the pre-journal server: sent; pending after SES accepted; pending that SES never received, then marked `not-sent` under the OLD rule.
+  - **After the backup:**
+    - a pre-journal message accepted with no SES event;
+    - on the journal server: sent with identical retries and a changed body;
+    - answer lost;
+    - journal `sent` committed but answer lost;
+    - closed `undeterminable`;
+    - accepted with no SES event.
+  - **After restoring the backup,** with the guard turned on only by the durable marker:
+    - every accepted message was answered as a duplicate;
+    - the pre-journal message with no record and no event, and a new id, were blocked;
+    - the old `failed` and the closed message were refused;
+    - changed bodies were refused;
+    - Sent history was rebuilt.
+  - **After a recorded guard-off,** a new id sent once and old ones stayed blocked.
+  - **SES submissions over the whole drill: 8, one per message.** Nothing was resubmitted after the restore.
+  - All drill resources were removed.
+- **Production.**
+  - Deployed 2:53 PM PST. The process (PID, InvocationID, start time) was recorded, and `/proc/<pid>/cwd/server.js` = `48099fdc…`.
+  - Against that same process: `verify-auth.mjs` 28/28, `verify-browser.mjs` 22/22 and the real delivery drill 4/4, all with exit code 0.
+- Raw records are in our evidence set 9, sent to the reviewer.
+
 
 These answer the reviewer's remaining items. Raw records are in our evidence set 8, sent to the reviewer. These are our own runs.
 

@@ -92,6 +92,15 @@ try {
  u=await user();await stop();await start({OUTBOX_REQUIRE_EXISTING_JOURNAL:'1'});r=await send(u.t,'legacy-restore-unknown');
  ok('legacy restore guard rejects unknown ids without a journal',r.status===503&&sesCount('legacy-restore-unknown')===0);
  await stop();await start();
+ // Durable guard (on top of the journal patch): the marker alone turns it on; forgetting the env setting does not reopen sending
+ rr=ops('guard','on','--operator','offline-review','--reason','restored a pre-journal backup');
+ u=await user();await sleep(10500);r=await send(u.t,'guard-marker-only');
+ ok('durable guard marker blocks unknown ids without any env setting',rr.code===0&&r.status===503&&sesCount('guard-marker-only')===0&&(await call('GET','/api/health')).j.outbox.restoreGuard===true,JSON.stringify({status:r.status,code:rr.code}));
+ rr=ops('guard','off','--operator','x');
+ ok('turning the guard off requires an operator and a reason',rr.code!==0);
+ rr=ops('guard','off','--operator','offline-review','--reason','legacy ids accounted for');await sleep(10500);
+ r=await send(u.t,'guard-marker-only');
+ ok('after a recorded guard off, a new id sends once; both changes are recorded',rr.code===0&&r.status===200&&sesCount('guard-marker-only')===1&&Object.keys(objects()).filter(k=>k.startsWith('events/resolutions/_restore-guard/mail/')).length===2);
 } catch(e){console.log('ERROR',e.stack);fail++;}
 finally{try{await stop();}catch{}fs.rmSync(dir,{recursive:true,force:true});}
 console.log(fail ? `${fail} FAILED` : 'all passed');process.exit(fail?1:0);

@@ -5,6 +5,7 @@
 //   node tools/outbox-ops.mjs show <wallet> <messageId>
 //   node tools/outbox-ops.mjs resolve <wallet> <messageId> --as sent|not-sent|undeterminable --operator <name> --reason "<text>"
 //   node tools/outbox-ops.mjs canary                                 send one probe to the SES mailbox simulator (hourly cron)
+//   node tools/outbox-ops.mjs guard on|off|status --operator <name> --reason "<text>"   durable legacy-restore guard (recorded)
 // Rules (never sends the user's message, never generates a new messageId):
 //   sent            only if SES recorded an acceptance event (Send/Delivery/Bounce/...) for this messageId.
 //   not-sent        refused: missing asynchronous events cannot prove nonacceptance.
@@ -87,6 +88,18 @@ if (cmd === 'list') {
   }
   catch (e) { console.error('refused: the entry changed while resolving (' + e.name + '); the resolution record was written, run show and resolve again'); process.exit(1); }
   console.log(JSON.stringify(record, null, 1));
+} else if (cmd === 'guard') {
+  // node tools/outbox-ops.mjs guard on|off|status --operator <name> --reason "<text>"
+  // The durable legacy-restore guard for this mail bucket (journal/_restore-guard/<S3_INCOMING_BUCKET>.json in the events bucket): while on, every instance refuses
+  // a messageId that has neither a journal entry nor a surviving outbox record, regardless of its environment.
+  const mode = a._[0], operator = a.operator, reason = a.reason;
+  const cur = await getJson(EV, `journal/_restore-guard/${MAIL}.json`);
+  if (mode === 'status' || !mode) { console.log(JSON.stringify(cur ? cur.rec : { active: false }, null, 1)); process.exit(0); }
+  if (!['on', 'off'].includes(mode) || !operator || !reason) { console.error('usage: guard on|off|status --operator <name> --reason "<text>"'); process.exit(2); }
+  const at = new Date().toISOString(); const rec = { active: mode === 'on', operator, reason, at, previous: cur ? cur.rec : null };
+  await s3.send(new PutObjectCommand({ Bucket: EV, Key: `resolutions/_restore-guard/${MAIL}/${at.replace(/[^0-9TZ]/g, '')}.json`, Body: JSON.stringify(rec), ContentType: 'application/json', IfNoneMatch: '*' }));
+  await s3.send(new PutObjectCommand({ Bucket: EV, Key: `journal/_restore-guard/${MAIL}.json`, Body: JSON.stringify(rec), ContentType: 'application/json', ...(cur ? { IfMatch: cur.etag } : { IfNoneMatch: '*' }) }));
+  console.log(JSON.stringify(rec, null, 1));
 } else if (cmd === 'canary') {
   const id = 'canary-' + new Date().toISOString().replace(/[^0-9TZ]/g, '');
   const r = await ses.send(new SendEmailCommand({ FromEmailAddress: `outbox-canary@${DOMAIN}`, Destination: { ToAddresses: ['success@simulator.amazonses.com'] }, ConfigurationSetName: CS,

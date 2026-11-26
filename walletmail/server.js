@@ -790,6 +790,18 @@ async function journalGet(w, id) {
   catch (e) { if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null; throw e; }
 }
 const journalPut = (r, cond) => s3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: journalKey(r.wallet, r.messageId), Body: JSON.stringify(r), ContentType: 'application/json', ...cond }));
+// Durable restore guard (2026-11-26, on top of the journal patch): journal/_restore-guard/<mail bucket>.json in the events bucket turns
+// the legacy-restore guard on for every instance, whether or not OUTBOX_REQUIRE_EXISTING_JOURNAL is in its environment,
+// so a forgotten setting cannot reopen sending. Only `tools/outbox-ops.mjs guard off` (recorded) turns it off.
+// If the marker cannot be read, the guard is treated as ON (fail closed).
+let restoreGuard = { active: false, checkedAt: 0 };
+async function restoreGuardActive() {
+  if (!reconcileStatus.enabled) return false;
+  if (Date.now() - restoreGuard.checkedAt < 10000) return restoreGuard.active;
+  try { const g = await evJson(`journal/_restore-guard/${S3_BUCKET}.json`); restoreGuard = { active: g?.active === true, checkedAt: Date.now() }; }
+  catch (e) { restoreGuard = { active: true, checkedAt: Date.now() }; }
+  return restoreGuard.active;
+}
 async function closedResolution(w, id) {
   for (const o of await evList(`resolutions/${w}/${b64u(id)}/`)) {
     const r = await evJson(o.Key);
@@ -962,7 +974,7 @@ app.post('/api/messages/send-external', requireAuth, async (req, res) => {
         const cur = await outboxGet(key);
         const accepted = evs.some(e => ACCEPTED_EVENTS.has(e.eventType));
         if (accepted && !cur?.rec.fp) return res.status(409).json({ error: 'Original fingerprint unavailable; cannot reconstruct history from caller content', state: 'unknown', deliveryMayHaveOccurred: true });
-        if (!cur && (process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM)) return res.status(503).json({ error: 'Restore guard: no authoritative claim; sending blocked', deliveryMayHaveOccurred: true });
+        if (!cur && (process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM || await restoreGuardActive())) return res.status(503).json({ error: 'Restore guard: no authoritative claim; sending blocked', deliveryMayHaveOccurred: true });
         try { await journalPut(cur ? { ...cur.rec, retryable: false } : claim, { IfNoneMatch: '*' }); owned = !cur; }
         catch (e) { if (!condFailed(e)) throw e; }
         j = await journalGet(wallet, fid);
@@ -1697,8 +1709,9 @@ app.post('/api/auth/logout-all', requireAuth, async (req, res) => {
 
 app.get('/api/health', (req, res) => {
   const { enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt } = reconcileStatus;
+  const restoreGuardOn = process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM || restoreGuard.active;
   res.json({ status: 'ok', version: '2.0.0', spec: 'Master-Spec-v1.0', domain: EMAIL_DOMAIN, mailbox: MAILBOX_ADDR || 'not configured', time: new Date().toISOString(),
-    outbox: { reconcile: enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt } });
+    outbox: { reconcile: enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt, restoreGuard: restoreGuardOn } });
 });
 
 // Cheap session check — the client uses this to restore a reload without
