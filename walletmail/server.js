@@ -780,7 +780,19 @@ const PENDING_ALERT_MS = Number(process.env.OUTBOX_PENDING_ALERT_MS) || 15 * 600
 const RECONCILE_LOOKBACK_MS = Number(process.env.OUTBOX_RECONCILE_LOOKBACK_MS) || 3 * 3600000;
 const ACCEPTED_EVENTS = new Set(['Send', 'Delivery', 'Bounce', 'Complaint', 'Reject', 'DeliveryDelay']);
 const evIndexPrefix = (wallet, id) => `index/${wallet}/${b64u(id)}/`;
-const reconcileStatus = { enabled: !!(EVENTS_BUCKET && SES_CONFIGURATION_SET), lastRunAt: null, lastOkAt: null, lastError: null, eventsIndexed: 0, reconciled: 0, pendingStale: 0, pendingStaleOldest: null, lastCanaryAt: null };
+const reconcileStatus = { enabled: !!(EVENTS_BUCKET && SES_CONFIGURATION_SET), lastRunAt: null, lastOkAt: null, lastError: null, eventsIndexed: 0, reconciled: 0, pendingStale: 0, pendingStaleOldest: null, lastCanaryAt: null,
+  anomalies: { bounce: 0, complaint: 0, delayOpen: 0, delayOverdue: 0, oldest: null, checkedAt: null } };
+// Delivery anomalies (2026-11-26, acceptance D): every Bounce / Complaint / DeliveryDelay event is also written once to
+// anomalies/open/<type>/<wallet>/<obid>/<file> in the events bucket. An operator closes it with `outbox-ops ack`, which
+// writes anomalies/ack/<same path> (nothing is deleted). A delay followed by a final event is closed by the reconciler.
+// Health reports what is still open; the monitor alerts on any open bounce/complaint and on a delay open > OUTBOX_DELAY_ALERT_MS.
+const ANOMALY_TYPES = new Set(['Bounce', 'Complaint', 'DeliveryDelay']);
+const DELAY_ALERT_MS = Number(process.env.OUTBOX_DELAY_ALERT_MS) || 3600000;
+function deliveryStatus(evs) {
+  const has = (t) => evs.some(e => e.eventType === t);
+  if (has('Complaint')) return 'complained'; if (has('Bounce')) return 'bounced'; if (has('Delivery')) return 'delivered';
+  if (has('DeliveryDelay')) return 'delayed'; if (has('Send')) return 'sent'; return null;
+}
 const CANARY_WALLET = '0x' + '0'.repeat(40);
 // Authoritative journal: separate from the rollbackable mail bucket.
 if (!!EVENTS_BUCKET !== !!SES_CONFIGURATION_SET || (EVENTS_BUCKET && EVENTS_BUCKET === S3_BUCKET)) throw new Error('Configure a separate events bucket and configuration set together');
@@ -887,6 +899,26 @@ async function markSentFromEvents(wallet, id, evs, by) {
   }
   throw new Error('outbox reconcile conflict');
 }
+async function anomalySweep(now) {
+  const acked = new Set((await evList('anomalies/ack/')).map(o => o.Key.slice('anomalies/ack/'.length)));
+  const out = { bounce: 0, complaint: 0, delayOpen: 0, delayOverdue: 0, oldest: null, checkedAt: new Date(now).toISOString() };
+  for (const o of await evList('anomalies/open/')) {
+    const rel = o.Key.slice('anomalies/open/'.length); if (acked.has(rel)) continue;
+    const a = await evJson(o.Key); if (!a) continue;
+    if (a.eventType === 'DeliveryDelay') {
+      const final = (await outboxEvents(a.wallet, a.messageId)).find(e => ['Delivery', 'Bounce', 'Complaint'].includes(e.eventType) && String(e.timestamp) >= String(a.timestamp));
+      if (final) {
+        try { await evS3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: `anomalies/ack/${rel}`, ContentType: 'application/json', IfNoneMatch: '*',
+          Body: JSON.stringify({ by: 'reconciler', reason: `followed by ${final.eventType}`, finalEvent: final.eventType, at: new Date(now).toISOString() }) })); }
+        catch (e) { if (!condFailed(e)) throw e; }
+        continue;
+      }
+      out.delayOpen++; if (now - Date.parse(a.timestamp || a.openedAt) >= DELAY_ALERT_MS) out.delayOverdue++;
+    } else if (a.eventType === 'Bounce') out.bounce++; else if (a.eventType === 'Complaint') out.complaint++; else continue;
+    const t = a.timestamp || a.openedAt; if (!out.oldest || t < out.oldest) out.oldest = t;
+  }
+  return out;
+}
 let reconcileRunning = false, lastStaleSweep = 0;
 async function reconcileOnce({ fromMs } = {}) {
   if (!reconcileStatus.enabled || reconcileRunning) return;
@@ -907,6 +939,12 @@ async function reconcileOnce({ fromMs } = {}) {
           const k = `${evIndexPrefix(ev.wallet, ev.messageId)}${ev.eventType}-${ev.sesMessageId}-${String(ev.timestamp).replace(/[^0-9TZ]/g, '')}.json`;
           await evS3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: k, Body: JSON.stringify(ev), ContentType: 'application/json' }));
           reconcileStatus.eventsIndexed++;
+          if (ev.wallet !== CANARY_WALLET && ANOMALY_TYPES.has(ev.eventType)) {
+            const ak = `anomalies/open/${ev.eventType}/${ev.wallet}/${b64u(ev.messageId)}/${k.split('/').pop()}`;
+            try { await evS3.send(new PutObjectCommand({ Bucket: EVENTS_BUCKET, Key: ak, Body: JSON.stringify({ ...ev, openedAt: new Date().toISOString() }), ContentType: 'application/json', IfNoneMatch: '*' }));
+              audit('outbox_delivery_anomaly', ev.wallet, { messageId: ev.messageId, eventType: ev.eventType, sesMessageId: ev.sesMessageId }); }
+            catch (e) { if (!condFailed(e)) throw e; }
+          }
           if (ev.wallet === CANARY_WALLET) { if (ev.eventType === 'Send' && (!reconcileStatus.lastCanaryAt || ev.timestamp > reconcileStatus.lastCanaryAt)) reconcileStatus.lastCanaryAt = ev.timestamp; continue; }
           touched.set(`${ev.wallet}\n${ev.messageId}`, true);
         }
@@ -936,6 +974,8 @@ async function reconcileOnce({ fromMs } = {}) {
       }
       reconcileStatus.pendingStale = stale; reconcileStatus.pendingStaleOldest = oldest;
     }
+    // 4. delivery anomalies: every reconcile period, so an alert is at most one monitor run (5 min) behind the event
+    reconcileStatus.anomalies = await anomalySweep(now);
     reconcileStatus.lastOkAt = new Date().toISOString(); reconcileStatus.lastError = null;
   } catch (e) { reconcileStatus.lastError = String(e.name || e.message).slice(0, 120); console.error('outbox reconcile failed:', e.message); }
   finally { reconcileRunning = false; }
@@ -1082,14 +1122,33 @@ app.get('/api/messages/outbox/:messageId', requireAuth, async (req, res) => {
     const { state, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy, resolution } = cur.rec;
     let events = null;
     try { events = (await outboxEvents(req.walletAddress.toLowerCase(), id)).map(e => ({ eventType: e.eventType, timestamp: e.timestamp, sesMessageId: e.sesMessageId, detail: e.detail })); } catch { events = null; }
-    res.set('Cache-Control', 'private, no-store').json({ messageId: id, state, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy,
+    // delivery is derived from SES events only; an operator's ack never changes it (it is reported next to it)
+    const delivery = events ? deliveryStatus(events) : null;
+    let anomalies = null;
+    if (reconcileStatus.enabled) try {
+      anomalies = [];
+      for (const t of ANOMALY_TYPES) for (const o of await evList(`anomalies/open/${t}/${req.walletAddress.toLowerCase()}/${b64u(id)}/`)) {
+        const rel = o.Key.slice('anomalies/open/'.length); const ack = await evJson(`anomalies/ack/${rel}`);
+        anomalies.push({ eventType: t, file: rel.split('/').pop(), acknowledged: !!ack, ...(ack ? { ackBy: ack.operator || ack.by, ackKind: ack.by, ackAt: ack.at, ackReason: ack.reason } : {}) });
+      }
+    } catch { anomalies = null; }
+    res.set('Cache-Control', 'private, no-store').json({ messageId: id, state, delivery, anomalies, claimedAt, sentAt, failedAt, sesMessageId, error, reconciledAt, reconciledBy,
       resolution: resolution ? { state: resolution.state, at: resolution.at, reason: resolution.reason } : undefined, events });
   } catch (err) { res.status(503).json({ error: 'Could not load outbox state' }); }
 });
 
 // Read all pages before returning a successful mailbox response. A truncated
 // response without a progressing cursor must fail, never masquerade as complete.
-async function listMailObjects(prefix, maxKeys) {
+// Single-flight listing (2026-11-27, acceptance E): concurrent inbox loads share ONE in-flight listing of the same prefix
+// instead of each paging the whole bucket. Nothing is cached after it resolves, so every listing is still live: a request
+// that joins an in-flight listing sees exactly what it would have seen had it arrived when that listing started.
+const listInFlight = new Map();
+function listMailObjects(prefix, maxKeys) {
+  const k = `${prefix}\n${maxKeys}`; let p = listInFlight.get(k);
+  if (!p) { p = listMailObjectsOnce(prefix, maxKeys).finally(() => listInFlight.delete(k)); listInFlight.set(k, p); }
+  return p.then(r => ({ Contents: [...r.Contents] }));
+}
+async function listMailObjectsOnce(prefix, maxKeys) {
   const Contents = [], seen = new Set();
   let token;
   do {
@@ -1119,13 +1178,14 @@ function mimeVisible(parsed, aliases) {
   return recipients.some(v => aliases.has(v.address?.toLowerCase()));
 }
 
-async function mailBytes(key) {
+async function mailBytes(key, range) {
   try {
-    const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+    const data = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key, ...(range ? { Range: range } : {}) }));
     const chunks = []; for await (const chunk of data.Body) chunks.push(Buffer.from(chunk));
     return Buffer.concat(chunks);
   } catch (e) {
     if (e.name === 'NoSuchKey' || e.name === 'NotFound') return null;
+    if (range && (e.name === 'InvalidRange' || e.$metadata?.httpStatusCode === 416)) return mailBytes(key);   // empty object
     e.mailStorageFailure = true; throw e;
   }
 }
@@ -1144,13 +1204,19 @@ function attachmentMetadata(parsed, id) {
 // least recently used evicted); the listing is still read live on every request. Reads are done with limited parallelism. Who may see a message is still decided
 // per request from the caller's aliases; a storage failure still fails the whole request.
 const MAIL_CACHE_MAX = Number(process.env.MAIL_CACHE_BYTES) || 64 * 1024 * 1024;
-const MAIL_FETCH_PARALLEL = Number(process.env.MAIL_FETCH_PARALLEL) || 8;
-const mailSummaryCache = new Map(); let mailSummaryBytes = 0;
+const MAIL_FETCH_PARALLEL = Number(process.env.MAIL_FETCH_PARALLEL) || 24;
+const MAIL_LIST_PAGE = Math.min(1000, Number(process.env.MAIL_LIST_PAGE) || 1000);   // keys per S3 listing page for the mailbox scan (tests use 100 to exercise paging)
+const mailSummaryCache = new Map(); let mailSummaryBytes = 0; const summaryInFlight = new Map();
 async function cachedSummary(obj, build) {
   const ver = `${obj.ETag || ''}:${obj.LastModified ? new Date(obj.LastModified).getTime() : ''}:${obj.Size ?? ''}`;
   const hit = mailSummaryCache.get(obj.Key);
   if (hit && hit.ver === ver) { mailSummaryCache.delete(obj.Key); mailSummaryCache.set(obj.Key, hit); return hit.val; }
-  const val = await build();
+  // single flight: concurrent loads of the same object version share one fetch + parse (after a restart, ten users
+  // opening their inbox at once would otherwise each read and parse every message)
+  const fk = `${obj.Key}\n${ver}`; let inflight = summaryInFlight.get(fk);
+  if (!inflight) { inflight = build().finally(() => summaryInFlight.delete(fk)); summaryInFlight.set(fk, inflight); }
+  else return inflight.then(v => (v === undefined ? null : v));
+  const val = await inflight;
   if (val === undefined) return null;                  // object missing right now: do not remember that
   const size = (val ? JSON.stringify(val).length : 0) + obj.Key.length + 64;
   if (hit) { mailSummaryCache.delete(obj.Key); mailSummaryBytes -= hit.size; }
@@ -1160,10 +1226,62 @@ async function cachedSummary(obj, build) {
   }
   return val;
 }
+// Memory bound (2026-11-26, acceptance E): the mail host has 911 MB and no swap. Opening one stored MIME message holds
+// its raw bytes plus, for a full parse, the decoded attachments. So:
+//  - message/attachment views read and parse stored MIME objects at most MIME_LARGE_CONCURRENCY at a time (the raw
+//    object is only fetched inside a slot; a small message gives its slot back as soon as it is fetched);
+//  - any parse of a message of MIME_LARGE_BYTES or more (also in the inbox scan) holds a slot of the same limit.
+// A request that waits longer than MIME_QUEUE_MS gets a retryable 503 with Retry-After (never a 404).
+const MIME_LARGE_BYTES = Number(process.env.MIME_LARGE_BYTES) || 1024 * 1024;
+const MIME_LARGE_CONCURRENCY = Number(process.env.MIME_LARGE_CONCURRENCY) || 1;
+const MIME_QUEUE_MS = Number(process.env.MIME_QUEUE_MS) || 15000;
+class MailBusyError extends Error { constructor() { super('Busy reading large messages, retry shortly'); this.name = 'MailBusy'; } }
+let mimeActive = 0; const mimeWaiters = [];
+async function mimeAcquire() {
+  if (mimeActive < MIME_LARGE_CONCURRENCY) { mimeActive++; return; }
+  await new Promise((resolve, reject) => {
+    const w = { resolve, timer: setTimeout(() => { const i = mimeWaiters.indexOf(w); if (i >= 0) mimeWaiters.splice(i, 1); reject(new MailBusyError()); }, MIME_QUEUE_MS) };
+    mimeWaiters.push(w);
+  });
+}
+function mimeRelease() { const w = mimeWaiters.shift(); if (w) { clearTimeout(w.timer); w.resolve(); } else mimeActive--; }   // hand the slot to the next waiter
+async function parseMime(bytes, held = false) {
+  if (held || bytes.length < MIME_LARGE_BYTES) return simpleParser(bytes);
+  await mimeAcquire();
+  try { return await simpleParser(bytes); } finally { mimeRelease(); }
+}
+const busyReply = (res, err, fallback) => err?.name === 'MailBusy'
+  ? res.set('Retry-After', '5').status(503).json({ error: err.message, retryable: true })
+  : res.status(503).json({ error: fallback });
 async function mapLimit(items, n, fn) {
   const out = new Array(items.length); let next = 0;
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i]); } }));
   return out;
+}
+// Inbox scan, two stages (2026-11-27, acceptance E: cold inbox on the 1-vCPU mail host). The inbox lists every raw/
+// message of the site and keeps those addressed to the caller. A full MIME parse of every message costs ~2 ms of CPU
+// each, so stage 1 is a CONSERVATIVE pre-filter that can only skip messages that cannot be addressed to the caller:
+//  - read the first 64 KiB, take the To/Cc header values (unfolded, lower-case, all whitespace removed);
+//  - if they contain anything the parser could decode into a different address (encoded words "=?", punycode "xn--",
+//    comments "(", quoted pairs "\\", quotes) or the header block is not complete, the message is a candidate;
+//  - otherwise it is a candidate only if one of the caller's alias addresses occurs literally in those values.
+// Every candidate then gets the unchanged full parse + recipient filter (emailFromSummary), so what a user sees is
+// exactly what the full scan shows. Stage-1 results are cached per object version and shared by all users.
+function headerBlock(bytes) {
+  const a = bytes.indexOf('\r\n\r\n'), b = bytes.indexOf('\n\n');
+  const end = a >= 0 && (b < 0 || a <= b) ? a + 4 : b >= 0 ? b + 2 : -1;
+  return end > 0 ? bytes.subarray(0, end) : null;
+}
+function mimeRecipientProbe(obj) {
+  if (obj.Key.includes('AMAZON_SES_SETUP_NOTIFICATION')) return null;
+  return cachedSummary({ ...obj, Key: 'h\n' + obj.Key }, async () => {
+    const bytes = await mailBytes(obj.Key, 'bytes=0-65535');   // throws (mailStorageFailure) if storage fails
+    if (!bytes) return undefined;
+    const h = headerBlock(bytes); if (!h) return { unsafe: true, toCc: '' };
+    const lines = h.toString('latin1').replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/);
+    const toCc = lines.filter(l => /^(to|cc)[ \t]*:/i.test(l)).map(l => l.slice(l.indexOf(':') + 1)).join(',').toLowerCase().replace(/\s+/g, '');
+    return { unsafe: /=\?|xn--|[("\\]/.test(toCc), toCc };
+  });
 }
 // Parsed MIME message without its attachment bodies (null = unreadable, never shown)
 function mimeSummary(obj) {
@@ -1172,7 +1290,7 @@ function mimeSummary(obj) {
     const bytes = await mailBytes(obj.Key);              // throws (mailStorageFailure) if storage fails
     if (!bytes) return undefined;
     try {
-      const parsed = await simpleParser(bytes);
+      const parsed = await parseMime(bytes);
       const eid = obj.Key.split('/').pop();
       const fromAddr = parsed.from?.value?.[0]?.address;
       return {
@@ -1182,7 +1300,7 @@ function mimeSummary(obj) {
         text: parsed.text || '', html: parsed.html || '', date: parsed.date ? parsed.date.getTime() : null,
         attachments: attachmentMetadata(parsed, eid),
       };
-    } catch (e) { console.warn('Parse error:', obj.Key, e.message); return null; }
+    } catch (e) { if (e.name === 'MailBusy') throw e; console.warn('Parse error:', obj.Key, e.message); return null; }
   });
 }
 // content/ records are small JSON: read every time (in parallel), not cached, so a read failure still fails the request
@@ -1258,25 +1376,28 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
       };
     }
     async function scanMime(objects) {
-      const summaries = await mapLimit(objects, MAIL_FETCH_PARALLEL, mimeSummary);
-      objects.forEach((obj, i) => { const email = emailFromSummary(obj, summaries[i]); if (email) emails.push(email); });
+      // stage 1 (conservative pre-filter) for all objects; the full parse + exact filter (emailFromSummary) for the candidates
+      const probes = await mapLimit(objects, MAIL_FETCH_PARALLEL, mimeRecipientProbe); const al = [...aliases].map(a => a.toLowerCase().replace(/\s+/g, ''));
+      const mine = objects.filter((obj, i) => probes[i] && (probes[i].unsafe || al.some(a => probes[i].toCc.includes(a))));
+      const full = await mapLimit(mine, MAIL_FETCH_PARALLEL, mimeSummary); const byKey = new Map(mine.map((o, i) => [o.Key, full[i]]));
+      objects.forEach((obj) => { if (!byKey.has(obj.Key)) return; const email = emailFromSummary(obj, byKey.get(obj.Key)); if (email) emails.push(email); });
     }
 
     // 1. Scan raw/ prefix (SES direct S3 delivery) — must match recipients
     try {
-      const rawListed = await listMailObjects('raw/', 100);
+      const rawListed = await listMailObjects('raw/', MAIL_LIST_PAGE);
       if (rawListed.Contents) await scanMime(rawListed.Contents.reverse());
     } catch (e) { console.warn('Raw scan error:', e.message); throw e; }
 
     // 2. Scan incoming/{wallet}/ prefix (SNS webhook delivery) — already filtered by wallet
     try {
-      const incomingListed = await listMailObjects(`incoming/${walletAddr}/`, 100);
+      const incomingListed = await listMailObjects(`incoming/${walletAddr}/`, MAIL_LIST_PAGE);
       if (incomingListed.Contents) await scanMime(incomingListed.Contents.reverse());
     } catch (e) { console.warn('Incoming scan error:', e.message); throw e; }
 
     // 3. Scan content/ prefix for WalletMail internal messages sent to this user
     try {
-      const contentListed = await listMailObjects('content/', 100);
+      const contentListed = await listMailObjects('content/', MAIL_LIST_PAGE);
       if (contentListed.Contents) {
         const objects = contentListed.Contents.reverse();
         const msgs = await mapLimit(objects, MAIL_FETCH_PARALLEL, contentRecord);
@@ -1356,6 +1477,7 @@ app.get('/api/messages/inbox', requireAuth, async (req, res) => {
 
     res.json({ emails: filtered, count: filtered.length });
   } catch (err) {
+    if (err?.name === 'MailBusy') return busyReply(res, err);
     res.status(503).json({ error: 'Could not load complete mailbox' });
   }
 });
@@ -1481,11 +1603,16 @@ async function visibleMessage(req) {
   const tried = new Set();
   async function mime(key) {
     if (tried.has(key)) return null;
-    tried.add(key);
-    const bytes = await mailBytes(key);
-    if (!bytes) return null;
+    tried.add(key); let held = true;
     let parsed;
-    try { parsed = await simpleParser(bytes); } catch { return null; }
+    await mimeAcquire();
+    try {
+      const bytes = await mailBytes(key);
+      if (!bytes) return null;
+      const large = bytes.length >= MIME_LARGE_BYTES;
+      if (!large) { mimeRelease(); held = false; }
+      try { parsed = await parseMime(bytes, large); } catch { return null; }
+    } finally { if (held) mimeRelease(); }
     const sender = parsed.from?.value?.[0]?.address?.toLowerCase();
     // Raw incoming From headers can be spoofed. Only recipients may read raw
     // objects; sender access is granted by its authenticated sent/content record.
@@ -1522,7 +1649,7 @@ app.get('/api/messages/:messageId/attachments/:index', requireAuth, async (req, 
     res.set({ 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="attachment-${index}.bin"; filename*=UTF-8''${encoded}`,
       'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; sandbox", 'Cache-Control': 'private, no-store' });
     res.send(attachment.content);
-  } catch (err) { res.status(503).json({ error: 'Could not load attachment' }); }
+  } catch (err) { busyReply(res, err, 'Could not load attachment'); }
 });
 
 app.get('/api/messages/:messageId', requireAuth, async (req, res) => {
@@ -1530,7 +1657,7 @@ app.get('/api/messages/:messageId', requireAuth, async (req, res) => {
     const message = await visibleMessage(req);
     if (!message) return res.status(404).json({ error: 'Not found' });
     res.set('Cache-Control', 'private, no-store').json(message.detail);
-  } catch (err) { res.status(503).json({ error: 'Could not load message' }); }
+  } catch (err) { busyReply(res, err, 'Could not load message'); }
 });
 
 app.post('/api/messages/:messageId/read', requireAuth, async (req, res) => {
@@ -1708,10 +1835,10 @@ app.post('/api/auth/logout-all', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  const { enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt } = reconcileStatus;
+  const { enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt, anomalies } = reconcileStatus;
   const restoreGuardOn = process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM || restoreGuard.active;
   res.json({ status: 'ok', version: '2.0.0', spec: 'Master-Spec-v1.0', domain: EMAIL_DOMAIN, mailbox: MAILBOX_ADDR || 'not configured', time: new Date().toISOString(),
-    outbox: { reconcile: enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt, restoreGuard: restoreGuardOn } });
+    outbox: { reconcile: enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt, restoreGuard: restoreGuardOn, anomalies } });
 });
 
 // Cheap session check — the client uses this to restore a reload without

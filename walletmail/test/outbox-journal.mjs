@@ -28,9 +28,14 @@ async function login(w) { const c = await call('POST', '/api/auth/challenge', nu
 const send = (t, id, extra = {}) => call('POST', '/api/messages/send-external', t, { messageId: id, recipientEmail: 'someone@example.org', subject: 'hello ' + id, body: 'body ' + id, ...extra });
 const outbox = (t, id) => call('GET', '/api/messages/outbox/' + id, t);
 const until = async (fn, ms = 6000) => { const end = Date.now() + ms; while (Date.now() < end) { if (await fn()) return true; await sleep(100); } return false; };
+function opsIn(bucket, ...a) { try { return { code: 0, out: execFileSync(process.execPath, ['-r', path.join(HERE, 'events-store.cjs'), path.join(dir, 'tools', 'outbox-ops.mjs'), ...a], { cwd: dir, env: { ...ENV, S3_INCOMING_BUCKET: bucket }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; }
+  catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } }
 function ops(...a) { try { return { code: 0, out: execFileSync(process.execPath, ['-r', path.join(HERE, 'events-store.cjs'), path.join(dir, 'tools', 'outbox-ops.mjs'), ...a], { cwd: dir, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; }
   catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || '') }; } }
 const user = async () => { const w = ethers.Wallet.createRandom(); return { w, addr: w.address.toLowerCase(), t: await login(w) }; };
+// "restore": a new bucket holding a copy of an earlier snapshot of the mail bucket
+function restoreTo(snap, bucket) { const o=objects(); for (const [k,v] of Object.entries(snap)) o[bucket+k.slice(4)]=v; fs.writeFileSync(store,JSON.stringify(o)); }
+const mailSnapshot = () => Object.fromEntries(Object.entries(objects()).filter(([k])=>k.startsWith('mail/')));
 function eraseMail(u,id) { const o=objects();delete o[`mail/outbox/${u.addr}/${id}.json`];delete o[`mail/sent/${u.addr}/${id}.json`];fs.writeFileSync(store,JSON.stringify(o)); }
 try {
  await start();
@@ -98,9 +103,74 @@ try {
  ok('durable guard marker blocks unknown ids without any env setting',rr.code===0&&r.status===503&&sesCount('guard-marker-only')===0&&(await call('GET','/api/health')).j.outbox.restoreGuard===true,JSON.stringify({status:r.status,code:rr.code}));
  rr=ops('guard','off','--operator','x');
  ok('turning the guard off requires an operator and a reason',rr.code!==0);
+ rr=ops('guard','off','--operator','offline-review','--reason','legacy ids accounted for');
+ ok('guard off is refused without a backfill (a reason alone is never enough)',rr.code!==0&&/no completed backfill/.test(rr.out),rr.out);
+ rr=ops('backfill','--operator','x','--reason','y');
+ ok('backfill requires a source (--source-bucket or --ids)',rr.code!==0);
+ rr=ops('backfill','--source-bucket','mail','--operator','offline-review','--reason','scan of the bucket being served, after the guard went on');
+ ok('a backfill of the served bucket itself completes and is recorded with its source',rr.code===0&&JSON.parse(rr.out).source.bucket==='mail'&&Object.keys(objects()).some(k=>k.startsWith('events/resolutions/_backfill/mail/')),rr.out.slice(0,300));
+ rr=ops('guard','off','--operator','offline-review','--reason','legacy ids accounted for');
+ ok('…but it does not qualify: the served bucket scanned after the guard went on does not prove pre-rollback records were handled',rr.code!==0&&/pre-rollback source/.test(rr.out),rr.out);
+ const idsFile=path.join(dir,'legacy-ids.txt');fs.writeFileSync(idsFile,`${u.addr} listed-legacy
+`);
+ rr=ops('backfill','--ids',idsFile,'--operator','offline-review','--reason','legacy ids from the pre-restore send log');
+ ok('an explicit legacy-ID list closes each listed id that has no record (recorded with the list hash)',rr.code===0&&JSON.parse(rr.out).closed.some(x=>x.messageId==='listed-legacy')&&!!JSON.parse(rr.out).source.idsSha256,rr.out.slice(0,300));
  rr=ops('guard','off','--operator','offline-review','--reason','legacy ids accounted for');await sleep(10500);
+ r=await send(u.t,'listed-legacy');
+ ok('a listed legacy id is never sent (closed as undeterminable)',r.status===409&&sesCount('listed-legacy')===0,JSON.stringify(r));
  r=await send(u.t,'guard-marker-only');
  ok('after a recorded guard off, a new id sends once; both changes are recorded',rr.code===0&&r.status===200&&sesCount('guard-marker-only')===1&&Object.keys(objects()).filter(k=>k.startsWith('events/resolutions/_restore-guard/mail/')).length===2);
+
+ // L3 (acceptance C): a legacy message sent AFTER the backup, with no SES event and no journal (the pre-journal server),
+ // so the restored data has no trace of it. Disposition = backfill (journal it from the live bucket before any restore).
+ // Then: restore → retry; guard off → restart → retry; a second restore into a fresh bucket with no guard marker → retry.
+ await stop();await start();
+ u=await user();const backup=mailSnapshot();
+ fault({events:'off'});await send(u.t,'L3');await send(u.t,'L3s');await send(u.t,'L3u');fault();
+ state=objects();for(const id of ['L3','L3s','L3u'])delete state[`events/journal/${u.addr}/${Buffer.from(id).toString('base64url')}.json`];
+ for(const id of ['L3s','L3u'])delete state[`mail/outbox/${u.addr}/${id}.json`];   // L3s, L3u: only their Sent record survives
+ { const k=`mail/sent/${u.addr}/L3u.json`;const e=JSON.parse(Buffer.from(state[k].body,'base64'));delete e.fromEmail;state[k].body=Buffer.from(JSON.stringify(e)).toString('base64'); }   // L3u cannot be fingerprinted
+ fs.writeFileSync(store,JSON.stringify(state));
+ ok('L3 setup: one SES submission each, no journal, no events',['L3','L3s','L3u'].every(id=>sesCount(id)===1)&&!Object.keys(objects()).some(k=>k.includes(`/index/${u.addr}/`)));
+ rr=ops('inventory');
+ ok('inventory counts the legacy records not yet journaled and the unverifiable one',rr.code===0&&JSON.parse(rr.out).notJournaled>=2&&JSON.parse(rr.out).unverified.some(x=>x.messageId==='L3u'),rr.out.slice(0,400));
+ rr=ops('backfill','--source-bucket','mail','--operator','offline-review','--reason','journal legacy records of the live bucket before any restore');
+ const bf=rr.code===0?JSON.parse(rr.out):{migrated:[],unverified:[]};
+ ok('backfill (source = live bucket) migrates L3 and L3s and lists L3u as unverified (not migrated)',bf.unverified.some(x=>x.messageId==='L3u')&&!bf.migrated.some(x=>x.messageId==='L3u'),rr.out.slice(0,400));
+ ok('backfill journals L3 from its outbox record and L3s from its Sent record (not retryable)',['L3','L3s'].every(id=>bf.migrated.some(w=>w.wallet===u.addr&&w.messageId===id&&w.state==='sent'))
+   &&['L3','L3s'].every(id=>{const j=JSON.parse(Buffer.from(objects()[`events/journal/${u.addr}/${Buffer.from(id).toString('base64url')}.json`].body,'base64'));return j.retryable===false&&!!j.fp&&j.backfilledFrom;}),rr.out.slice(0,400));
+ rr=ops('backfill','--source-bucket','mail','--operator','offline-review','--reason','second run');
+ ok('a second backfill changes nothing (existing entries are never overwritten)',rr.code===0&&JSON.parse(rr.out).counts.migrated===0);
+ // restore 1: bucket mail2 from the backup taken before L3; the durable guard on for mail2
+ restoreTo(backup,'mail2');rr=opsIn('mail2','guard','on','--operator','offline-review','--reason','restored mail2 from the pre-L3 backup');
+ await stop();await start({S3_INCOMING_BUCKET:'mail2'});u.t=await login(u.w);
+ ok('restore 1: L3 is absent from the restored mail data',!Object.keys(objects()).some(k=>k.startsWith(`mail2/outbox/${u.addr}/L3`)||k.startsWith(`mail2/sent/${u.addr}/L3`)));
+ r=await send(u.t,'L3');let r2=await send(u.t,'L3s');
+ ok('restore 1: L3 and L3s retries are duplicates, no SES submission',r.status===200&&r.j.duplicate&&r2.status===200&&r2.j.duplicate&&sesCount('L3')===1&&sesCount('L3s')===1,JSON.stringify([r.status,r.j.error,r2.status,r2.j.error]));
+ r=await send(u.t,'L3s',{body:'a different body under the L3s id'});
+ ok('restore 1: the backfilled Sent fingerprint refuses different content under the same id',r.status===409&&sesCount('L3s')===1);
+ r=await send(u.t,'L3u');
+ ok('restore 1: the unverified L3u is blocked by the guard (503), no SES submission',r.status===503&&sesCount('L3u')===1,JSON.stringify(r));
+ rr=opsIn('mail2','backfill','--source-bucket','mail2','--operator','offline-review','--reason','scan of the restored bucket');
+ rr=opsIn('mail2','guard','off','--operator','offline-review','--reason','restored bucket scanned');
+ ok('restore 1: guard off is refused while the latest pre-rollback backfill has an unverified record (scanning the restored bucket does not count)',rr.code!==0&&/unverified/.test(rr.out),rr.out);
+ const l3uFile=path.join(dir,'l3u.txt');fs.writeFileSync(l3uFile,`${u.addr} L3u
+`);
+ rr=opsIn('mail2','backfill','--ids',l3uFile,'--operator','offline-review','--reason','L3u content cannot be verified: close it');
+ ok('restore 1: the unverified L3u is closed by an explicit ID list',rr.code===0&&JSON.parse(rr.out).closed.some(x=>x.messageId==='L3u'));
+ rr=opsIn('mail2','guard','off','--operator','offline-review','--reason','legacy disposition complete');
+ ok('restore 1: after that the recorded guard off succeeds',rr.code===0,rr.out);
+ await stop();await start({S3_INCOMING_BUCKET:'mail2'});u.t=await login(u.w);
+ r=await send(u.t,'L3');r2=await send(u.t,'L3s');let r3=await send(u.t,'L3u');
+ ok('guard off + restart: L3u stays closed (409)',r3.status===409&&sesCount('L3u')===1);
+ ok('guard off + restart: L3 and L3s are still duplicates, no SES submission',(await call('GET','/api/health')).j.outbox.restoreGuard===false&&r.status===200&&r.j.duplicate&&r2.status===200&&r2.j.duplicate&&sesCount('L3')===1&&sesCount('L3s')===1,JSON.stringify([r.status,r2.status]));
+ // restore 2: a fresh bucket from the same backup, no guard marker, no env setting
+ restoreTo(backup,'mail3');await stop();await start({S3_INCOMING_BUCKET:'mail3'});u.t=await login(u.w);
+ r=await send(u.t,'L3');r2=await send(u.t,'L3s');
+ ok('restore 2 (fresh bucket, no guard marker, no env): L3 and L3s are still duplicates, no SES submission',(await call('GET','/api/health')).j.outbox.restoreGuard===false&&r.status===200&&r.j.duplicate&&r2.status===200&&r2.j.duplicate&&sesCount('L3')===1&&sesCount('L3s')===1,JSON.stringify([r.status,r2.status]));
+ r3=await send(u.t,'L3u');
+ ok('restore 2: L3u stays closed (409), no SES submission',r3.status===409&&sesCount('L3u')===1);
+ ok('restore 2: Sent history shows L3 and L3s again',(await call('GET','/api/messages/sent',u.t)).j.emails?.filter(e=>e.id==='L3'||e.id==='L3s').length===2);
 } catch(e){console.log('ERROR',e.stack);fail++;}
 finally{try{await stop();}catch{}fs.rmSync(dir,{recursive:true,force:true});}
 console.log(fail ? `${fail} FAILED` : 'all passed');process.exit(fail?1:0);

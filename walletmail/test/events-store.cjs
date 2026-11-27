@@ -2,6 +2,7 @@
 // SES stub that, when it accepts a message, writes SES events the way Amazon Data Firehose does (concatenated JSON in
 // raw/YYYY/MM/DD/HH/ of the events bucket). DRILL_STORE: objects file, DRILL_CONTROL: fault file, DRILL_AUDIT: SES log.
 // Faults: {ses:'reject'|'error-not-sent'|'lost-response'}, {events:'off'} (pipeline broken: SES accepts, no events).
+// Recipients: bounce@ → Bounce, complaint@ → Delivery + Complaint, delay@ → DeliveryDelay only (no final event), sendonly@ → Send only, else Delivery.
 const fs = require('node:fs'); const crypto = require('node:crypto'); const { Readable } = require('node:stream');
 const file = process.env.DRILL_STORE, control = process.env.DRILL_CONTROL, sesLog = process.env.DRILL_AUDIT, EV = process.env.SES_EVENTS_BUCKET || 'events';
 const load = () => JSON.parse(fs.readFileSync(file, 'utf8')); const save = (o) => fs.writeFileSync(file, JSON.stringify(o));
@@ -45,6 +46,8 @@ ses.SESv2Client.prototype.send = async function (cmd) {
     const evs = [{ eventType: 'Send', mail, send: {} }];
     if (to.some((x) => x.startsWith('bounce@'))) evs.push({ eventType: 'Bounce', mail, bounce: { bounceType: 'Permanent', bounceSubType: 'General', bouncedRecipients: [{ emailAddress: to[0] }], timestamp: new Date().toISOString() } });
     else if (to.some((x) => x.startsWith('complaint@'))) evs.push({ eventType: 'Delivery', mail, delivery: { recipients: to, smtpResponse: '250 OK', timestamp: new Date().toISOString() } }, { eventType: 'Complaint', mail, complaint: { complainedRecipients: [{ emailAddress: to[0] }], complaintFeedbackType: 'abuse', timestamp: new Date().toISOString() } });
+    else if (to.some((x) => x.startsWith('sendonly@'))) { /* accepted, no delivery outcome yet */ }
+    else if (to.some((x) => x.startsWith('delay@'))) evs.push({ eventType: 'DeliveryDelay', mail, deliveryDelay: { delayType: 'TransientCommunicationFailure', expirationTime: new Date(Date.now() + 86400e3).toISOString(), delayedRecipients: [{ emailAddress: to[0] }], timestamp: new Date().toISOString() } });
     else evs.push({ eventType: 'Delivery', mail, delivery: { recipients: to, smtpResponse: '250 2.6.0 Message received', processingTimeMillis: 500, timestamp: new Date().toISOString() } });
     firehose(evs);
   }

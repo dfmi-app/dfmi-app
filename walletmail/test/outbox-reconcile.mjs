@@ -18,7 +18,7 @@ const port = await new Promise((r) => { const s = net.createServer(); s.listen(0
 const BASE = `http://127.0.0.1:${port}`; let proc;
 const ENV = { ...process.env, DRILL_STORE: store, DRILL_CONTROL: control, DRILL_AUDIT: sesLog, AWS_REGION: 'us-east-1', AWS_ACCESS_KEY_ID: 'x', AWS_SECRET_ACCESS_KEY: 'x',
   S3_INCOMING_BUCKET: 'mail', SES_EVENTS_BUCKET: 'events', SES_CONFIGURATION_SET: 'walletmail-events', EMAIL_DOMAIN: 'example.invalid', DFMI_RPC: 'http://127.0.0.1:9', ENS_REGISTRY: '', ENS_RESOLVER: '', ENS_BOOTSTRAP_NAMES: '',
-  OUTBOX_RECONCILE_MS: '300', OUTBOX_PENDING_ALERT_MS: '1500', OUTBOX_EVIDENCE_WINDOW_MS: '1000', OUTBOX_CANARY_MAX_GAP_MS: String(3600e3) };
+  OUTBOX_RECONCILE_MS: '300', OUTBOX_PENDING_ALERT_MS: '1500', OUTBOX_EVIDENCE_WINDOW_MS: '1000', OUTBOX_CANARY_MAX_GAP_MS: String(3600e3), OUTBOX_DELAY_ALERT_MS: '2500' };
 async function start(extra = {}) { proc = spawn(process.execPath, ['-r', path.join(HERE, 'events-store.cjs'), path.join(dir, 'server.js')], { cwd: dir, env: { ...ENV, PORT: String(port), ...extra }, stdio: 'ignore' });
   for (let i = 0; i < 100; i++) { try { if ((await fetch(BASE + '/api/health')).ok) return; } catch {} await sleep(50); } throw Error('no start'); }
 async function stop() { if (!proc || proc.exitCode !== null || proc.signalCode) return; const d = once(proc, 'exit'); proc.kill(); await d; }
@@ -103,6 +103,37 @@ try {
   // events index unreadable → nothing is sent
   u = await user(); fault({ s3: { op: 'ListObjectsV2Command', bucket: 'events', prefix: 'index/' } }); r = await send(u.t, 'e1'); fault();
   ok('if the delivery records cannot be read, nothing is sent (503, deliveryMayHaveOccurred false)', r.status === 503 && r.j.deliveryMayHaveOccurred === false && sesCount('e1') === 0);
+  // 6. delivery anomalies (acceptance D): success / bounce / complaint / delay are recorded, reported for alerting, and closed by a recorded ack
+  u = await user();
+  await send(u.t, 'd-ok'); await send(u.t, 'd-bounce', { recipientEmail: 'bounce@simulator.amazonses.com' }); await send(u.t, 'd-complaint', { recipientEmail: 'complaint@simulator.amazonses.com' }); await send(u.t, 'd-delay', { recipientEmail: 'delay@example.org' });
+  const dstate = async (id) => (await outbox(u.t, id)).j.delivery;
+  ok('outbox status: delivered / bounced / complained / delayed', await until(async () => (await dstate('d-ok')) === 'delivered' && (await dstate('d-bounce')) === 'bounced' && (await dstate('d-complaint')) === 'complained' && (await dstate('d-delay')) === 'delayed', 8000),
+    JSON.stringify([await dstate('d-ok'), await dstate('d-bounce'), await dstate('d-complaint'), await dstate('d-delay')]));
+  const openKeys = () => Object.keys(objects()).filter((k) => k.startsWith('events/anomalies/open/') && k.includes(`/${u.addr}/`));
+  ok('each bounce, complaint and delay is recorded once as an open anomaly (a delivery is not)', await until(async () => openKeys().length === 3) && ['Bounce', 'Complaint', 'DeliveryDelay'].every((t) => openKeys().some((k) => k.startsWith(`events/anomalies/open/${t}/`))), JSON.stringify(openKeys()));
+  let an = null;
+  ok('health reports the open bounce, complaint and delay (what the monitor alerts on)', await until(async () => { an = (await call('GET', '/api/health')).j.outbox.anomalies; return an?.bounce >= 1 && an?.complaint >= 1 && an?.delayOpen >= 1; }, 8000), JSON.stringify(an));
+  ok('a delay still open after OUTBOX_DELAY_ALERT_MS is reported as overdue', await until(async () => { an = (await call('GET', '/api/health')).j.outbox.anomalies; return an?.delayOverdue >= 1; }, 10000), JSON.stringify(an));
+  let la = ops('anomalies');
+  ok('operator: anomalies lists them with their detail', la.code === 0 && ['d-bounce', 'd-complaint', 'd-delay'].every((id) => la.out.includes(`"messageId": "${id}"`)) && /"bounceType": "Permanent"/.test(la.out));
+  rr = ops('ack', u.addr, 'd-bounce', '--operator', 'test-op');
+  ok('operator: ack needs an operator and a reason', rr.code !== 0);
+  for (const o of JSON.parse(la.out).open.filter((x) => x.eventType !== 'DeliveryDelay')) ops('ack', o.wallet, o.messageId, '--operator', 'test-op', '--reason', 'address checked; suppressed by SES');
+  ok('after the recorded acks health shows no open bounce/complaint; the open records are kept (nothing deleted)', await until(async () => { an = (await call('GET', '/api/health')).j.outbox.anomalies; return an?.bounce === 0 && an?.complaint === 0; }, 8000)
+    && openKeys().length === 3 && Object.keys(objects()).some((k) => k.startsWith('events/anomalies/ack/Bounce/') && k.includes(`/${u.addr}/`)), JSON.stringify(an));
+  { const ob = (await outbox(u.t, 'd-bounce')).j;
+    ok('an acknowledged bounce stays "bounced" (delivery comes only from SES events) and shows the ack', ob.delivery === 'bounced' && ob.anomalies?.length === 1 && ob.anomalies[0].acknowledged === true && ob.anomalies[0].ackBy === 'test-op' && ob.anomalies[0].ackKind === 'operator', JSON.stringify({ d: ob.delivery, a: ob.anomalies })); }
+  await send(u.t, 'd-sendonly', { recipientEmail: 'sendonly@example.org' });
+  ok('a bare Send event is reported as "sent", never "delivered"', await until(async () => (await outbox(u.t, 'd-sendonly')).j.events?.some((e) => e.eventType === 'Send')) && (await dstate('d-sendonly')) === 'sent');
+  ok('ack of a messageId with nothing open is refused', ops('ack', u.addr, 'd-ok', '--operator', 'x', '--reason', 'y').code !== 0);
+  { // the delayed message is delivered later: Firehose writes the Delivery event; the reconciler closes the delay itself
+    const sid = (await outbox(u.t, 'd-delay')).j.sesMessageId; const d = new Date(); const p2 = (x) => String(x).padStart(2, '0');
+    const key = `events/raw/${d.getUTCFullYear()}/${p2(d.getUTCMonth() + 1)}/${p2(d.getUTCDate())}/${p2(d.getUTCHours())}/late-delivery-${Date.now()}`;
+    const ev = { eventType: 'Delivery', mail: { timestamp: d.toISOString(), messageId: sid, destination: ['delay@example.org'], tags: { obw: [u.addr], obid: [Buffer.from('d-delay').toString('base64url')] } }, delivery: { recipients: ['delay@example.org'], smtpResponse: '250 OK', timestamp: new Date().toISOString() } };
+    const st5 = objects(); st5[key] = { body: Buffer.from(JSON.stringify(ev)).toString('base64'), etag: '"late"', at: Date.now() }; fs.writeFileSync(store, JSON.stringify(st5));
+    ok('a delay followed by its Delivery is closed by the reconciler (recorded) and the status becomes delivered', await until(async () => { an = (await call('GET', '/api/health')).j.outbox.anomalies; return an?.delayOpen === 0 && an?.delayOverdue === 0 && (await dstate('d-delay')) === 'delivered'; }, 10000)
+      && Object.keys(objects()).some((k) => k.startsWith('events/anomalies/ack/DeliveryDelay/') && k.includes(`/${u.addr}/`) && JSON.parse(Buffer.from(objects()[k].body, 'base64')).by === 'reconciler'), JSON.stringify(an));
+  }
   const hh = (await call('GET', '/api/health')).j.outbox;
   ok('health reports the reconciler as running and the last canary time', !!hh.lastOkAt && !!hh.lastCanaryAt, JSON.stringify(hh));
 } catch (e) { console.log('ERROR', e.stack); fail++; }

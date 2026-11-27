@@ -19,7 +19,7 @@ const fault=(value={})=>fs.writeFileSync(control,JSON.stringify(value));
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
 async function start(fence=''){
   const probe=net.createServer();await new Promise(r=>probe.listen(0,'127.0.0.1',r));const port=probe.address().port;await new Promise(r=>probe.close(r));ports.push(port);
-  const p=spawn(process.execPath,['-r','./durability-store.cjs',SERVER],{env:{...process.env,PORT:String(port),DRILL_STORE:store,DRILL_CONTROL:control,DRILL_AUDIT:audit,
+  const p=spawn(process.execPath,['-r','./durability-store.cjs',SERVER],{env:{...process.env,PORT:String(port),MAIL_LIST_PAGE:'100',DRILL_STORE:store,DRILL_CONTROL:control,DRILL_AUDIT:audit,
     AWS_REGION:'us-east-1',AWS_ACCESS_KEY_ID:'test',AWS_SECRET_ACCESS_KEY:'test',S3_INCOMING_BUCKET:bucket,EMAIL_DOMAIN:'example.invalid',DFMI_RPC:'http://127.0.0.1:9',
     ENS_REGISTRY:'',ENS_RESOLVER:'',ENS_BOOTSTRAP_NAMES:'',KNOWN_ENS_MAPPINGS:JSON.stringify({[b.address.toLowerCase()]:'restore-recipient'}),MAILBOX_ADDRESS:'',SIGNATURE_ENFORCE:'1',SESSIONS_NOT_BEFORE:fence},stdio:['ignore','pipe','pipe']});
   let logs='';p.stdout.on('data',d=>logs+=d);p.stderr.on('data',d=>logs+=d);const s={p,base:`http://127.0.0.1:${port}`,logs:()=>logs};active.add(s);

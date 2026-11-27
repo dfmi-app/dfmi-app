@@ -262,6 +262,28 @@ The prompt cannot be triggered by automation. When a browser is driven by an aut
 
 These are our own results. The reviewer can repeat the checklist on their own devices.
 
+### Final acceptance: frozen build, not yet deployed (27 November)
+
+The final acceptance follows a checklist agreed with the reviewer, `ACCEPTANCE-FINAL.md`. It runs once against one frozen build and is judged on the results. Before freezing we fixed three problems we had reproduced ourselves:
+
+1. **Old messages could be sent again.** A message from before the send journal (L3) could be resent with its original ID once the restore guard was turned off.
+   - New: `outbox-ops backfill` journals the old records. It must run from the pre-rollback bucket or from an explicit list of old message IDs, and it records the count, the source and anything it could not verify.
+   - `guard off` is refused unless such a backfill exists and nothing in it is left unverified.
+2. **Bounces, complaints and delays were recorded but nobody was alerted.**
+   - They are now written to an anomaly log, reported by the health check and alerted by the monitor.
+   - An operator acknowledges each one with `outbox-ops ack`, which keeps a record.
+   - The delivery status comes from SES events only, so an acknowledgement never turns into "delivered".
+3. **Large attachments could exhaust the mail host's memory.**
+   - Large messages are read and parsed one at a time.
+   - A request that waits too long gets a 503 it can retry, with a Retry-After header.
+
+Capacity on real S3 also brought three inbox changes:
+- concurrent requests share one listing and one parse per message;
+- a conservative To/Cc pre-filter runs before the full parse;
+- `test/inbox-prefilter.mjs` checks that every inbox is byte-identical to the full scan.
+
+The frozen `walletmail/server.js` has sha256 `1229e4ee34a35af8386e069477f1600669f356b4aa3838f6f8ce79e352a6b93d`. The acceptance scripts are in `walletmail/test/acceptance/`.
+
 ### Send journal: the reviewer's patch, an isolated cloud drill, deployed (26 November, 2:05–2:58 PM PST)
 
 - **The reviewer's patch is applied unchanged** (commit `6624bee`: `1fe4632-journal-fix.patch`, `server.js` sha256 `57c3dfad…`).

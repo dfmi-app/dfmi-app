@@ -6,6 +6,13 @@
 //   node tools/outbox-ops.mjs resolve <wallet> <messageId> --as sent|not-sent|undeterminable --operator <name> --reason "<text>"
 //   node tools/outbox-ops.mjs canary                                 send one probe to the SES mailbox simulator (hourly cron)
 //   node tools/outbox-ops.mjs guard on|off|status --operator <name> --reason "<text>"   durable legacy-restore guard (recorded)
+//   node tools/outbox-ops.mjs backfill --source-bucket <pre-rollback bucket> | --ids <legacy-ID list> --operator <name> --reason "<text>"
+//                                                                    journal legacy records (or close listed ids), recorded with source + unverified list
+//   node tools/outbox-ops.mjs inventory [--source-bucket <bucket>]  legacy outbox/ and sent/ counts, how many already journaled
+//   node tools/outbox-ops.mjs anomalies                              open bounces / complaints / delivery delays
+//   node tools/outbox-ops.mjs ack <wallet> <messageId> --operator <name> --reason "<text>"   close them (recorded, nothing deleted)
+// `guard off` is refused unless the latest backfill from a pre-rollback source (another bucket, an ID list, or this bucket
+// before the latest `guard on`) completed with an empty unverified list.
 // Rules (never sends the user's message, never generates a new messageId):
 //   sent            only if SES recorded an acceptance event (Send/Delivery/Bounce/...) for this messageId.
 //   not-sent        refused: missing asynchronous events cannot prove nonacceptance.
@@ -14,7 +21,7 @@
 // Every resolution is written once to resolutions/<wallet>/<obid>/<time>.json in the EVENTS bucket (the authoritative
 // copy: that bucket is not restored with the mail bucket, so a rollback cannot erase it) and to outbox-resolutions/ in
 // the mail bucket; then the outbox entry is updated with a conditional write (it fails if the entry changed meanwhile).
-import { createRequire } from 'node:module'; import path from 'node:path';
+import { createRequire } from 'node:module'; import path from 'node:path'; import crypto from 'node:crypto'; import fs from 'node:fs';
 const require = createRequire(path.join(process.cwd(), 'server.js'));
 require('dotenv').config({ quiet: true });
 const { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
@@ -96,14 +103,118 @@ if (cmd === 'list') {
   const cur = await getJson(EV, `journal/_restore-guard/${MAIL}.json`);
   if (mode === 'status' || !mode) { console.log(JSON.stringify(cur ? cur.rec : { active: false }, null, 1)); process.exit(0); }
   if (!['on', 'off'].includes(mode) || !operator || !reason) { console.error('usage: guard on|off|status --operator <name> --reason "<text>"'); process.exit(2); }
+  if (mode === 'off') {
+    const recs = async (p) => { const out = []; for (const o of await list(EV, p)) { const r = await getJson(EV, o.Key); if (r) out.push(r.rec); } return out; };
+    const lastOn = (await recs(`resolutions/_restore-guard/${MAIL}/`)).filter(r => r.active === true).map(r => r.at).sort().pop() || '';
+    // A backfill only counts if its source predates the rollback: another bucket (the live copy before the restore) or an
+    // explicit legacy-ID list, or this same bucket inventoried BEFORE the latest guard on. Every record such a backfill
+    // listed as unverified must have been closed since. A reason alone is never enough.
+    const qualifying = (await recs('resolutions/_backfill/')).filter(r => r.complete === true && r.source &&
+      (r.source.type === 'ids' || (r.source.type === 'bucket' && (r.source.bucket !== MAIL || (lastOn && r.at < lastOn))))).sort((x, y) => x.at.localeCompare(y.at));
+    const latest = qualifying.pop();
+    if (!latest) { console.error(`refused: no completed backfill from a pre-rollback source for ${MAIL} (another bucket, an ID list, or ${MAIL} itself before the guard went on at ${lastOn || 'never'}); run: backfill --source-bucket <live bucket> | --ids <file> --operator <name> --reason "<text>"`); process.exit(1); }
+    // every record any qualifying backfill reported as unverified must since have become authoritative (closed by an ID list)
+    const outstanding = [];
+    for (const r of [...qualifying, latest]) for (const u of r.unverified || []) if (!u.wallet || !u.messageId || !(await getJson(EV, jkey(u.wallet, u.messageId)))) outstanding.push(u);
+    if (outstanding.length) { console.error(`refused: ${outstanding.length} unverified legacy record(s) are still open (${JSON.stringify(outstanding.slice(0, 3))}); close them with backfill --ids <file>`); process.exit(1); }
+  }
   const at = new Date().toISOString(); const rec = { active: mode === 'on', operator, reason, at, previous: cur ? cur.rec : null };
   await s3.send(new PutObjectCommand({ Bucket: EV, Key: `resolutions/_restore-guard/${MAIL}/${at.replace(/[^0-9TZ]/g, '')}.json`, Body: JSON.stringify(rec), ContentType: 'application/json', IfNoneMatch: '*' }));
   await s3.send(new PutObjectCommand({ Bucket: EV, Key: `journal/_restore-guard/${MAIL}.json`, Body: JSON.stringify(rec), ContentType: 'application/json', ...(cur ? { IfMatch: cur.etag } : { IfNoneMatch: '*' }) }));
   console.log(JSON.stringify(rec, null, 1));
+} else if (cmd === 'backfill' || cmd === 'inventory') {
+  // Legacy disposition (2026-11-26, acceptance C). A message sent before the journal existed has no authoritative claim.
+  //   backfill --source-bucket <bucket> [--ids <file>] --operator <name> --reason "<text>"
+  //     source = the COMPLETE pre-rollback records (the live bucket before any restore). Every outbox/ and external sent/
+  //     record there without a journal entry is journaled (conditional write, never overwrites), not retryable, with the
+  //     server's fingerprint. A record that cannot be read or fingerprinted is NOT migrated; it is listed as unverified.
+  //   backfill --ids <file> ...   an explicit legacy-ID list (JSON array or lines "wallet messageId"): each listed id
+  //     without a journal entry (and not found in --source-bucket, if given) is CLOSED: journal state abandoned + an
+  //     undeterminable resolution; it is never sent again.
+  //   inventory [--source-bucket <bucket>]   counts only (no writes)
+  const src = a['source-bucket'] || (cmd === 'inventory' ? MAIL : null), idsFile = a.ids, operator = a.operator, reason = a.reason;
+  if (cmd === 'backfill' && ((!src && !idsFile) || !operator || !reason)) { console.error('usage: backfill --source-bucket <bucket> | --ids <file> --operator <name> --reason "<text>"'); process.exit(2); }
+  const started = new Date().toISOString();
+  const journaled = async (w, id) => !!(await getJson(EV, jkey(w, id)));
+  const cand = [], unverified = [], inv = { outbox: {}, sentExternal: 0, sentInternalOrOther: 0, alreadyJournaled: 0, notJournaled: 0, unverifiable: 0 };
+  const seen = new Set();
+  if (src) {
+    for (const o of await list(src, 'outbox/')) {
+      const m = /^outbox\/(0x[0-9a-f]{40})\/(.+)\.json$/.exec(o.Key); let cur = null; try { cur = m && await getJson(src, o.Key); } catch {}
+      if (!m || !cur || !cur.rec.messageId || !cur.rec.fp) { unverified.push({ key: o.Key, wallet: m?.[1], messageId: m?.[2], why: !cur ? 'unreadable' : 'no fingerprint' }); if (m) seen.add(`${m[1]}/${m[2]}`); continue; }
+      inv.outbox[cur.rec.state] = (inv.outbox[cur.rec.state] || 0) + 1; seen.add(`${m[1]}/${cur.rec.messageId}`);
+      cand.push({ ...cur.rec, wallet: m[1], retryable: false, backfilledAt: started, backfilledFrom: `outbox (${src})` });
+    }
+    for (const o of await list(src, 'sent/')) {
+      const m = /^sent\/(0x[0-9a-f]{40})\/(.+)\.json$/.exec(o.Key); if (!m) continue;
+      let cur = null; try { cur = await getJson(src, o.Key); } catch {}
+      const e = cur?.rec; const to = e && (e.toEmail || e.to);
+      if (e && (e.internal === true || typeof to !== 'string' || !to.includes('@'))) { inv.sentInternalOrOther++; continue; }
+      if (seen.has(`${m[1]}/${m[2]}`)) continue;
+      inv.sentExternal++;
+      if (!e || !e.fromEmail || typeof e.subject !== 'string' || typeof e.body !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(m[2])) { unverified.push({ key: o.Key, wallet: m[1], messageId: m[2], why: !e ? 'unreadable' : 'cannot fingerprint' }); continue; }
+      // the same fingerprint server.js computes: sha256(JSON.stringify([recipientEmail, subject, body, fromEmail]))
+      const fp = crypto.createHash('sha256').update(JSON.stringify([e.to || e.toEmail, e.subject, e.body, e.fromEmail])).digest('hex');
+      cand.push({ state: 'sent', fp, to, from: e.fromEmail, wallet: m[1], messageId: m[2], sesMessageId: e.sesMessageId || null,
+        sentAt: new Date(e.timestamp || Date.parse(o.LastModified) || Date.now()).toISOString(), retryable: false, backfilledAt: started, backfilledFrom: `sent (${src})` });
+    }
+  }
+  let ids = [];
+  if (idsFile) {
+    const raw = fs.readFileSync(idsFile, 'utf8'); let parsed = null; try { parsed = JSON.parse(raw); } catch {}
+    ids = (parsed || raw.split('\n').filter(l => l.trim()).map(l => { const [wallet, messageId] = l.trim().split(/\s+/); return { wallet, messageId }; }))
+      .map(x => ({ wallet: String(x.wallet || '').toLowerCase(), messageId: String(x.messageId || '') }));
+    const bad = ids.filter(x => !/^0x[0-9a-f]{40}$/.test(x.wallet) || !/^[A-Za-z0-9._:-]{1,128}$/.test(x.messageId));
+    if (bad.length) { console.error('refused: malformed entries in the ID list: ' + JSON.stringify(bad.slice(0, 5))); process.exit(2); }
+  }
+  for (const r of cand) { if (await journaled(r.wallet, r.messageId)) { inv.alreadyJournaled++; r._skip = true; } else inv.notJournaled++; }
+  for (let i = unverified.length - 1; i >= 0; i--) { const u = unverified[i]; if (u.wallet && u.messageId && await journaled(u.wallet, u.messageId)) { unverified.splice(i, 1); inv.alreadyJournaled++; } }   // already authoritative
+  inv.unverifiable = unverified.length;
+  if (cmd === 'inventory') { console.log(JSON.stringify({ at: started, bucket: src, ...inv, unverified }, null, 1)); process.exit(0); }
+  const migrated = [], existing = [], closed = [];
+  const put = async (rec) => { try { await s3.send(new PutObjectCommand({ Bucket: EV, Key: jkey(rec.wallet, rec.messageId), Body: JSON.stringify(rec), ContentType: 'application/json', IfNoneMatch: '*' })); return true; }
+    catch (e) { if (e.name === 'PreconditionFailed' || e.$metadata?.httpStatusCode === 412 || e.$metadata?.httpStatusCode === 409) return false; throw e; } };
+  for (const r of cand) { if (r._skip || !(await put(r))) { existing.push({ wallet: r.wallet, messageId: r.messageId }); continue; } migrated.push({ wallet: r.wallet, messageId: r.messageId, state: r.state, from: r.backfilledFrom }); }
+  const unv = unverified.filter(u => !ids.some(x => x.wallet === u.wallet && x.messageId === u.messageId));   // a listed id is closed below
+  for (const x of ids) {
+    if (migrated.concat(existing).some(m => m.wallet === x.wallet && m.messageId === x.messageId)) continue;
+    const at = new Date().toISOString();
+    const rec = { wallet: x.wallet, messageId: x.messageId, state: 'abandoned', fp: null, retryable: false, closedAt: at, closedBy: 'backfill --ids', resolution: { state: 'abandoned', decision: 'undeterminable', at, operator, reason } };
+    if (!(await put(rec))) { existing.push({ wallet: x.wallet, messageId: x.messageId }); continue; }
+    await s3.send(new PutObjectCommand({ Bucket: EV, Key: `resolutions/${x.wallet}/${b64u(x.messageId)}/${at.replace(/[^0-9TZ]/g, '')}.json`, ContentType: 'application/json', IfNoneMatch: '*',
+      Body: JSON.stringify({ wallet: x.wallet, messageId: x.messageId, decision: 'undeterminable', newState: 'abandoned', previousState: 'legacy (listed, no record)', operator, reason, at, by: 'backfill --ids' }) }));
+    closed.push(x);
+  }
+  const at = new Date().toISOString();
+  const source = src ? { type: 'bucket', bucket: src, ...(idsFile ? { ids: idsFile, idsSha256: crypto.createHash('sha256').update(fs.readFileSync(idsFile)).digest('hex') } : {}) }
+    : { type: 'ids', ids: idsFile, idsSha256: crypto.createHash('sha256').update(fs.readFileSync(idsFile)).digest('hex') };
+  const rec = { source, servedBucket: MAIL, operator, reason, startedAt: started, at, complete: true,
+    counts: { migrated: migrated.length, alreadyJournaled: existing.length, closed: closed.length, unverified: unv.length }, inventory: src ? inv : undefined, migrated, alreadyJournaled: existing, closed, unverified: unv };
+  await s3.send(new PutObjectCommand({ Bucket: EV, Key: `resolutions/_backfill/${(src || 'ids').replace(/[^A-Za-z0-9._-]/g, '_')}/${at.replace(/[^0-9TZ]/g, '')}.json`, Body: JSON.stringify(rec), ContentType: 'application/json', IfNoneMatch: '*' }));
+  console.log(JSON.stringify(rec, null, 1));
+} else if (cmd === 'anomalies') {
+  const acked = new Set((await list(EV, 'anomalies/ack/')).map(o => o.Key.slice('anomalies/ack/'.length)));
+  const open = [];
+  for (const o of await list(EV, 'anomalies/open/')) { const rel = o.Key.slice('anomalies/open/'.length); if (acked.has(rel)) continue; const r = await getJson(EV, o.Key); if (r) open.push({ eventType: r.rec.eventType, wallet: r.rec.wallet, messageId: r.rec.messageId, timestamp: r.rec.timestamp, destination: r.rec.destination, detail: r.rec.detail }); }
+  console.log(JSON.stringify({ at: new Date().toISOString(), open }, null, 1));
+} else if (cmd === 'ack') {
+  const [w0, id] = a._; const w = (w0 || '').toLowerCase(); const operator = a.operator, reason = a.reason;
+  if (!/^0x[0-9a-f]{40}$/.test(w) || !id || !operator || !reason) { console.error('usage: ack <wallet> <messageId> --operator <name> --reason "<text>"'); process.exit(2); }
+  const acked = new Set((await list(EV, 'anomalies/ack/')).map(o => o.Key.slice('anomalies/ack/'.length)));
+  const done = [];
+  for (const o of await list(EV, 'anomalies/open/')) {
+    const rel = o.Key.slice('anomalies/open/'.length); const parts = rel.split('/');
+    if (parts[1] !== w || parts[2] !== b64u(id) || acked.has(rel)) continue;
+    const at = new Date().toISOString();
+    await s3.send(new PutObjectCommand({ Bucket: EV, Key: `anomalies/ack/${rel}`, Body: JSON.stringify({ by: 'operator', operator, reason, at }), ContentType: 'application/json', IfNoneMatch: '*' }));
+    done.push({ eventType: parts[0], file: parts[3], at });
+  }
+  if (!done.length) { console.error('nothing open for this messageId'); process.exit(1); }
+  console.log(JSON.stringify({ wallet: w, messageId: id, operator, reason, acked: done }, null, 1));
 } else if (cmd === 'canary') {
   const id = 'canary-' + new Date().toISOString().replace(/[^0-9TZ]/g, '');
   const r = await ses.send(new SendEmailCommand({ FromEmailAddress: `outbox-canary@${DOMAIN}`, Destination: { ToAddresses: ['success@simulator.amazonses.com'] }, ConfigurationSetName: CS,
     Content: { Simple: { Subject: { Data: 'outbox canary ' + id }, Body: { Text: { Data: 'Event pipeline probe. No reply.' } } } },
     EmailTags: [{ Name: 'obw', Value: CANARY_WALLET }, { Name: 'obid', Value: b64u(id) }, { Name: 'messageId', Value: id }] }));
   console.log(JSON.stringify({ at: new Date().toISOString(), canary: id, sesMessageId: r.MessageId }));
-} else { console.error('usage: list | show <wallet> <id> | resolve ... | canary'); process.exit(2); }
+} else { console.error('usage: list | show <wallet> <id> | resolve ... | guard ... | backfill ... | anomalies | ack ... | canary'); process.exit(2); }

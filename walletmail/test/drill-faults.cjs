@@ -6,8 +6,11 @@
 //   {"s3":"sent-commit-then-fail"} outbox PutObject whose body has state "sent": write it for real, then throw a 503
 //   {"s3":"journal-sent-commit-then-fail"} the same for the journal entry in the events bucket
 //   {"ses":"no-events"}            send for real WITHOUT the configuration set: SES publishes no event for it
+//   {"ses":"accept-then-kill"}     send for real, log it, then SIGKILL this process before the outcome is recorded
 // Also forces every listening socket onto 127.0.0.1.
 const fs = require('node:fs');
+// resolve the AWS SDK from the server's directory, so the server and this preload share the same module instances
+const req = require('node:module').createRequire(require('node:path').join(process.cwd(), 'server.js'));
 const net = require('net'); const listen = net.Server.prototype.listen;
 net.Server.prototype.listen = function (...args) {
   if (typeof args[0] === 'number' || typeof args[0] === 'string') { const port = args[0]; const cb = args.find((a) => typeof a === 'function'); return listen.call(this, { port: Number(port), host: '127.0.0.1' }, cb); }
@@ -16,17 +19,18 @@ net.Server.prototype.listen = function (...args) {
 };
 const ctl = () => { try { return JSON.parse(fs.readFileSync(process.env.DRILL_CONTROL, 'utf8')); } catch { return {}; } };
 const err = (name, code) => { const e = new Error(name); e.name = name; e.$metadata = { httpStatusCode: code }; return e; };
-const ses = require('@aws-sdk/client-sesv2'); const realSes = ses.SESv2Client.prototype.send;
+const ses = req('@aws-sdk/client-sesv2'); const realSes = ses.SESv2Client.prototype.send;
 ses.SESv2Client.prototype.send = async function (cmd, ...rest) {
   const f = ctl(); const tag = (cmd.input?.EmailTags || []).find((t) => t.Name === 'messageId')?.Value;
   if (f.ses === 'error-not-sent') throw err('InternalFailure', 500);
   if (f.ses === 'no-events') delete cmd.input.ConfigurationSetName;
   const r = await realSes.call(this, cmd, ...rest);
   fs.appendFileSync(process.env.DRILL_SES_LOG, JSON.stringify({ at: new Date().toISOString(), tag, sesMessageId: r.MessageId, to: cmd.input?.Destination?.ToAddresses }) + '\n');
+  if (f.ses === 'accept-then-kill') process.kill(process.pid, 'SIGKILL');
   if (f.ses === 'lost-response') { const e = new Error('drill: response lost after SES accepted'); e.name = 'TimeoutError'; throw e; }
   return r;
 };
-const s3 = require('@aws-sdk/client-s3'); const realS3 = s3.S3Client.prototype.send;
+const s3 = req('@aws-sdk/client-s3'); const realS3 = s3.S3Client.prototype.send;
 s3.S3Client.prototype.send = async function (cmd, ...rest) {
   const f = ctl();
   const pre = f.s3 === 'sent-commit-then-fail' ? 'outbox/' : f.s3 === 'journal-sent-commit-then-fail' ? 'journal/' : null;
