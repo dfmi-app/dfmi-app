@@ -264,7 +264,7 @@ These are our own results. The reviewer can repeat the checklist on their own de
 
 ### Final acceptance: frozen build, not yet deployed (27 November)
 
-The final acceptance follows a checklist agreed with the reviewer, `ACCEPTANCE-FINAL.md`. It runs once against one frozen build and is judged on the results. Before freezing we fixed three problems we had reproduced ourselves:
+The final acceptance follows a checklist agreed with the reviewer, `ACCEPTANCE-FINAL.md`. It runs once against one frozen build and is judged on the results. Before freezing we fixed three problems we had reproduced ourselves, and merged the reviewer's restore-guard fix (item 4):
 
 1. **Old messages could be sent again.** A message from before the send journal (L3) could be resent with its original ID once the restore guard was turned off.
    - New: `outbox-ops backfill` journals the old records. It must run from the pre-rollback bucket or from an explicit list of old message IDs, and it records the count, the source and anything it could not verify.
@@ -276,13 +276,17 @@ The final acceptance follows a checklist agreed with the reviewer, `ACCEPTANCE-F
 3. **Large attachments could exhaust the mail host's memory.**
    - Large messages are read and parsed one at a time.
    - A request that waits too long gets a 503 it can retry, with a Retry-After header.
+4. **The restore guard could stay open for up to 10 seconds after it was turned on.** An instance cached "off" for 10 seconds. The reviewer's fix (`f4542cf-guard-fix.patch`) is merged by what it changes, not by copying their file:
+   - the guard marker is read fresh before any unknown message ID is released, and on every health check;
+   - a marker that cannot be parsed, or whose `active` field is missing or not true/false, counts as on;
+   - `test/outbox-journal.mjs` checks that turning the guard on and off takes effect at once, and checks six kinds of damaged marker. The previous frozen server fails 8 of these checks.
 
 Capacity on real S3 also brought three inbox changes:
 - concurrent requests share one listing and one parse per message;
 - a conservative To/Cc pre-filter runs before the full parse;
 - `test/inbox-prefilter.mjs` checks that every inbox is byte-identical to the full scan.
 
-The frozen `walletmail/server.js` has sha256 `1229e4ee34a35af8386e069477f1600669f356b4aa3838f6f8ce79e352a6b93d`. The acceptance scripts are in `walletmail/test/acceptance/`.
+The frozen `walletmail/server.js` has sha256 `dadef120452c797a04139646d37f5ad9901498114a512d54470f0e195d3845b5`. It replaces the first frozen build (`1229e4ee…`), which the reviewer did not sign off because it lacked item 4. The acceptance scripts are in `walletmail/test/acceptance/`.
 
 ### Send journal: the reviewer's patch, an isolated cloud drill, deployed (26 November, 2:05–2:58 PM PST)
 

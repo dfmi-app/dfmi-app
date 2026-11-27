@@ -806,13 +806,22 @@ const journalPut = (r, cond) => s3.send(new PutObjectCommand({ Bucket: EVENTS_BU
 // the legacy-restore guard on for every instance, whether or not OUTBOX_REQUIRE_EXISTING_JOURNAL is in its environment,
 // so a forgotten setting cannot reopen sending. Only `tools/outbox-ops.mjs guard off` (recorded) turns it off.
 // If the marker cannot be read, the guard is treated as ON (fail closed).
+// Guard fix (2026-11-27, per the reviewer's f4542cf-guard-fix): the marker is read fresh every time an unknown id is about to be
+// released — no cached "off" — so "guard on" takes effect at once on every instance. A marker that exists but is unparsable, not an
+// object, or whose `active` is missing or not a boolean is treated as ON. Only an absent marker or `active: false` means off.
+// The health check refreshes the guard state the same way.
 let restoreGuard = { active: false, checkedAt: 0 };
 async function restoreGuardActive() {
   if (!reconcileStatus.enabled) return false;
-  if (Date.now() - restoreGuard.checkedAt < 10000) return restoreGuard.active;
-  try { const g = await evJson(`journal/_restore-guard/${S3_BUCKET}.json`); restoreGuard = { active: g?.active === true, checkedAt: Date.now() }; }
-  catch (e) { restoreGuard = { active: true, checkedAt: Date.now() }; }
-  return restoreGuard.active;
+  let active;
+  try {
+    let g;
+    try { const d = await evS3.send(new GetObjectCommand({ Bucket: EVENTS_BUCKET, Key: `journal/_restore-guard/${S3_BUCKET}.json` })); g = JSON.parse(await streamToString(d.Body)); }
+    catch (e) { if (e.name !== 'NoSuchKey' && e.name !== 'NotFound') throw e; g = undefined; }   // absent marker: no guard
+    active = g === undefined ? false : (g && typeof g === 'object' && !Array.isArray(g) && typeof g.active === 'boolean') ? g.active : true;
+  } catch (e) { active = true; }
+  restoreGuard = { active, checkedAt: Date.now() };
+  return active;
 }
 async function closedResolution(w, id) {
   for (const o of await evList(`resolutions/${w}/${b64u(id)}/`)) {
@@ -1834,7 +1843,8 @@ app.post('/api/auth/logout-all', requireAuth, async (req, res) => {
   } catch (e) { res.status(503).json({ error: 'Could not revoke sessions, try again' }); }
 });
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  await restoreGuardActive();
   const { enabled, lastOkAt, lastError, pendingStale, pendingStaleOldest, lastCanaryAt, anomalies } = reconcileStatus;
   const restoreGuardOn = process.env.OUTBOX_REQUIRE_EXISTING_JOURNAL === '1' || !!process.env.OUTBOX_RECONCILE_FROM || restoreGuard.active;
   res.json({ status: 'ok', version: '2.0.0', spec: 'Master-Spec-v1.0', domain: EMAIL_DOMAIN, mailbox: MAILBOX_ADDR || 'not configured', time: new Date().toISOString(),

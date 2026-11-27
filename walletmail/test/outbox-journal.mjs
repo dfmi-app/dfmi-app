@@ -120,6 +120,22 @@ try {
  ok('a listed legacy id is never sent (closed as undeterminable)',r.status===409&&sesCount('listed-legacy')===0,JSON.stringify(r));
  r=await send(u.t,'guard-marker-only');
  ok('after a recorded guard off, a new id sends once; both changes are recorded',rr.code===0&&r.status===200&&sesCount('guard-marker-only')===1&&Object.keys(objects()).filter(k=>k.startsWith('events/resolutions/_restore-guard/mail/')).length===2);
+ // Guard fix (reviewer's f4542cf-guard-fix, merged 2026-11-27): no cached "off" — on and off take effect at once on a running
+ // instance; the health check refreshes the state; a damaged marker counts as ON. No sleeps here on purpose.
+ r=await send(u.t,'gf-warm');ok('guard fix: with the guard off a new id sends (this instance has just read "off")',r.status===200&&sesCount('gf-warm')===1);
+ rr=ops('guard','on','--operator','offline-review','--reason','immediate-on check');r=await send(u.t,'gf-immediate-on');
+ ok('guard fix: guard on takes effect immediately — the very next unknown id is blocked, no SES submission',rr.code===0&&r.status===503&&sesCount('gf-immediate-on')===0,JSON.stringify({code:rr.code,status:r.status}));
+ ok('guard fix: the health check shows the guard on immediately',(await call('GET','/api/health')).j.outbox.restoreGuard===true);
+ rr=ops('guard','off','--operator','offline-review','--reason','immediate-off check (the earlier ID-list backfill qualifies)');
+ ok('guard fix: health shows the guard off immediately after a recorded guard off',rr.code===0&&(await call('GET','/api/health')).j.outbox.restoreGuard===false,rr.out.slice(0,300));
+ r=await send(u.t,'gf-immediate-off');ok('guard fix: guard off takes effect immediately — the next new id sends once',r.status===200&&sesCount('gf-immediate-off')===1,JSON.stringify(r));
+ { const mk='events/journal/_restore-guard/mail.json', saved=objects()[mk];
+   const damaged=[['unparsable JSON','{"active": fal'],['missing "active"','{"operator":"x","reason":"y"}'],['"active" as a string','{"active":"false"}'],['"active" as a number','{"active":0}'],['an array','[false]'],['JSON null','null']];
+   for(const [name,body] of damaged){ const o=objects();o[mk]={body:Buffer.from(body).toString('base64'),etag:'"damaged"',at:Date.now()};fs.writeFileSync(store,JSON.stringify(o));
+     const id='gf-damaged-'+name.replace(/\W+/g,'-');u=await user();const h=(await call('GET','/api/health')).j.outbox.restoreGuard;r=await send(u.t,id);
+     ok(`guard fix: a damaged marker (${name}) counts as ON — health shows on, a new id is blocked, no SES submission`,h===true&&r.status===503&&sesCount(id)===0,JSON.stringify({health:h,status:r.status})); }
+   const o=objects();o[mk]=saved;fs.writeFileSync(store,JSON.stringify(o)); }
+ u=await user();r=await send(u.t,'gf-after-repair');ok('guard fix: with the valid "off" marker back, a new id sends once again',r.status===200&&sesCount('gf-after-repair')===1,JSON.stringify(r));
 
  // L3 (acceptance C): a legacy message sent AFTER the backup, with no SES event and no journal (the pre-journal server),
  // so the restored data has no trace of it. Disposition = backfill (journal it from the live bucket before any restore).
