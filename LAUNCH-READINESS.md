@@ -262,7 +262,29 @@ The prompt cannot be triggered by automation. When a browser is driven by an aut
 
 These are our own results. The reviewer can repeat the checklist on their own devices.
 
-### Final acceptance: frozen build, not yet deployed (27 November)
+### Final acceptance: run once on the frozen build, then deployed (27 November)
+
+The reviewer signed off the frozen build (server sha256 `dadef120…`). The checklist then ran once, in order:
+
+| Item | Result |
+|---|---|
+| A. Same build everywhere | All 18 test suites pass on the production Node versions (24.14.1 for mail, 22.23.5 for payments) with production dependencies, 0 failures. After the deploy, every one of the 21 components in production matches its frozen hash. |
+| B. No duplicates | Payments: 40/40 checks. Mail: one SES submission per message ID, through 20 concurrent copies, a process kill, and two restores from backup. |
+| C. Old messages | Every old record has a recorded disposition. Turning the guard off is refused until the old records are accounted for. After restores, retrying an old ID never sends it again. |
+| D. Delivery problems | Bounce, complaint and delay alerts arrived in 5–6 minutes. Each acknowledgement is recorded. A recovery notice follows. An acknowledged bounce is never shown as delivered. |
+| E. Capacity (temporary t2.micro, real S3) | Session check p95 212 ms. Sending p95 580 ms (1,500 messages in 5 minutes). Warm inbox p95 1.1 s / 1.6 s. Cold inbox p95 8.7 s / 10.9 s. Ten 10 MiB attachments in 11 s. Peak memory 250 MiB of the 450 MiB limit. Paid path: 300 payments, p95 156 ms, each charged once. |
+| Recovery | One object: about 15 s. Whole bucket from backup: 7.5 min and 6 min. Cross-region replica: lag 23 s, retrieval under 2.5 min. Payment restore: about 1 s. Process crash: back in 6 s. |
+
+Two things are recorded as they happened:
+- **A test-script mistake.** After each restore, the frozen drill script retried the bounce and complaint test messages with the wrong recipient. The server correctly refused them. A separate check that retried the original requests unchanged passed.
+- **One rerun.** The first capacity sending run reused message IDs from the dry run, so 50 of its 1,500 messages were not new. It was rerun with new IDs.
+
+Deployed the same day, 19:05 UTC:
+- old production records journaled first: 12 journaled, 0 left unverified;
+- a 450 MiB memory limit on the mail service;
+- smoke tests passed: sign-in, delivery and the browser page.
+
+#### Before the run: the frozen build
 
 The final acceptance follows a checklist agreed with the reviewer, `ACCEPTANCE-FINAL.md`. It runs once against one frozen build and is judged on the results. Before freezing we fixed three problems we had reproduced ourselves, and merged the reviewer's restore-guard fix (item 4):
 
