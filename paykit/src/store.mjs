@@ -41,6 +41,8 @@ export function ownerState(content) {
 
 export class InvoiceStore {
   constructor(path) {
+    // Without a path the store and its lock would land in the current directory as "undefined" / "undefined.lock".
+    if (typeof path !== 'string' || !path.trim()) throw new Error('InvoiceStore needs a store file path');
     this.path = path;
     this.lockFile = path + '.lock';
     this._lockToken = null;
@@ -175,12 +177,14 @@ export class InvoiceStore {
     });
   }
 
-  /** Mark a non-settling status (open/partial/overdue/unknown) with a last_check detail. */
+  /** Mark a non-settling status (open/partial/overdue/unknown) with a last_check detail. A paid invoice is returned unchanged. */
   mark(invoiceId, status, detail) {
     return this.withLock(() => {
       const d = this.#readOrThrow();
       const inv = d.invoices[invoiceId];
       if (!inv) return null;
+      // Never downgrade a settled invoice: a concurrent checkPayment may still hold a stale "not paid" view of it.
+      if (inv.status === 'paid') return inv;
       inv.status = status;
       inv.last_check = { at: new Date().toISOString(), ...detail };
       this.#write(d);

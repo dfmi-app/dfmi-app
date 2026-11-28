@@ -194,3 +194,20 @@ test('#4 concurrent claims of one tx from two processes: exactly one wins', asyn
   const paid = ['inv_x', 'inv_y'].filter(id => s2.get(id).status === 'paid');
   assert.equal(paid.length, 1, 'only the winning invoice is paid');
 });
+
+test('a paid invoice is never downgraded by mark() (stale concurrent check)', () => {
+  const p = freshStore();
+  const s = new InvoiceStore(p);
+  s.put({ id: 'inv_m', payee: PAYEE, status: 'open', amount_units: '100' });
+  assert.equal(s.settle('inv_m', { txHash: '0x' + 'cd'.repeat(32) }, { tx_hash: '0x' + 'cd'.repeat(32) }).ok, true);
+  const r = s.mark('inv_m', 'open', { reason: 'stale view from a concurrent check' });
+  assert.equal(r.status, 'paid', 'mark returns the paid invoice unchanged');
+  const back = new InvoiceStore(p).get('inv_m');
+  assert.equal(back.status, 'paid');
+  assert.ok(back.settlement, 'settlement kept');
+  assert.equal(back.last_check, null, 'no stale last_check written over the settlement');
+});
+
+test('InvoiceStore refuses to open without a path (no stray "undefined.lock")', () => {
+  for (const bad of [undefined, null, '', '   ']) assert.throws(() => new InvoiceStore(bad), /needs a store file path/);
+});

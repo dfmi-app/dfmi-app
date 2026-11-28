@@ -161,3 +161,22 @@ test('#3 unknown creation block fails closed; reconcile settles explicitly', asy
   const open = await kit.checkPayment({ invoice_id: inv.invoice_id, reconcile: true });
   assert.equal(open.status, 'paid');
 });
+
+test('two concurrent checks: the one still waiting on the chain cannot un-pay an invoice the other settled', async () => {
+  // A starts a check and waits in getLogs; B checks and settles; A then returns with a stale "not paid" view.
+  // Before the fix A wrote that view back (paid -> open) and the invoice stayed open forever (its own tx is consumed).
+  let calls = 0, release; const gate = new Promise((r) => { release = r; });
+  const prov = fakeProvider([], 105);
+  const kit = new PayKit(cfg, { provider: prov });
+  const inv = await kit.createInvoice({ payee_address: PAYEE, amount: '2.00', payer_hint: PAYER });
+  const base = fakeProvider([{ from: PAYER, to: PAYEE, value: BigInt(inv.amount_units), block: 106 }], 110);
+  Object.assign(prov, base, { async getLogs(f) { if (++calls === 1) await gate; return base.getLogs(f); } });
+  const a = kit.checkPayment({ invoice_id: inv.invoice_id });
+  await new Promise((r) => setImmediate(r));
+  const b = await kit.checkPayment({ invoice_id: inv.invoice_id });
+  assert.equal(b.status, 'paid');
+  release();
+  assert.equal((await a).status, 'paid', 'the stale check reports the settled state');
+  assert.equal(kit.store.get(inv.invoice_id).status, 'paid', 'stored state stays paid');
+  assert.equal((await kit.checkPayment({ invoice_id: inv.invoice_id })).status, 'paid', 'a later /deliver check still sees paid');
+});
