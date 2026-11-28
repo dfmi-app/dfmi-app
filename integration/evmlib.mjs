@@ -5,7 +5,7 @@ import solc from 'solc';
 import { readFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits } from 'ethers';
+import { JsonRpcProvider, Wallet, Contract, ContractFactory, parseUnits, ZeroAddress } from 'ethers';
 
 const CHAIN_ID = 112172; // the wallet contracts hardcode this in their EIP-712 domain
 
@@ -60,9 +60,9 @@ export async function makeEnv({ variant = 'v1', cap = 1_000000n, expirySecs = 36
   if (variant === 'v2') {
     const reg = await new ContractFactory(ART.registry.abi, ART.registry.bytecode, owner).deploy();
     await reg.waitForDeployment(); registryAddr = await reg.getAddress();
-    walletC = await new ContractFactory(ART.v2.abi, ART.v2.bytecode, owner).deploy(await owner.getAddress(), tokenAddr, registryAddr);
+    walletC = await new ContractFactory(ART.v2.abi, ART.v2.bytecode, owner).deploy(await owner.getAddress(), tokenAddr, registryAddr, ZeroAddress); // v3: no AgentRegistry (0 = no identity-level check)
   } else {
-    walletC = await new ContractFactory(ART.v1.abi, ART.v1.bytecode, owner).deploy(await owner.getAddress(), tokenAddr);
+    walletC = await new ContractFactory(ART.v1.abi, ART.v1.bytecode, owner).deploy(await owner.getAddress(), tokenAddr, ZeroAddress); // v3: no AgentRegistry (0 = no identity-level check)
   }
   await walletC.waitForDeployment();
   const walletAddr = await walletC.getAddress();
