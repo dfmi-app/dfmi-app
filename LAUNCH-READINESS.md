@@ -262,7 +262,57 @@ The prompt cannot be triggered by automation. When a browser is driven by an aut
 
 These are our own results. The reviewer can repeat the checklist on their own devices.
 
-### Final acceptance: run once on the frozen build, then deployed (27 November)
+### Signed off: final technical production acceptance (27 November)
+
+The reviewer signed off the final technical production acceptance against the frozen A–E checklist. No blocker remains
+within the frozen scope. Two problems were found and fixed on the way. Each fix meant a new freeze and a full rerun of A–E.
+
+**B4: a report was regenerated after a restore.** The reviewer found this in the evidence of the second-freeze run. After
+the payment databases were restored to a backup taken before a purchase, a retry of the same payment kept the original
+charge, but the seller generated the report again and overwrote its archive. Now a retry first reads the archive for the
+original settlement transaction, checks it, and returns that report unchanged. The archive is written once and never
+replaced. A damaged archive fails loudly and is left as it is. The test restores, restarts and retries the original request
+6 times. It then checks:
+- one charge and no refund;
+- one report generated in total;
+- the archive is unchanged;
+- every retry returns the original order, transaction and report.
+
+The previous seller fails exactly these new checks.
+
+**D: one alert could hide a new problem.** The full run on the B4 fix (third freeze) found this. Once the monitor had sent
+an alert for open delivery problems, it stayed quiet about that check for 6 hours. In the run, a delivery delay passed one
+hour just after a bounce alert had gone out, and no alert followed within the 15-minute limit. We stopped that run and kept
+its records. Now the monitor alerts again at once when the number of bounces, complaints or overdue delays rises. The
+earlier monitor fails exactly the new checks.
+
+**Results on the fourth freeze.** Every item met its target:
+
+| Item | Result |
+|---|---|
+| A. Same build everywhere | 18/18 test suites on both production Node versions, 0 failures |
+| B. No duplicates | Payments 46/46, including the new B4 checks. Mail: one SES submission per message ID |
+| C. Old messages | Disposition from the complete pre-rollback records. Turning the guard off is refused without it |
+| D. Delivery problems | Bounce alert in 53 s. A delay that became overdue after that alert was alerted in 4 min 56 s. Acknowledged bounces are never shown as delivered. Recovery notice sent |
+| E. Capacity (temporary t2.micro, real S3) | Session p95 210 ms. Sending p95 600 ms (1,500 in 5 min). Warm inbox 1.1 / 1.6 s. Cold inbox 8.8 / 11.1 s. Attachments 9.8 s. Peak memory 219 MiB of 450 MiB. Paid path: 300 payments, p95 162 ms, each charged once |
+| Recovery | One object 24 s / 17 s. Whole bucket from backup 6.0 / 6.5 min. Replica lag 22 s, retrieval 1.6 min. Payment restore 0.5 s. Process crash 6 s |
+
+**Deployed** 27 November, 4:41 PM PST. Only the payment host changed: the seller and the monitor. The mail service stayed on
+the build deployed at 11:05 AM. After the deploy:
+- all 21 components in production match their frozen hashes;
+- the monitor's first scheduled runs passed 42/42.
+
+The temporary test hosts, buckets and accounts were deleted after the sign-off.
+
+The reviewer recorded three limitations that do not affect the sign-off:
+- The mail smoke test's exit code was not saved separately; its full results were.
+- A delivery to the SES test mailbox is not a person receiving mail in an outside mailbox.
+- The drill-script mistake with the bounce and complaint retries described below is accepted as a corrected step.
+
+The review checked the records we supplied for consistency. It did not rerun anything in production or require a real paid
+purchase.
+
+### Final acceptance, second freeze: run once on the frozen build, then deployed (27 November)
 
 The reviewer signed off the frozen build (server sha256 `dadef120…`). The checklist then ran once, in order:
 
