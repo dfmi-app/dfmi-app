@@ -100,6 +100,42 @@ buyer agent ── SessionKeyWallet.pay() ──▶ facilitator ──▶ dfmi c
 
 On the buying side, the authorization path decides whether an agent may send. On the selling side, paykit lets an agent confirm the money arrived before it delivers, without trusting the facilitator's word for it. Together they close the loop: a transaction between two agents, bounded on one end, verified on the other, with a human present only at grant and revoke.
 
+## The invoice store and its lock file
+
+The store (`invoices.json` by default, see `store` in the config) has one writer at a time. Every operation takes an exclusive lock file next to it, `invoices.json.lock`, which holds `pid:token`. The operation reloads the file, applies its change, writes a temporary file, and renames it over the store, then removes the lock. Each write is atomic: the visible store is either the old version or the new one, never half of each.
+
+paykit never removes a lock it did not create. Removing another process's lock safely cannot be done with plain files, so a lock left by a process that died mid-operation (a `kill -9`, an out-of-memory kill, a power loss) stays until an operator clears it. The symptom is this error after a 5-second wait, and a service that uses paykit failing to start or restarting in a loop:
+
+```
+timed out acquiring store lock …/invoices.json.lock held by pid 12345 (dead). Stop all writers, verify none is running, then remove the lock file manually.
+```
+
+The state in brackets is a hint: `dead` means that PID no longer exists, and `live` means some process with that PID exists. It may be a different process that reused the PID. `unknown` means the file is empty or unreadable.
+
+To recover, on the host that holds the store:
+
+1. **Stop every writer.** That includes the service that uses paykit (e.g. `pm2 stop <service>`) and any `cli.mjs` or `pay.mjs` still running.
+2. **Confirm none is left.** Read the PID with `cat invoices.json.lock`. Check that `ps -p <pid>` shows nothing, or something that is not paykit. Check that `pgrep -af 'paykit|serve.mjs'` lists no writer.
+3. **Check the store is intact.**
+
+   ```bash
+   node -e "JSON.parse(require('fs').readFileSync('invoices.json','utf8')); console.log('ok')"
+   ```
+
+   An `invoices.json.tmp.<pid>` file is an unfinished write that never replaced the store. Move it aside; do not copy it over the store.
+4. **Back up, then remove the lock.**
+
+   ```bash
+   cp -p invoices.json invoices.json.bak-$(date +%Y%m%d%H%M)
+   mv invoices.json.lock invoices.json.lock.stale-$(date +%Y%m%d%H%M)
+   ```
+
+5. **Start the service again** and run one read, e.g. `node src/cli.mjs list`, to confirm the store opens.
+
+Never remove the lock while a writer may still be running: two writers would overwrite each other's invoices. The lock is only meaningful on one host. Do not share a store over NFS or between machines.
+
+If the store is not valid JSON, paykit refuses to start rather than begin with an empty store. It copies the file to `invoices.json.corrupt-<timestamp>` and stops. Restore from your latest backup, or repair the file by hand, before starting again.
+
 ## Limits, stated up front
 
 - One chain, one token: the dfmi chain and dUSD. The reader is chain-agnostic in shape, but v0 is scoped to what dfmi runs today.
