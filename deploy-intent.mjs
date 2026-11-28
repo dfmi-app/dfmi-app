@@ -56,7 +56,7 @@ if (cat !== 0) {
   console.log(`✓ Category registered: splitter ${cfg.splitter} → 1 (market-data)`);
 } else {
   console.log(`⚠ splitter ${cfg.splitter} != deployer ${owner.address}; ServiceRegistry requires self-registration.`);
-  console.log(`  Register from the splitter's own key:  SELLER_ADDRESS=${cfg.splitter} REGISTRANT_KEY=0x<splitter key> node wangvc-seller/register.mjs`);
+  console.log(`  Register from the splitter's own key:  SERVICE_REGISTRY=${regAddr} SELLER_ADDRESS=${cfg.splitter} REGISTRANT_KEY=0x<splitter key> node wangvc-seller/register.mjs`);
 }
 
 // 3. IntentSessionWallet

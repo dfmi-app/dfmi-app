@@ -9,14 +9,21 @@
  *
  *   SELLER_ADDRESS=0x… REGISTRANT_KEY=0x<key for SELLER_ADDRESS> node register.mjs
  *   Optional: SERVICE_CATEGORY (default 1 = market-data), SERVICE_LABEL (default wangvc-signals),
- *             SERVICE_REGISTRY, RPC, INSECURE_TLS=1
+ *             RPC, INSECURE_TLS=1
+ *   Required: SERVICE_REGISTRY (no default; the old built-in address was the pre-fix, first-come registry)
  *
  * Categories (ServiceRegistry.sol): 1=market-data 2=ai-answers 3=api-tools 4=media 5=compute 6..255=open
  */
 import { JsonRpcProvider, Wallet, Contract } from 'ethers';
 
 const RPC = process.env.RPC || 'https://ethereum.dfmi.app:8541';
-const REGISTRY = process.env.SERVICE_REGISTRY || '0xED134CC9c3D94908B20dd9DDBc2534C199394A81';
+// No default: the old built-in address was the pre-fix registry (first-come, anyone could register any address).
+// Pass the ServiceRegistry that enforces msg.sender == payTo, e.g. the one recorded by deploy-intent.mjs.
+const REGISTRY = process.env.SERVICE_REGISTRY;
+if (!REGISTRY) {
+  console.error('Set SERVICE_REGISTRY to the ServiceRegistry address (the self-registration registry; there is no built-in default).');
+  process.exit(1);
+}
 const SELLER = process.env.SELLER_ADDRESS || '0x35EED7539a6e19B7427007f727e87A0527450eBe';
 const CATEGORY = Number(process.env.SERVICE_CATEGORY || 1);
 const LABEL = process.env.SERVICE_LABEL || 'wangvc-signals';
